@@ -1,0 +1,6 @@
+qwen-tts
+modelscope
+soundfile
+numpy
+torch
+transformers
