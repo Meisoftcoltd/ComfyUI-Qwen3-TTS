@@ -32,7 +32,16 @@ A ComfyUI custom node suite for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS)
     cd ComfyUI-Qwen3-TTS
     pip install -r requirements.txt
     ```
-    *Note: For GPU acceleration, ensure you have a CUDA-compatible PyTorch installed.*
+    
+    **For portable/standalone ComfyUI installations**, use the embedded Python instead:
+    ```bash
+    # From your ComfyUI root folder
+    .\python_embeded\python.exe -m pip install -r custom_nodes\ComfyUI-Qwen3-TTS\requirements.txt
+    ```
+    
+    > ⚠️ **Note**: ComfyUI does not auto-install dependencies from `requirements.txt`. You must run the install command manually.
+    
+    *For GPU acceleration, ensure you have a CUDA-compatible PyTorch installed.*
 
 ## Usage
 
