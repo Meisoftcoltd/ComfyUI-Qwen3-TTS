@@ -1,0 +1,311 @@
+{
+  "id": "26b557c0-b6a1-4103-95fa-9674c47af988",
+  "revision": 0,
+  "last_node_id": 6,
+  "last_link_id": 5,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "Qwen3DatasetFromFolder",
+      "pos": [
+        379.5197595792638,
+        293.0460692575642
+      ],
+      "size": [
+        279.1333374023437,
+        106
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "jsonl_path",
+          "type": "STRING",
+          "links": [
+            1
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-qwen3-tts",
+        "ver": "8692bfd8b930a7b5aca53754e63726e88ec94bd3",
+        "Node name for S&R": "Qwen3DatasetFromFolder"
+      },
+      "widgets_values": [
+        "C:\\path\\to\\your\\audio_folder",
+        "dataset.jsonl",
+        "C:\\path\\to\\your\\audio_folder\\ref.wav"
+      ]
+    },
+    {
+      "id": 4,
+      "type": "Qwen3Loader",
+      "pos": [
+        1144.5197595792638,
+        184.04606925756423
+      ],
+      "size": [
+        270,
+        154
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "local_model_path",
+          "shape": 7,
+          "type": "STRING",
+          "widget": {
+            "name": "local_model_path"
+          },
+          "link": 3
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "QWEN3_MODEL",
+          "links": [
+            4
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-qwen3-tts",
+        "ver": "8692bfd8b930a7b5aca53754e63726e88ec94bd3",
+        "Node name for S&R": "Qwen3Loader"
+      },
+      "widgets_values": [
+        "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        "HuggingFace",
+        "bf16",
+        "auto",
+        ""
+      ]
+    },
+    {
+      "id": 2,
+      "type": "Qwen3DataPrep",
+      "pos": [
+        382.5197595792638,
+        458.0460692575642
+      ],
+      "size": [
+        270,
+        82
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "jsonl_path",
+          "type": "STRING",
+          "widget": {
+            "name": "jsonl_path"
+          },
+          "link": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "processed_jsonl_path",
+          "type": "STRING",
+          "links": [
+            2
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-qwen3-tts",
+        "ver": "8692bfd8b930a7b5aca53754e63726e88ec94bd3",
+        "Node name for S&R": "Qwen3DataPrep"
+      },
+      "widgets_values": [
+        "",
+        "Qwen/Qwen3-TTS-Tokenizer-12Hz"
+      ]
+    },
+    {
+      "id": 3,
+      "type": "Qwen3FineTune",
+      "pos": [
+        756.5197595792638,
+        302.0460692575642
+      ],
+      "size": [
+        270,
+        226
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "train_jsonl",
+          "type": "STRING",
+          "widget": {
+            "name": "train_jsonl"
+          },
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model_path",
+          "type": "STRING",
+          "links": [
+            3
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-qwen3-tts",
+        "ver": "8692bfd8b930a7b5aca53754e63726e88ec94bd3",
+        "Node name for S&R": "Qwen3FineTune"
+      },
+      "widgets_values": [
+        "",
+        "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+        "output/finetuned_model",
+        10,
+        2,
+        0.00002,
+        "my_speaker",
+        "bf16"
+      ]
+    },
+    {
+      "id": 5,
+      "type": "Qwen3CustomVoice",
+      "pos": [
+        1100.5197595792638,
+        405.0460692575642
+      ],
+      "size": [
+        400,
+        214
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "QWEN3_MODEL",
+          "link": 4
+        }
+      ],
+      "outputs": [
+        {
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [
+            5
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-qwen3-tts",
+        "ver": "8692bfd8b930a7b5aca53754e63726e88ec94bd3",
+        "Node name for S&R": "Qwen3CustomVoice"
+      },
+      "widgets_values": [
+        "A series of powerful speech generation capabilities developed by Qwen, offering comprehensive support for voice clone.",
+        "Auto",
+        "Vivian",
+        "",
+        "my_speaker"
+      ]
+    },
+    {
+      "id": 6,
+      "type": "PreviewAudio",
+      "pos": [
+        1569.5197595792638,
+        407.0460692575642
+      ],
+      "size": [
+        270,
+        88
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 5
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.10.0",
+        "Node name for S&R": "PreviewAudio"
+      },
+      "widgets_values": []
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "STRING"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      0,
+      "STRING"
+    ],
+    [
+      3,
+      3,
+      0,
+      4,
+      0,
+      "STRING"
+    ],
+    [
+      4,
+      4,
+      0,
+      5,
+      0,
+      "QWEN3_MODEL"
+    ],
+    [
+      5,
+      5,
+      0,
+      6,
+      0,
+      "AUDIO"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "workflowRendererVersion": "LG",
+    "ue_links": [],
+    "ds": {
+      "scale": 0.9090909090909091,
+      "offset": [
+        -188.81975957926394,
+        148.15393074243588
+      ]
+    },
+    "frontendVersion": "1.37.11"
+  },
+  "version": 0.4
+}
