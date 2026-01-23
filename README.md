@@ -43,6 +43,8 @@ A ComfyUI custom node suite for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS)
     
     *For GPU acceleration, ensure you have a CUDA-compatible PyTorch installed.*
 
+    > ⚠️ **Dependency Note**: The upstream `qwen-tts` package requires `transformers==4.57.3`. This may downgrade your existing transformers version. If other custom nodes require a newer version, consider using a separate Python environment.
+
 ## Usage
 
 ### 1. Load Model
