@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-qwen3-tts"
 description = "A ComfyUI custom node suite for Qwen3-TTS, supporting 1.7B and 0.6B models, Custom Voice, Voice Design, Voice Cloning and Fine-Tuning. "
-version = "1.4.0"
+version = "1.5.0"
 license = { text = "Apache-2.0" } 
 
 dependencies = ["qwen-tts", "modelscope", "soundfile", "numpy", "torch", "transformers", "accelerate", "librosa", "tensorboard"]

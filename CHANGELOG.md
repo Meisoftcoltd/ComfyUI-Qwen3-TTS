@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-01-27
+
+### Added
+- `max_new_tokens` parameter for Voice Clone node to control generation length and prevent hangs
+- `ref_audio_max_seconds` parameter to auto-trim long reference audio (default: 30s)
+- Troubleshooting section in README for common issues
+- **New node: Qwen3-TTS Audio Compare** for evaluating fine-tuned models (speaker similarity, mel spectrogram distance, speaking rate)
+- Resume training from checkpoints with `resume_training` parameter
+- Per-epoch checkpointing with automatic cleanup of intermediate checkpoints
+- 8-bit AdamW optimizer support via bitsandbytes for reduced VRAM usage
+- Gradient checkpointing option (~30-40% VRAM savings during training)
+- Learning rate warmup scheduling with state persistence
+- SHA256-based dataset caching to skip reprocessing unchanged datasets
+- Configurable `batch_size` parameter in Data Prep node for VRAM control
+- Support for 0.6B model fine-tuning (text_projection fix)
+- UI progress status updates with loss tracking during training
+- Optimizer and scheduler state saving for true training resume
+
+### Changed
+- Reduced default `max_new_tokens` from 8192 to 2048 to prevent generation hangs
+- Reduced default learning rate from 2e-5 to 2e-6 for training stability
+- Updated documentation with generation hang mitigation tips and new fine-tuning features
+
+### Fixed
+- Mitigated infinite generation loop issue when using long reference audio or generating long outputs
+- Fixed dtype parameter handling in fine-tuning
+- Fixed speaker embedding CPU conversion issue
+
+### Contributors
+- @rekuenkdr - Training enhancements, VRAM optimizations, Audio Compare node
+
 ## [1.4.0] - 2026-01-24
 
 ### Added

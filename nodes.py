@@ -346,7 +346,7 @@ class Qwen3CustomVoice:
             "optional": {
                 "instruct": ("STRING", {"multiline": True, "default": ""}),
                 "custom_speaker_name": ("STRING", {"default": ""}),
-                "max_new_tokens": ("INT", {"default": 8192, "min": 64, "max": 8192, "step": 64}),
+                "max_new_tokens": ("INT", {"default": 2048, "min": 64, "max": 8192, "step": 64}),
             }
         }
     
@@ -461,6 +461,9 @@ class Qwen3PromptMaker:
                 "model": ("QWEN3_MODEL",),
                 "ref_audio": ("AUDIO",),
                 "ref_text": ("STRING", {"multiline": True}),
+            },
+            "optional": {
+                "ref_audio_max_seconds": ("FLOAT", {"default": 30.0, "min": -1.0, "max": 120.0, "step": 5.0}),
             }
         }
 
@@ -468,8 +471,17 @@ class Qwen3PromptMaker:
     FUNCTION = "create_prompt"
     CATEGORY = "Qwen3-TTS"
 
-    def create_prompt(self, model, ref_audio, ref_text):
+    def create_prompt(self, model, ref_audio, ref_text, ref_audio_max_seconds=30.0):
         audio_tuple = load_audio_input(ref_audio)
+        
+        # Trim reference audio if too long to prevent generation hangs (-1 = no limit)
+        if audio_tuple is not None and ref_audio_max_seconds > 0:
+            wav_data, audio_sr = audio_tuple
+            max_samples = int(ref_audio_max_seconds * audio_sr)
+            if len(wav_data) > max_samples:
+                print(f"Trimming reference audio from {len(wav_data)/audio_sr:.1f}s to {ref_audio_max_seconds}s to prevent generation issues")
+                wav_data = wav_data[:max_samples]
+                audio_tuple = (wav_data, audio_sr)
         
         try:
             prompt = model.create_voice_clone_prompt(
@@ -504,18 +516,20 @@ class Qwen3VoiceClone:
                 "ref_audio": ("AUDIO",),
                 "ref_text": ("STRING", {"multiline": True}),
                 "prompt": ("QWEN3_PROMPT",),
+                "max_new_tokens": ("INT", {"default": 2048, "min": 64, "max": 8192, "step": 64}),
+                "ref_audio_max_seconds": ("FLOAT", {"default": 30.0, "min": -1.0, "max": 120.0, "step": 5.0}),
             }
         }
     
     @classmethod
-    def IS_CHANGED(s, model, text, seed, language="Auto", ref_audio=None, ref_text=None, prompt=None):
+    def IS_CHANGED(s, model, text, seed, language="Auto", ref_audio=None, ref_text=None, prompt=None, max_new_tokens=2048, ref_audio_max_seconds=30.0):
         return seed
 
     RETURN_TYPES = ("AUDIO",)
     FUNCTION = "generate"
     CATEGORY = "Qwen3-TTS"
 
-    def generate(self, model, text, seed, language="Auto", ref_audio=None, ref_text=None, prompt=None):
+    def generate(self, model, text, seed, language="Auto", ref_audio=None, ref_text=None, prompt=None, max_new_tokens=2048, ref_audio_max_seconds=30.0):
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
@@ -530,16 +544,28 @@ class Qwen3VoiceClone:
                 wavs, sr = model.generate_voice_clone(
                     text=text,
                     language=lang,
-                    voice_clone_prompt=prompt
+                    voice_clone_prompt=prompt,
+                    max_new_tokens=max_new_tokens
                 )
             elif ref_audio is not None and ref_text is not None and ref_text.strip() != "":
                 # Use on-the-fly prompt creation
                 audio_tuple = load_audio_input(ref_audio)
+                
+                # Trim reference audio if too long to prevent generation hangs (-1 = no limit)
+                if audio_tuple is not None and ref_audio_max_seconds > 0:
+                    wav_data, audio_sr = audio_tuple
+                    max_samples = int(ref_audio_max_seconds * audio_sr)
+                    if len(wav_data) > max_samples:
+                        print(f"Trimming reference audio from {len(wav_data)/audio_sr:.1f}s to {ref_audio_max_seconds}s to prevent generation issues")
+                        wav_data = wav_data[:max_samples]
+                        audio_tuple = (wav_data, audio_sr)
+                
                 wavs, sr = model.generate_voice_clone(
                     text=text,
                     language=lang,
                     ref_audio=audio_tuple,
-                    ref_text=ref_text
+                    ref_text=ref_text,
+                    max_new_tokens=max_new_tokens
                 )
             else:
                  raise ValueError("For Voice Clone, you must provide either 'prompt' OR ('ref_audio' AND 'ref_text').")

@@ -14,6 +14,11 @@ A ComfyUI custom node suite for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS)
   - **Voice Design**: Create new voices using natural language descriptions.
   - **Voice Cloning**: Clone voices from a short reference audio clip.
 - **Fine-Tuning**: Train a custom voice model using your own dataset (folder of .wav + .txt files).
+  - Resume training from checkpoints
+  - VRAM optimizations: gradient checkpointing, 8-bit AdamW, configurable batch sizes
+  - Per-epoch checkpointing with automatic cleanup
+  - Support for both 1.7B and 0.6B models
+- **Audio Comparison**: Evaluate fine-tuned models with speaker similarity and mel spectrogram metrics.
 - **Cross-Lingual Support**: Generate speech in Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, and Italian.
 - **Flexible Attention**: robust support for `flash_attention_2` with automatic fallback to `sdpa` (standard PyTorch 2.0 attention) if dependencies are missing.
 
@@ -86,9 +91,11 @@ Connect the loaded model to one of the generator nodes:
 - **text**: The text to speak.
 
 #### **Voice Clone** (Requires `Base` Model)
-- **ref_audio**: Upload a reference audio file (1-10 seconds ideal).
+- **ref_audio**: Upload a reference audio file (1-10 seconds ideal, max 30s by default).
 - **ref_text**: The transcription of the reference audio (improves quality).
 - **text**: The text for the cloned voice to speak.
+- **max_new_tokens**: Maximum tokens to generate (default: 2048). Increase for longer outputs, but higher values may increase hang risk.
+- **ref_audio_max_seconds**: Auto-trim reference audio to this length (default: 30s, set to -1 to disable). Longer reference audio can cause generation hangs.
 
 ### 3. Advanced: Prompt Caching
 Use the **Qwen3-TTS Prompt Maker** node to pre-calculate the voice features from a reference audio. Connect the output `Qwen3_Prompt` to the **Voice Clone** node. This is faster if you are generating many sentences with the same cloned voice.
@@ -104,18 +111,55 @@ Train a dedicated model for a specific voice.
     
 2.  **Process Data**:
     - Use **Qwen3-TTS Data Prep** node with the `dataset.jsonl`. It tokenizes audio and creates `*_codes.jsonl`.
+    - **batch_size**: Control VRAM usage during processing (default: 16, lower if OOM).
+    - Includes SHA256-based caching to skip reprocessing unchanged datasets.
     
 3.  **Fine-Tune**:
     - Use **Qwen3-TTS Finetune** node.
     - **train_jsonl**: Connect the `*_codes.jsonl`.
-    - **init_model**: Use `Qwen3-TTS-12Hz-1.7B-Base`.
+    - **init_model**: Use `Qwen3-TTS-12Hz-1.7B-Base` (or 0.6B variant).
     - **output_dir**: Where to save the new model.
     - **speaker_name**: Name your new voice.
-    - Run the node (Queue Prompt). It might take a while depending on epochs/GPU.
+    - **Advanced options**:
+      - **resume_training**: Continue training from a checkpoint.
+      - **gradient_checkpointing**: Enable for ~30-40% VRAM savings.
+      - **use_8bit_adam**: Use 8-bit AdamW optimizer (requires bitsandbytes) for reduced VRAM.
+      - **warmup_ratio**: Learning rate warmup (default: 0.1).
+      - **gradient_accumulation**: Simulate larger batch sizes.
+    - Run the node (Queue Prompt). Per-epoch checkpoints are saved automatically.
     
-4.  **Use Fine-Tuned Model**:
+4.  **Evaluate Fine-Tuned Model** (Optional):
+    - Use **Qwen3-TTS Audio Compare** node to compare reference vs generated audio.
+    - Measures speaker similarity, mel spectrogram distance, and speaking rate ratio.
+    
+5.  **Use Fine-Tuned Model**:
     - Use **Qwen3-TTS Loader** and set `local_model_path` to your fine-tuned `output_dir/epoch_X`.
     - Use **Qwen3-TTS Custom Voice** node. Your `speaker_name` won't appear in the dropdown, you should type your exact trained `speaker_name` in the input, and it'll ignore the default voices and use the trained one.
+
+## Troubleshooting
+
+### Generation Hangs / GPU Stuck at 100%
+
+The Qwen3-TTS model can occasionally enter infinite generation loops when it fails to emit an end-of-sequence token. This is a [known upstream issue](https://github.com/QwenLM/Qwen3-TTS/issues/68).
+
+**Symptoms:**
+- Generation never completes, GPU stays at 100% usage
+- More common with long reference audio (>30 seconds) or when generating long outputs
+
+**Solutions:**
+1. **Lower `max_new_tokens`** (default: 2048). Try 1024 for shorter outputs.
+2. **Use shorter reference audio** for voice cloning (5-15 seconds is ideal). The `ref_audio_max_seconds` parameter auto-trims long audio (default: 30s).
+3. **Kill the Python process** and restart ComfyUI if generation hangs.
+4. **Try a different seed** - some seeds may produce more stable results.
+
+### Slow Inference on Windows (Without FlashAttention)
+
+FlashAttention 2 is not easily available on Windows. Without it, inference may be slower.
+
+**Solutions:**
+- Set **attention** to `sdpa` (PyTorch 2.0+ native attention) for decent performance.
+- Use `eager` as a fallback if `sdpa` causes issues.
+- Consider using WSL2 with Linux for FlashAttention 2 support.
 
 ## Credits
 
