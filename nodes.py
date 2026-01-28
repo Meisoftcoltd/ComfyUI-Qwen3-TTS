@@ -13,6 +13,7 @@ import folder_paths
 import comfy.model_management as mm
 from server import PromptServer
 from qwen_tts import Qwen3TTSModel, Qwen3TTSTokenizer
+from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem
 from .dataset import TTSDataset
 from accelerate import Accelerator
 from torch.optim import AdamW
@@ -24,12 +25,17 @@ except ImportError:
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, get_linear_schedule_with_warmup
 from transformers.utils import cached_file
-from safetensors.torch import save_file
+from safetensors.torch import save_file, load_file
 
 # Register Qwen3-TTS models folder with ComfyUI
 QWEN3_TTS_MODELS_DIR = os.path.join(folder_paths.models_dir, "Qwen3-TTS")
 os.makedirs(QWEN3_TTS_MODELS_DIR, exist_ok=True)
 folder_paths.add_model_folder_path("Qwen3-TTS", QWEN3_TTS_MODELS_DIR)
+
+# Register Qwen3-TTS prompts folder for voice embeddings
+QWEN3_TTS_PROMPTS_DIR = os.path.join(folder_paths.models_dir, "Qwen3-TTS", "prompts")
+os.makedirs(QWEN3_TTS_PROMPTS_DIR, exist_ok=True)
+folder_paths.add_model_folder_path("Qwen3-TTS-Prompts", QWEN3_TTS_PROMPTS_DIR)
 
 # Model repo mappings
 QWEN3_TTS_MODELS = {
@@ -497,6 +503,126 @@ class Qwen3PromptMaker:
              raise e
              
         return (prompt,)
+
+
+class Qwen3SavePrompt:
+    """Save a QWEN3_PROMPT (voice clone embedding) to disk as safetensors."""
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "prompt": ("QWEN3_PROMPT",),
+                "filename": ("STRING", {"default": "voice_embedding"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("filepath",)
+    FUNCTION = "save_prompt"
+    CATEGORY = "Qwen3-TTS"
+    OUTPUT_NODE = True
+
+    def save_prompt(self, prompt, filename):
+        # prompt is List[VoiceClonePromptItem], we save the first item
+        if not prompt or len(prompt) == 0:
+            raise ValueError("Empty prompt - nothing to save")
+        
+        item = prompt[0]
+        
+        # Build tensors dict for safetensors
+        tensors = {
+            "ref_spk_embedding": item.ref_spk_embedding.contiguous().cpu(),
+        }
+        if item.ref_code is not None:
+            tensors["ref_code"] = item.ref_code.contiguous().cpu()
+        
+        # Build metadata dict (safetensors metadata must be strings)
+        metadata = {
+            "x_vector_only_mode": str(item.x_vector_only_mode),
+            "icl_mode": str(item.icl_mode),
+        }
+        if item.ref_text is not None:
+            metadata["ref_text"] = item.ref_text
+        
+        # Ensure filename has no extension (we add .safetensors)
+        if filename.endswith(".safetensors"):
+            filename = filename[:-12]
+        
+        filepath = os.path.join(QWEN3_TTS_PROMPTS_DIR, f"{filename}.safetensors")
+        
+        save_file(tensors, filepath, metadata=metadata)
+        print(f"Saved voice prompt to: {filepath}")
+        
+        return (filepath,)
+
+
+class Qwen3LoadPrompt:
+    """Load a QWEN3_PROMPT (voice clone embedding) from disk."""
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        # Get list of available prompt files
+        prompt_files = []
+        if os.path.exists(QWEN3_TTS_PROMPTS_DIR):
+            for f in os.listdir(QWEN3_TTS_PROMPTS_DIR):
+                if f.endswith(".safetensors"):
+                    prompt_files.append(f)
+        if not prompt_files:
+            prompt_files = ["no prompts saved yet"]
+        
+        return {
+            "required": {
+                "prompt_file": (sorted(prompt_files),),
+            },
+        }
+
+    RETURN_TYPES = ("QWEN3_PROMPT",)
+    RETURN_NAMES = ("prompt",)
+    FUNCTION = "load_prompt"
+    CATEGORY = "Qwen3-TTS"
+
+    @classmethod
+    def IS_CHANGED(s, prompt_file):
+        # Return file modification time to detect changes
+        filepath = os.path.join(QWEN3_TTS_PROMPTS_DIR, prompt_file)
+        if os.path.exists(filepath):
+            return os.path.getmtime(filepath)
+        return float("nan")
+
+    def load_prompt(self, prompt_file):
+        if prompt_file == "no prompts saved yet":
+            raise ValueError("No prompt files available. Save a prompt first using Qwen3-TTS Save Prompt.")
+        
+        filepath = os.path.join(QWEN3_TTS_PROMPTS_DIR, prompt_file)
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"Prompt file not found: {filepath}")
+        
+        # Load tensors
+        tensors = load_file(filepath)
+        
+        # Load metadata
+        from safetensors import safe_open
+        with safe_open(filepath, framework="pt") as f:
+            metadata = f.metadata() or {}
+        
+        # Reconstruct VoiceClonePromptItem
+        ref_spk_embedding = tensors["ref_spk_embedding"]
+        ref_code = tensors.get("ref_code", None)
+        x_vector_only_mode = metadata.get("x_vector_only_mode", "False") == "True"
+        icl_mode = metadata.get("icl_mode", "False") == "True"
+        ref_text = metadata.get("ref_text", None)
+        
+        item = VoiceClonePromptItem(
+            ref_code=ref_code,
+            ref_spk_embedding=ref_spk_embedding,
+            x_vector_only_mode=x_vector_only_mode,
+            icl_mode=icl_mode,
+            ref_text=ref_text,
+        )
+        
+        print(f"Loaded voice prompt from: {filepath}")
+        return ([item],)
 
 
 class Qwen3VoiceClone:

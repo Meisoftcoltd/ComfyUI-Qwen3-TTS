@@ -57,7 +57,8 @@ ComfyUI/models/Qwen3-TTS/
 ├── Qwen3-TTS-12Hz-1.7B-Base/
 ├── Qwen3-TTS-12Hz-0.6B-CustomVoice/
 ├── Qwen3-TTS-12Hz-0.6B-Base/
-└── Qwen3-TTS-Tokenizer-12Hz/          # For fine-tuning
+├── Qwen3-TTS-Tokenizer-12Hz/          # For fine-tuning
+└── prompts/                           # Saved voice embeddings (.safetensors)
 ```
 
 **First-time use**: When you first select a model and run the workflow, it will be downloaded automatically. Only the model you select is downloaded—not all variants.
@@ -97,8 +98,20 @@ Connect the loaded model to one of the generator nodes:
 - **max_new_tokens**: Maximum tokens to generate (default: 2048). Increase for longer outputs, but higher values may increase hang risk.
 - **ref_audio_max_seconds**: Auto-trim reference audio to this length (default: 30s, set to -1 to disable). Longer reference audio can cause generation hangs.
 
-### 3. Advanced: Prompt Caching
+### 3. Advanced: Prompt Caching & Voice Libraries
+
 Use the **Qwen3-TTS Prompt Maker** node to pre-calculate the voice features from a reference audio. Connect the output `Qwen3_Prompt` to the **Voice Clone** node. This is faster if you are generating many sentences with the same cloned voice.
+
+#### Saving Voice Embeddings
+
+You can save voice clone prompts to disk for reuse without recomputing:
+
+1. **Qwen3-TTS Save Prompt**: Takes a `QWEN3_PROMPT` and saves it to `models/Qwen3-TTS/prompts/<filename>.safetensors`
+2. **Qwen3-TTS Load Prompt**: Dropdown of saved prompts, outputs `QWEN3_PROMPT` directly usable by Voice Clone
+
+**Workflow example:**
+- First time: Voice Design → audio → Prompt Maker → **Save Prompt** (saves embedding)
+- Reuse: **Load Prompt** → Voice Clone (instant, no recomputation)
 
 ## Fine-Tuning
 
