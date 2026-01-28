@@ -1220,7 +1220,7 @@ class Qwen3FineTune:
 
                 # Calculate total steps and global step counter
                 total_steps_per_epoch = len(train_dataloader)
-                total_steps = total_steps_per_epoch * epochs
+                total_steps = total_steps_per_epoch * end_epoch
                 global_step = start_epoch * total_steps_per_epoch  # Resume from correct step
 
                 for epoch in range(start_epoch, end_epoch):
