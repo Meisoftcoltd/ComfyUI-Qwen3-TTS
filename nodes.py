@@ -937,7 +937,9 @@ class Qwen3FineTune:
             "optional": {
                  # Workflow
                  "resume_training": ("BOOLEAN", {"default": False, "tooltip": "Continue training from the latest checkpoint in output_dir."}),
-                 "keep_intermediate_checkpoints": ("BOOLEAN", {"default": False, "tooltip": "Keep all epoch checkpoints. When False, only the latest checkpoint is kept to save disk space."}),
+                 "log_every_steps": ("INT", {"default": 10, "min": 1, "max": 1000, "tooltip": "Log training progress every N steps."}),
+                 "save_every_epochs": ("INT", {"default": 1, "min": 1, "max": 100, "tooltip": "Save checkpoint every N epochs. Set to 1 to save every epoch."}),
+                 "save_every_steps": ("INT", {"default": 0, "min": 0, "max": 100000, "tooltip": "Save checkpoint every N steps. Set to 0 to disable step-based saving."}),
                  # VRAM Optimizations
                  "mixed_precision": (["bf16", "fp16", "no"], {"default": "bf16", "tooltip": "Mixed precision training mode. bf16 recommended for modern GPUs."}),
                  "gradient_accumulation": ("INT", {"default": 4, "min": 1, "max": 32, "tooltip": "Accumulate gradients over N steps before updating. Effective batch size = batch_size * gradient_accumulation."}),
@@ -960,7 +962,7 @@ class Qwen3FineTune:
     FUNCTION = "train"
     CATEGORY = "Qwen3-TTS/FineTuning"
 
-    def train(self, train_jsonl, init_model, source, output_dir, epochs, batch_size, lr, speaker_name, seed, mixed_precision="bf16", resume_training=False, keep_intermediate_checkpoints=False, gradient_accumulation=4, gradient_checkpointing=True, use_8bit_optimizer=True, weight_decay=0.01, max_grad_norm=1.0, warmup_steps=0, warmup_ratio=0.0, unique_id=None):
+    def train(self, train_jsonl, init_model, source, output_dir, epochs, batch_size, lr, speaker_name, seed, mixed_precision="bf16", resume_training=False, log_every_steps=10, save_every_epochs=1, save_every_steps=0, gradient_accumulation=4, gradient_checkpointing=True, use_8bit_optimizer=True, weight_decay=0.01, max_grad_norm=1.0, warmup_steps=0, warmup_ratio=0.0, unique_id=None):
         # Helper to send progress text to UI
         def send_status(text):
             if unique_id:
@@ -1158,16 +1160,68 @@ class Qwen3FineTune:
                     )
                 
                 model.train()
-                
+
                 target_speaker_embedding = None
-                
+
                 # Calculate total epochs for this run
                 end_epoch = start_epoch + epochs
                 print(f"Starting training from epoch {start_epoch + 1} to {end_epoch}...")
 
-                # Calculate total steps and logging interval
+                # Helper function to save a checkpoint
+                def save_checkpoint(checkpoint_name, current_step=None):
+                    ckpt_path = os.path.join(full_output_dir, checkpoint_name)
+
+                    # Copy entire Base model directory (official approach)
+                    # This preserves exact config structure for proper loading
+                    shutil.copytree(init_model_path, ckpt_path, dirs_exist_ok=True)
+
+                    # Save training weights
+                    unwrapped = accelerator.unwrap_model(model)
+                    torch.save(unwrapped.state_dict(), os.path.join(ckpt_path, "pytorch_model.bin"))
+
+                    # Save optimizer state for resume
+                    torch.save(optimizer.state_dict(), os.path.join(ckpt_path, "optimizer.pt"))
+
+                    # Save scheduler state for resume
+                    if scheduler:
+                        torch.save(scheduler.state_dict(), os.path.join(ckpt_path, "scheduler.pt"))
+
+                    # Modify config.json for custom voice
+                    ckpt_cfg_path = os.path.join(ckpt_path, "config.json")
+                    with open(ckpt_cfg_path, 'r', encoding='utf-8') as f:
+                        ckpt_cfg = json.load(f)
+
+                    ckpt_cfg["tts_model_type"] = "custom_voice"
+                    spk_key = speaker_name.lower()
+                    ckpt_cfg["talker_config"]["spk_id"] = {spk_key: 3000}
+                    ckpt_cfg["talker_config"]["spk_is_dialect"] = {spk_key: False}
+
+                    with open(ckpt_cfg_path, 'w', encoding='utf-8') as f:
+                        json.dump(ckpt_cfg, f, indent=2, ensure_ascii=False)
+
+                    # Overwrite model.safetensors with finetuned weights + speaker embedding
+                    state_dict = unwrapped.state_dict()
+                    state_dict = {k: v.cpu() for k, v in state_dict.items()}
+
+                    # Remove speaker_encoder weights (not needed for inference)
+                    keys_to_drop = [k for k in state_dict.keys() if k.startswith("speaker_encoder")]
+                    for k in keys_to_drop:
+                        del state_dict[k]
+
+                    # Inject speaker embedding at index 3000
+                    if target_speaker_embedding is not None:
+                        weight = state_dict['talker.model.codec_embedding.weight']
+                        state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().cpu().to(weight.dtype)
+
+                    save_file(state_dict, os.path.join(ckpt_path, "model.safetensors"))
+
+                    print(f"Checkpoint saved: {ckpt_path}")
+                    return ckpt_path
+
+                # Calculate total steps and global step counter
                 total_steps_per_epoch = len(train_dataloader)
-                log_interval = max(1, total_steps_per_epoch // 10)
+                total_steps = total_steps_per_epoch * end_epoch
+                global_step = start_epoch * total_steps_per_epoch  # Resume from correct step
 
                 for epoch in range(start_epoch, end_epoch):
                     epoch_loss = 0
@@ -1266,237 +1320,36 @@ class Qwen3FineTune:
                             
                             epoch_loss += loss.item()
                             steps += 1
+                            global_step += 1
 
                             # Show step progress periodically
-                            if steps % log_interval == 0 or steps == total_steps_per_epoch:
-                                avg_loss_so_far = epoch_loss / steps
-                                status = f"Epoch {epoch + 1}/{end_epoch} - Step {steps}/{total_steps_per_epoch} - Loss: {avg_loss_so_far:.4f}"
+                            if global_step % log_every_steps == 0:
+                                lr_val = optimizer.param_groups[0]['lr']
+                                status = f"Step {global_step}/{total_steps}, Loss: {loss.item():.4f}, LR: {lr_val:.8f}"
                                 print(status)
                                 send_status(status)
+
+                            # Save checkpoint every N steps (if enabled)
+                            if save_every_steps > 0 and global_step % save_every_steps == 0:
+                                send_status(f"Saving checkpoint step {global_step}...")
+                                save_checkpoint(f"step_{global_step}")
 
                     avg_loss = epoch_loss/steps if steps > 0 else 0
                     print(f"Epoch {epoch + 1}/{end_epoch} - Avg Loss: {avg_loss}")
                     send_status(f"Epoch {epoch + 1}/{end_epoch} - Loss: {avg_loss:.4f}")
 
-                    # Save checkpoint after each epoch
-                    send_status(f"Saving checkpoint epoch {epoch + 1}...")
-                    checkpoint_path = os.path.join(full_output_dir, f"epoch_{epoch + 1}")
-                    os.makedirs(checkpoint_path, exist_ok=True)
+                    # Save checkpoint every N epochs, or always save final epoch
+                    should_save = ((epoch + 1) % save_every_epochs == 0) or ((epoch + 1) == end_epoch)
+                    if should_save:
+                        send_status(f"Saving checkpoint epoch {epoch + 1}...")
+                        save_checkpoint(f"epoch_{epoch + 1}")
 
-                    unwrapped_model_ckpt = accelerator.unwrap_model(model)
-                    torch.save(unwrapped_model_ckpt.state_dict(), os.path.join(checkpoint_path, "pytorch_model.bin"))
-
-                    # Save optimizer state for resume (preserves momentum/Adam statistics)
-                    torch.save(optimizer.state_dict(), os.path.join(checkpoint_path, "optimizer.pt"))
-
-                    # Save scheduler state for resume
-                    if scheduler:
-                        torch.save(scheduler.state_dict(), os.path.join(checkpoint_path, "scheduler.pt"))
-
-                    # Suppress verbose library output during save (stdout, stderr, and logging)
-                    prev_log_level = logging.root.manager.disable
-                    logging.disable(logging.CRITICAL)
-                    try:
-                        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                            config.save_pretrained(checkpoint_path)
-                            qwen3tts.processor.save_pretrained(checkpoint_path)
-                    finally:
-                        logging.disable(prev_log_level)
-
-                    # Modify checkpoint config for custom voice
-                    ckpt_config_path = os.path.join(checkpoint_path, "config.json")
-                    with open(ckpt_config_path, 'r', encoding='utf-8') as f:
-                        ckpt_config_dict = json.load(f)
-
-                    # Sanitize problematic model_type keys
-                    keys_to_sanitize = ["speaker_encoder_config", "decoder_config", "encoder_config"]
-                    for key in keys_to_sanitize:
-                        if key in ckpt_config_dict and isinstance(ckpt_config_dict[key], dict):
-                            if "model_type" in ckpt_config_dict[key]:
-                                del ckpt_config_dict[key]["model_type"]
-
-                    # Set custom voice type
-                    ckpt_config_dict["tts_model_type"] = "custom_voice"
-
-                    # Add speaker config
-                    speaker_name_key = speaker_name.lower()
-                    cfg = ckpt_config_dict.get("talker_config", {})
-                    if not isinstance(cfg, dict):
-                        cfg = {}
-
-                    spk_id = cfg.get("spk_id", {})
-                    if not isinstance(spk_id, dict): spk_id = {}
-                    spk_id[speaker_name_key] = 3000
-                    cfg["spk_id"] = spk_id
-
-                    spk_is_dialect = cfg.get("spk_is_dialect", {})
-                    if not isinstance(spk_is_dialect, dict): spk_is_dialect = {}
-                    spk_is_dialect[speaker_name_key] = False
-                    cfg["spk_is_dialect"] = spk_is_dialect
-
-                    ckpt_config_dict["talker_config"] = cfg
-
-                    with open(ckpt_config_path, 'w', encoding='utf-8') as f:
-                        json.dump(ckpt_config_dict, f, indent=2, ensure_ascii=False)
-
-                    # Copy speech_tokenizer for each checkpoint
-                    st_source_ckpt = None
-                    base_model_for_st = init_model_path if not resume_checkpoint_path else resume_checkpoint_path
-                    if os.path.isdir(base_model_for_st):
-                        local_st_ckpt = os.path.join(base_model_for_st, "speech_tokenizer")
-                        if os.path.isdir(local_st_ckpt):
-                            st_source_ckpt = local_st_ckpt
-                    if st_source_ckpt:
-                        target_st_ckpt = os.path.join(checkpoint_path, "speech_tokenizer")
-                        if not os.path.exists(target_st_ckpt):
-                            shutil.copytree(st_source_ckpt, target_st_ckpt)
-
-                    print(f"Checkpoint saved: {checkpoint_path}")
-
-                    # Delete previous epoch checkpoint to save space (unless user wants to keep them)
-                    if not keep_intermediate_checkpoints and epoch > start_epoch:
-                        prev_checkpoint_path = os.path.join(full_output_dir, f"epoch_{epoch}")
-                        # Safety check: only delete if it looks like a checkpoint we created
-                        is_valid_checkpoint = (
-                            os.path.isdir(prev_checkpoint_path) and
-                            os.path.exists(os.path.join(prev_checkpoint_path, "pytorch_model.bin")) and
-                            os.path.exists(os.path.join(prev_checkpoint_path, "config.json"))
-                        )
-                        if is_valid_checkpoint:
-                            shutil.rmtree(prev_checkpoint_path)
-                            print(f"Deleted previous checkpoint: {prev_checkpoint_path}")
-                        elif os.path.exists(prev_checkpoint_path):
-                            print(f"Skipped deletion of {prev_checkpoint_path}: not a valid checkpoint directory")
-
-                # Save final model (same as last epoch checkpoint)
+                # Final output path (already saved by the epoch loop)
                 final_output_path = os.path.join(full_output_dir, f"epoch_{end_epoch}")
-                os.makedirs(final_output_path, exist_ok=True)
-                
-                print("Saving trained model...")
-                unwrapped_model = accelerator.unwrap_model(model)
-                
-                # We skip unwrapped_model.save_pretrained because it fails on config diffs (KeyError: 'dtype')
-                # We save config manually instead (suppress verbose library output)
-                prev_log_level = logging.root.manager.disable
-                logging.disable(logging.CRITICAL)
-                try:
-                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                        config.save_pretrained(final_output_path)
-                        qwen3tts.processor.save_pretrained(final_output_path)
-                finally:
-                    logging.disable(prev_log_level)
-                
-                # Save speech tokenizer which is required for loading
-                # Try to copy it from the source model location
-                st_source = None
-                if os.path.isdir(init_model_path):
-                     local_st = os.path.join(init_model_path, "speech_tokenizer")
-                     if os.path.isdir(local_st):
-                         st_source = local_st
-                else:
-                    # Try HF Cache
-                    try:
-                        st_config = cached_file(init_model_path, "speech_tokenizer/config.json")
-                        if st_config:
-                            st_source = os.path.dirname(st_config)
-                    except:
-                        pass
-                        
-                if st_source:
-                    target_st = os.path.join(final_output_path, "speech_tokenizer")
-                    if os.path.exists(target_st):
-                        shutil.rmtree(target_st)
-                    shutil.copytree(st_source, target_st)
-                    print(f"Copied speech_tokenizer from {st_source}")
-                else:
-                    print("WARNING: Could not find speech_tokenizer to copy. Loading this model might fail!")
-
-                # Copy generation_config.json if it exists in source
-                gen_config_source = None
-                if os.path.isdir(init_model_path):
-                    local_gen = os.path.join(init_model_path, "generation_config.json")
-                    if os.path.exists(local_gen):
-                        gen_config_source = local_gen
-                else:
-                    try:
-                        gen_config_source = cached_file(init_model_path, "generation_config.json")
-                    except:
-                        pass
-                
-                if gen_config_source:
-                    shutil.copy2(gen_config_source, os.path.join(final_output_path, "generation_config.json"))
-                    print(f"Copied generation_config from {gen_config_source}")
-
-                # Modify Config for Custom Voice
-                config_path = os.path.join(final_output_path, "config.json")
-                with open(config_path, 'r', encoding='utf-8') as f:
-                     config_dict = json.load(f)
-                
-                # Sanitize the config of any "model_type" keys in nested configs which cause TypeError on load
-                # NOTE: We MUST NOT sanitize "talker_config" because it needs its model_type to load correctly.
-                # speaker_encoder_config is known to crash if model_type is present.
-                keys_to_sanitize = ["speaker_encoder_config", "decoder_config", "encoder_config"]
-                for key in keys_to_sanitize:
-                    if key in config_dict and isinstance(config_dict[key], dict):
-                         if "model_type" in config_dict[key]:
-                             print(f"Sanitizing {key}: removing model_type")
-                             del config_dict[key]["model_type"]
-
-                config_dict["tts_model_type"] = "custom_voice"
-                
-                # FORCE LOWERCASE name for strict library compatibility
-                speaker_name_key = speaker_name.lower()
-
-                # We only update talker_config. speaker_encoder_config is strict and lacks spk_id/spk_is_dialect.
-                cfg_key = "talker_config"
-                cfg = config_dict.get(cfg_key, {})
-                if not isinstance(cfg, dict):
-                    cfg = {}
-                
-                spk_id = cfg.get("spk_id", {})
-                if not isinstance(spk_id, dict): spk_id = {}
-                spk_id[speaker_name_key] = 3000
-                cfg["spk_id"] = spk_id
-                
-                spk_is_dialect = cfg.get("spk_is_dialect", {})
-                if not isinstance(spk_is_dialect, dict): spk_is_dialect = {}
-                spk_is_dialect[speaker_name_key] = False
-                cfg["spk_is_dialect"] = spk_is_dialect
-                
-                config_dict[cfg_key] = cfg
-                
-                with open(config_path, 'w', encoding='utf-8') as f:
-                    json.dump(config_dict, f, indent=2, ensure_ascii=False)
-
-                # Save training checkpoint (includes all weights for resume)
-                torch.save(unwrapped_model.state_dict(), os.path.join(final_output_path, "pytorch_model.bin"))
-                print(f"Saved training checkpoint: {os.path.join(final_output_path, 'pytorch_model.bin')}")
-
-                # Save optimizer state for resume (preserves momentum/Adam statistics)
-                torch.save(optimizer.state_dict(), os.path.join(final_output_path, "optimizer.pt"))
-
-                # Save scheduler state
-                if scheduler:
-                    torch.save(scheduler.state_dict(), os.path.join(final_output_path, "scheduler.pt"))
-
-                # Save specific weights for speaker embedding (injecting into index 3000)
-                state_dict = unwrapped_model.state_dict()
-                state_dict = {k: v.cpu() for k, v in state_dict.items()}
-                
-                drop_prefix = "speaker_encoder"
-                keys_to_drop = [k for k in state_dict.keys() if k.startswith(drop_prefix)]
-                for k in keys_to_drop:
-                     del state_dict[k]
-                
-                if target_speaker_embedding is not None:
-                     weight = state_dict['talker.model.codec_embedding.weight']
-                     state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().cpu().to(weight.dtype)
-
-                save_file(state_dict, os.path.join(final_output_path, "model.safetensors"))
 
                 # Cleanup: free accelerator resources and synchronize CUDA
                 accelerator.free_memory()
-                del model, optimizer, train_dataloader, qwen3tts, unwrapped_model
+                del model, optimizer, train_dataloader, qwen3tts
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                     torch.cuda.empty_cache()
@@ -1521,6 +1374,9 @@ class Qwen3AudioCompare:
                 "generated_audio": ("AUDIO",),
                 "speaker_encoder_model": (base_models, {"default": "Qwen/Qwen3-TTS-12Hz-0.6B-Base", "tooltip": "Base model to load speaker encoder from (only loads ~76 weights, not the full model)"}),
             },
+            "optional": {
+                "local_model_path": ("STRING", {"default": "", "tooltip": "Optional custom path to model directory. If empty, uses default models/Qwen3-TTS/ location."}),
+            },
         }
 
     RETURN_TYPES = ("STRING",)
@@ -1529,7 +1385,7 @@ class Qwen3AudioCompare:
     FUNCTION = "compare"
     CATEGORY = "Qwen3-TTS/Evaluation"
 
-    def _load_speaker_encoder(self, model_repo):
+    def _load_speaker_encoder(self, model_repo, local_model_path=""):
         """Load only the speaker encoder from a Base model (not the full model)."""
         from safetensors.torch import load_file
         from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSSpeakerEncoder
@@ -1538,8 +1394,11 @@ class Qwen3AudioCompare:
         if Qwen3AudioCompare._speaker_encoder is not None and Qwen3AudioCompare._speaker_encoder_model == model_repo:
             return Qwen3AudioCompare._speaker_encoder
 
-        # Get local model path
-        model_path = get_local_model_path(model_repo)
+        # Get local model path - use provided path if non-empty, otherwise fall back to default
+        if local_model_path and local_model_path.strip():
+            model_path = local_model_path.strip()
+        else:
+            model_path = get_local_model_path(model_repo)
         if not os.path.exists(model_path):
             raise ValueError(f"Base model not found at {model_path}. Please download it first using Qwen3-TTS Loader.")
 
@@ -1603,7 +1462,7 @@ class Qwen3AudioCompare:
             embedding = speaker_encoder(mel)
         return embedding
 
-    def compare(self, reference_audio, generated_audio, speaker_encoder_model):
+    def compare(self, reference_audio, generated_audio, speaker_encoder_model, local_model_path=""):
         import librosa
         from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
 
@@ -1622,7 +1481,7 @@ class Qwen3AudioCompare:
         gen_wav, gen_sr = extract_wav(generated_audio)
 
         # 1. Speaker Similarity using speaker encoder from Base model
-        speaker_encoder = self._load_speaker_encoder(speaker_encoder_model)
+        speaker_encoder = self._load_speaker_encoder(speaker_encoder_model, local_model_path)
 
         ref_emb = self._extract_speaker_embedding(speaker_encoder, ref_wav, ref_sr)
         gen_emb = self._extract_speaker_embedding(speaker_encoder, gen_wav, gen_sr)
