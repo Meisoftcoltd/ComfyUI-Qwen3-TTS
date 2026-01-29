@@ -1,6 +1,8 @@
 # ComfyUI Qwen3-TTS
 A ComfyUI custom node suite for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS), supporting 1.7B and 0.6B models, Custom Voice, Voice Design, Voice Cloning and Fine-Tuning.
 
+> 🎤 **Looking for Speech-to-Text?** Check out [ComfyUI-Qwen3-ASR](https://github.com/DarioFT/ComfyUI-Qwen3-ASR) for audio transcription with compatible outputs!
+
 <p align="center">
     <img src="https://raw.githubusercontent.com/DarioFT/ComfyUI-Qwen3-TTS/refs/heads/main/assets/intro.png"/>
 <p>
