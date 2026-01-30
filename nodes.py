@@ -978,6 +978,7 @@ class Qwen3FineTune:
                  # Learning Rate Schedule
                  "warmup_steps": ("INT", {"default": 0, "min": 0, "max": 10000, "tooltip": "Number of warmup steps. Set to 0 to disable warmup. Recommended: 5-10% of total steps."}),
                  "warmup_ratio": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 0.5, "step": 0.01, "tooltip": "Warmup as ratio of total steps. Ignored if warmup_steps > 0. E.g., 0.1 = 10% warmup."}),
+                 "save_optimizer_state": ("BOOLEAN", {"default": False, "tooltip": "Save optimizer/scheduler state in checkpoints. Enables perfect resume but doubles checkpoint size."}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -989,7 +990,7 @@ class Qwen3FineTune:
     FUNCTION = "train"
     CATEGORY = "Qwen3-TTS/FineTuning"
 
-    def train(self, train_jsonl, init_model, source, output_dir, epochs, batch_size, lr, speaker_name, seed, mixed_precision="bf16", resume_training=False, log_every_steps=10, save_every_epochs=1, save_every_steps=0, gradient_accumulation=4, gradient_checkpointing=True, use_8bit_optimizer=True, weight_decay=0.01, max_grad_norm=1.0, warmup_steps=0, warmup_ratio=0.0, unique_id=None):
+    def train(self, train_jsonl, init_model, source, output_dir, epochs, batch_size, lr, speaker_name, seed, mixed_precision="bf16", resume_training=False, log_every_steps=10, save_every_epochs=1, save_every_steps=0, gradient_accumulation=4, gradient_checkpointing=True, use_8bit_optimizer=True, weight_decay=0.01, max_grad_norm=1.0, warmup_steps=0, warmup_ratio=0.0, save_optimizer_state=False, unique_id=None):
         # Helper to send progress text to UI
         def send_status(text):
             if unique_id:
@@ -1277,12 +1278,10 @@ class Qwen3FineTune:
                     with open(os.path.join(ckpt_path, "config.json"), 'w', encoding='utf-8') as f:
                         json.dump(ckpt_cfg, f, indent=2, ensure_ascii=False)
 
-                    # Save optimizer state for resume
-                    torch.save(optimizer.state_dict(), os.path.join(ckpt_path, "optimizer.pt"))
-
-                    # Save scheduler state for resume
-                    if scheduler:
-                        torch.save(scheduler.state_dict(), os.path.join(ckpt_path, "scheduler.pt"))
+                    if save_optimizer_state:
+                        torch.save(optimizer.state_dict(), os.path.join(ckpt_path, "optimizer.pt"))
+                        if scheduler:
+                            torch.save(scheduler.state_dict(), os.path.join(ckpt_path, "scheduler.pt"))
 
                     # Save training config with step_offset for resume
                     training_config = {
@@ -1338,10 +1337,10 @@ class Qwen3FineTune:
                     # Save as pytorch_model.bin (works for both inference and resume)
                     torch.save(state_dict, os.path.join(ckpt_path, "pytorch_model.bin"))
 
-                    # Save optimizer and scheduler for resume
-                    torch.save(optimizer.state_dict(), os.path.join(ckpt_path, "optimizer.pt"))
-                    if scheduler:
-                        torch.save(scheduler.state_dict(), os.path.join(ckpt_path, "scheduler.pt"))
+                    if save_optimizer_state:
+                        torch.save(optimizer.state_dict(), os.path.join(ckpt_path, "optimizer.pt"))
+                        if scheduler:
+                            torch.save(scheduler.state_dict(), os.path.join(ckpt_path, "scheduler.pt"))
 
                     # Save training config with step_offset for resume
                     training_config = {
