@@ -1190,16 +1190,22 @@ class Qwen3FineTune:
 
                 # Helper function to save final inference-ready model
                 def save_final_model(checkpoint_name):
-                    """Save complete model ready for inference. Includes all necessary files."""
+                    """Save complete model ready for inference and resume."""
                     ckpt_path = os.path.join(full_output_dir, checkpoint_name)
 
-                    # Copy entire base model directory (preserves exact config structure)
-                    shutil.copytree(init_model_path, ckpt_path, dirs_exist_ok=True)
+                    # Copy config files only (exclude speech_tokenizer, model files)
+                    def ignore_files(directory, files):
+                        ignored = set()
+                        if directory == init_model_path:
+                            if "speech_tokenizer" in files:
+                                ignored.add("speech_tokenizer")
+                            if "model.safetensors" in files:
+                                ignored.add("model.safetensors")
+                            if "pytorch_model.bin" in files:
+                                ignored.add("pytorch_model.bin")
+                        return ignored
 
-                    # Remove the original model.safetensors (we'll create our own)
-                    original_safetensors = os.path.join(ckpt_path, "model.safetensors")
-                    if os.path.exists(original_safetensors):
-                        os.remove(original_safetensors)
+                    shutil.copytree(init_model_path, ckpt_path, ignore=ignore_files, dirs_exist_ok=True)
 
                     # Modify config.json for custom voice
                     ckpt_cfg_path = os.path.join(ckpt_path, "config.json")
@@ -1214,22 +1220,22 @@ class Qwen3FineTune:
                     with open(ckpt_cfg_path, 'w', encoding='utf-8') as f:
                         json.dump(ckpt_cfg, f, indent=2, ensure_ascii=False)
 
-                    # Save finetuned weights with speaker embedding
+                    # Save weights with speaker embedding injected (keeps speaker_encoder for resume)
                     unwrapped = accelerator.unwrap_model(model)
-                    state_dict = unwrapped.state_dict()
-                    state_dict = {k: v.cpu() for k, v in state_dict.items()}
+                    state_dict = {k: v.cpu() for k, v in unwrapped.state_dict().items()}
 
-                    # Remove speaker_encoder weights (not needed for inference)
-                    keys_to_drop = [k for k in state_dict.keys() if k.startswith("speaker_encoder")]
-                    for k in keys_to_drop:
-                        del state_dict[k]
-
-                    # Inject speaker embedding at index 3000
+                    # Inject speaker embedding at index 3000 (for inference)
                     if target_speaker_embedding is not None:
                         weight = state_dict['talker.model.codec_embedding.weight']
                         state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().cpu().to(weight.dtype)
 
-                    save_file(state_dict, os.path.join(ckpt_path, "model.safetensors"))
+                    # Save as pytorch_model.bin (works for both inference and resume)
+                    torch.save(state_dict, os.path.join(ckpt_path, "pytorch_model.bin"))
+
+                    # Save optimizer and scheduler for resume
+                    torch.save(optimizer.state_dict(), os.path.join(ckpt_path, "optimizer.pt"))
+                    if scheduler:
+                        torch.save(scheduler.state_dict(), os.path.join(ckpt_path, "scheduler.pt"))
 
                     print(f"Final model saved: {ckpt_path}")
                     return ckpt_path
