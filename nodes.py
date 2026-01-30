@@ -1374,7 +1374,10 @@ class Qwen3FineTune:
                             # Unwrap model to access attributes (DDP/FSDP wrappers hide them)
                             unwrapped_model = accelerator.unwrap_model(model)
 
-                            speaker_embedding = unwrapped_model.speaker_encoder(ref_mels.to(model.device).to(model.dtype)).detach()
+                            # Get device/dtype from model parameters (DDP wrappers don't expose these directly)
+                            model_dtype = next(unwrapped_model.parameters()).dtype
+                            model_device = next(unwrapped_model.parameters()).device
+                            speaker_embedding = unwrapped_model.speaker_encoder(ref_mels.to(model_device).to(model_dtype)).detach()
                             if target_speaker_embedding is None:
                                 target_speaker_embedding = speaker_embedding
 
