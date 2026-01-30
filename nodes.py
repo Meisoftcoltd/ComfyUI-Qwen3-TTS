@@ -214,8 +214,7 @@ class Qwen3Loader:
                 "attention": (["auto", "flash_attention_2", "sdpa", "eager"], {"default": "auto"}),
             },
             "optional": {
-                "local_model_path": ("STRING", {"default": "", "multiline": False}),
-                "checkpoint_path": ("STRING", {"default": "", "multiline": False, "tooltip": "Path to checkpoint folder. Loads base model architecture, then applies checkpoint weights."}),
+                "local_model_path": ("STRING", {"default": "", "multiline": False, "tooltip": "Path to local model or checkpoint. If checkpoint (no speech_tokenizer/), base model loads from repo_id first."}),
             }
         }
 
@@ -224,12 +223,11 @@ class Qwen3Loader:
     FUNCTION = "load_model"
     CATEGORY = "Qwen3-TTS"
 
-    def load_model(self, repo_id, source, precision, attention, local_model_path="", checkpoint_path=""):
+    def load_model(self, repo_id, source, precision, attention, local_model_path=""):
         device = mm.get_torch_device()
-        
+
         dtype = torch.float32
         if precision == "bf16":
-            # MPS has limited bf16 support; fall back to fp16 on Mac
             if device.type == "mps":
                 dtype = torch.float16
                 print("Note: Using fp16 on MPS (bf16 has limited support)")
@@ -237,39 +235,46 @@ class Qwen3Loader:
                 dtype = torch.bfloat16
         elif precision == "fp16":
             dtype = torch.float16
-            
-        # Determine model path
-        if local_model_path and local_model_path.strip() != "":
-            model_path = local_model_path.strip()
-            print(f"Loading from local path: {model_path}")
+
+        checkpoint_path = None
+        local_path_stripped = local_model_path.strip() if local_model_path else ""
+
+        if local_path_stripped:
+            speech_tokenizer_path = os.path.join(local_path_stripped, "speech_tokenizer")
+            if os.path.exists(speech_tokenizer_path):
+                model_path = local_path_stripped
+                print(f"Loading full model from: {model_path}")
+            else:
+                checkpoint_path = local_path_stripped
+                local_path = get_local_model_path(repo_id)
+                if os.path.exists(local_path) and os.listdir(local_path):
+                    model_path = local_path
+                else:
+                    print(f"Base model not found locally. Downloading {repo_id}...")
+                    model_path = download_model_to_comfyui(repo_id, source)
+                print(f"Loading base model from: {model_path}")
+                print(f"Will apply checkpoint from: {checkpoint_path}")
         else:
-            # Check if model exists in ComfyUI models folder, download if not
             local_path = get_local_model_path(repo_id)
             if os.path.exists(local_path) and os.listdir(local_path):
                 model_path = local_path
                 print(f"Loading from ComfyUI models folder: {model_path}")
             else:
-                # Download only this specific model
                 print(f"Model not found locally. Downloading {repo_id}...")
                 model_path = download_model_to_comfyui(repo_id, source)
 
-        print(f"Loading Qwen3-TTS model: {repo_id} from {model_path} on {device} as {dtype}")
-        
-        # Determine attention implementation
-        attn_impl = "sdpa" # Default to sdpa (torch 2.0+) as it's usually available and fast
-        
+        print(f"Loading Qwen3-TTS model on {device} as {dtype}")
+
+        attn_impl = "sdpa"
         if attention != "auto":
             attn_impl = attention
         else:
-            # Auto-detect
             try:
                 import flash_attn
-                # Also check version metadata as transformers works 
                 import importlib.metadata
                 importlib.metadata.version("flash_attn")
                 attn_impl = "flash_attention_2"
             except Exception:
-                # Fallback to sdpa if flash_attn missing or metadata broken
                 attn_impl = "sdpa"
 
         print(f"Using attention implementation: {attn_impl}")
@@ -281,10 +286,8 @@ class Qwen3Loader:
             attn_implementation=attn_impl
         )
 
-        # Load checkpoint weights if provided
-        if checkpoint_path and checkpoint_path.strip():
-            ckpt_path = checkpoint_path.strip()
-            ckpt_weights = os.path.join(ckpt_path, "pytorch_model.bin")
+        if checkpoint_path:
+            ckpt_weights = os.path.join(checkpoint_path, "pytorch_model.bin")
             if os.path.exists(ckpt_weights):
                 state_dict = torch.load(ckpt_weights, map_location="cpu")
                 model.model.load_state_dict(state_dict, strict=False)
@@ -292,23 +295,9 @@ class Qwen3Loader:
             else:
                 raise ValueError(f"Checkpoint weights not found: {ckpt_weights}")
 
-            # Apply speaker mapping from checkpoint config
-            ckpt_cfg_path = os.path.join(ckpt_path, "config.json")
-            if os.path.exists(ckpt_cfg_path):
-                with open(ckpt_cfg_path, 'r', encoding='utf-8') as f:
-                    ckpt_cfg = json.load(f)
-                if "talker_config" in ckpt_cfg:
-                    talker_cfg = ckpt_cfg["talker_config"]
-                    if hasattr(model.model, 'talker') and hasattr(model.model.talker, 'config'):
-                        if "spk_id" in talker_cfg:
-                            model.model.talker.config.spk_id = talker_cfg["spk_id"]
-                        if "spk_is_dialect" in talker_cfg:
-                            model.model.talker.config.spk_is_dialect = talker_cfg["spk_is_dialect"]
-                        print(f"Applied speaker mapping: {talker_cfg.get('spk_id', {})}")
-
         # FORCE SPEAKER MAPPING FIX - Deep Injection
         try:
-            cfg_file = os.path.join(model_path, "config.json")
+            cfg_file = os.path.join(checkpoint_path, "config.json") if checkpoint_path else os.path.join(model_path, "config.json")
             if os.path.exists(cfg_file):
                 with open(cfg_file, 'r', encoding='utf-8') as f:
                     cfg_data = json.load(f)
