@@ -1,6 +1,8 @@
 # ComfyUI Qwen3-TTS
 A ComfyUI custom node suite for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS), supporting 1.7B and 0.6B models, Custom Voice, Voice Design, Voice Cloning and Fine-Tuning.
 
+> [🇪🇸 Versión en Español](README_ES.md)
+
 > 🎤 **Looking for Speech-to-Text?** Check out [ComfyUI-Qwen3-ASR](https://github.com/DarioFT/ComfyUI-Qwen3-ASR) for audio transcription with compatible outputs!
 
 <p align="center">
@@ -9,6 +11,7 @@ A ComfyUI custom node suite for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS)
 
 ## Features
 
+- **Dynamic Model Selector**: Automatically detects downloaded models and local folders in `ComfyUI/models/Qwen3-TTS/`.
 - **ComfyUI Model Folder Integration**: Models are stored in `ComfyUI/models/Qwen3-TTS/`, keeping your models organized alongside other ComfyUI models.
 - **On-Demand Download**: Only downloads the model you select—no need to pre-download all variants.
 - **Full Qwen3-TTS Support**:
@@ -70,11 +73,12 @@ ComfyUI/models/Qwen3-TTS/
 ## Usage
 
 ### 1. Load Model
-Use the **Qwen3-TTS Loader** node.
+Use the **🎙️ Qwen3-TTS Loader** node.
 - **repo_id**: Select the model you want to use.
   - `CustomVoice` models: For using preset speakers.
   - `VoiceDesign` models: For designing voices with text prompts.
   - `Base` models: For voice cloning and fine-tuning.
+  - `Local: ...`: Your custom fine-tuned or manually downloaded models detected in the folder.
 - **source**: Choose between HuggingFace or ModelScope for downloading (if model not already present locally).
 - **local_model_path**: (Optional) Path to a locally trained/downloaded model (overrides repo_id).
 - **attention**: Leave at `auto` for best performance (tries Flash Attention 2, falls back to SDPA).
@@ -83,22 +87,28 @@ Use the **Qwen3-TTS Loader** node.
 
 Connect the loaded model to one of the generator nodes:
 
-#### **Custom Voice** (Requires `CustomVoice` Model)
+#### **Custom Voice** (🗣️ Qwen3-TTS Custom Voice)
 - **speaker**: Choose one of the 9 presets (e.g., Vivian, Ryan).
 - **text**: The text to speak.
 - **language**: Target language (or Auto).
 - **instruct**: (Optional) Add emotional instructions like "Happy" or "Whispering".
+- **Generation Parameters**:
+    - **top_p** (default 0.8): Controls diversity.
+    - **temperature** (default 0.7): Controls creativity/randomness.
+    - **repetition_penalty** (default 1.1): Increase (e.g., 1.2) if the model stutters or enters infinite loops.
 
-#### **Voice Design** (Requires `VoiceDesign` Model)
+#### **Voice Design** (🎨 Qwen3-TTS Voice Design)
 - **instruct**: Describe the voice you want, e.g., *"A deep, resonant male voice, narrator style, calm and professional."*
 - **text**: The text to speak.
+- **Parameters**: Same as Custom Voice (top_p, temperature, repetition_penalty).
 
-#### **Voice Clone** (Requires `Base` Model)
+#### **Voice Clone** (👥 Qwen3-TTS Voice Clone)
 - **ref_audio**: Upload a reference audio file (1-10 seconds ideal, max 30s by default).
 - **ref_text**: The transcription of the reference audio (improves quality).
 - **text**: The text for the cloned voice to speak.
 - **max_new_tokens**: Maximum tokens to generate (default: 2048). Increase for longer outputs, but higher values may increase hang risk.
 - **ref_audio_max_seconds**: Auto-trim reference audio to this length (default: 30s, set to -1 to disable). Longer reference audio can cause generation hangs.
+- **Parameters**: Same as Custom Voice (top_p, temperature, repetition_penalty).
 
 ### 3. Advanced: Prompt Caching & Voice Libraries
 
@@ -162,10 +172,10 @@ The Qwen3-TTS model can occasionally enter infinite generation loops when it fai
 - More common with long reference audio (>30 seconds) or when generating long outputs
 
 **Solutions:**
-1. **Lower `max_new_tokens`** (default: 2048). Try 1024 for shorter outputs.
-2. **Use shorter reference audio** for voice cloning (5-15 seconds is ideal). The `ref_audio_max_seconds` parameter auto-trims long audio (default: 30s).
-3. **Kill the Python process** and restart ComfyUI if generation hangs.
-4. **Try a different seed** - some seeds may produce more stable results.
+1. **Increase `repetition_penalty`**: Try setting it to 1.1 or 1.2. This is the most effective fix.
+2. **Lower `max_new_tokens`** (default: 2048). Try 1024 for shorter outputs.
+3. **Use shorter reference audio** for voice cloning (5-15 seconds is ideal). The `ref_audio_max_seconds` parameter auto-trims long audio (default: 30s).
+4. **Kill the Python process** and restart ComfyUI if generation hangs.
 
 ### Slow Inference on Windows (Without FlashAttention)
 
