@@ -139,15 +139,32 @@ def download_model_to_comfyui(repo_id: str, source: str) -> str:
     return target_path
 
 def get_available_models() -> list:
-    """Get list of available models (downloaded + all options)."""
+    """Get list of available models (downloaded + all options + local folders)."""
     available = []
+
+    # 1. Known Repo IDs
     for repo_id, folder_name in QWEN3_TTS_MODELS.items():
         local_path = os.path.join(QWEN3_TTS_MODELS_DIR, folder_name)
         if os.path.exists(local_path) and os.listdir(local_path):
             available.append(f"✓ {repo_id}")
         else:
             available.append(repo_id)
-    return available
+
+    # 2. Other Local Folders (not matching known repos)
+    if os.path.exists(QWEN3_TTS_MODELS_DIR):
+        for item in os.listdir(QWEN3_TTS_MODELS_DIR):
+            item_path = os.path.join(QWEN3_TTS_MODELS_DIR, item)
+            if os.path.isdir(item_path):
+                # Check if this folder is already covered by the mapping
+                is_known = False
+                for repo_id, folder_name in QWEN3_TTS_MODELS.items():
+                    if item == folder_name:
+                        is_known = True
+                        break
+                if not is_known and item != "prompts":
+                    available.append(f"Local: {item}")
+
+    return sorted(available)
 
 # Helper to convert audio to ComfyUI format
 def convert_audio(wav, sr):
@@ -244,7 +261,7 @@ class Qwen3Loader:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "repo_id": (list(QWEN3_TTS_MODELS.keys()), {"default": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"}),
+                "repo_id": (get_available_models(), {"default": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"}),
                 "source": (["HuggingFace", "ModelScope"], {"default": "HuggingFace"}),
                 "precision": (["fp16", "bf16", "fp32"], {"default": "bf16"}),
                 "attention": (["auto", "flash_attention_2", "sdpa", "eager"], {"default": "auto"}),
@@ -260,6 +277,16 @@ class Qwen3Loader:
     CATEGORY = "Qwen3-TTS"
 
     def load_model(self, repo_id, source, precision, attention, local_model_path=""):
+        # Handle "✓ " prefix or "Local: " prefix
+        model_name = repo_id
+        is_local_selection = False
+
+        if model_name.startswith("✓ "):
+            model_name = model_name[2:]
+        elif model_name.startswith("Local: "):
+            model_name = model_name[7:]
+            is_local_selection = True
+
         device = mm.get_torch_device()
 
         dtype = torch.float32
@@ -281,23 +308,35 @@ class Qwen3Loader:
                 model_path = local_path_stripped
                 print(f"Loading full model from: {model_path}")
             else:
+                # Loading checkpoint over base model
                 checkpoint_path = local_path_stripped
-                local_path = get_local_model_path(repo_id)
-                if os.path.exists(local_path) and os.listdir(local_path):
-                    model_path = local_path
+
+                # If we selected a local model, use that as base
+                if is_local_selection:
+                     model_path = os.path.join(QWEN3_TTS_MODELS_DIR, model_name)
                 else:
-                    print(f"Base model not found locally. Downloading {repo_id}...")
-                    model_path = download_model_to_comfyui(repo_id, source)
+                    # Use repo_id logic
+                    local_path = get_local_model_path(model_name)
+                    if os.path.exists(local_path) and os.listdir(local_path):
+                        model_path = local_path
+                    else:
+                        print(f"Base model not found locally. Downloading {model_name}...")
+                        model_path = download_model_to_comfyui(model_name, source)
+
                 print(f"Loading base model from: {model_path}")
                 print(f"Will apply checkpoint from: {checkpoint_path}")
         else:
-            local_path = get_local_model_path(repo_id)
-            if os.path.exists(local_path) and os.listdir(local_path):
-                model_path = local_path
-                print(f"Loading from ComfyUI models folder: {model_path}")
+            if is_local_selection:
+                model_path = os.path.join(QWEN3_TTS_MODELS_DIR, model_name)
+                print(f"Loading local model from ComfyUI models folder: {model_path}")
             else:
-                print(f"Model not found locally. Downloading {repo_id}...")
-                model_path = download_model_to_comfyui(repo_id, source)
+                local_path = get_local_model_path(model_name)
+                if os.path.exists(local_path) and os.listdir(local_path):
+                    model_path = local_path
+                    print(f"Loading from ComfyUI models folder: {model_path}")
+                else:
+                    print(f"Model not found locally. Downloading {model_name}...")
+                    model_path = download_model_to_comfyui(model_name, source)
 
         print(f"Loading Qwen3-TTS model on {device} as {dtype}")
 
@@ -421,18 +460,21 @@ class Qwen3CustomVoice:
                 "instruct": ("STRING", {"multiline": True, "default": ""}),
                 "custom_speaker_name": ("STRING", {"default": ""}),
                 "max_new_tokens": ("INT", {"default": 2048, "min": 64, "max": 8192, "step": 64}),
+                "top_p": ("FLOAT", {"default": 0.8, "min": 0.1, "max": 1.0, "step": 0.01}),
+                "temperature": ("FLOAT", {"default": 0.7, "min": 0.1, "max": 2.0, "step": 0.01}),
+                "repetition_penalty": ("FLOAT", {"default": 1.1, "min": 1.0, "max": 2.0, "step": 0.01, "tooltip": "Penalty for repetition. Increase (e.g., 1.1-1.2) to prevent infinite loops/stuttering."}),
             }
         }
     
     @classmethod
-    def IS_CHANGED(s, model, text, language, speaker, seed, instruct="", custom_speaker_name="", max_new_tokens=8192):
+    def IS_CHANGED(s, model, text, language, speaker, seed, instruct="", custom_speaker_name="", max_new_tokens=8192, top_p=0.8, temperature=0.7, repetition_penalty=1.1):
         return seed
 
     RETURN_TYPES = ("AUDIO",)
     FUNCTION = "generate"
     CATEGORY = "Qwen3-TTS"
 
-    def generate(self, model, text, language, speaker, seed, instruct="", custom_speaker_name="", max_new_tokens=8192):
+    def generate(self, model, text, language, speaker, seed, instruct="", custom_speaker_name="", max_new_tokens=8192, top_p=0.8, temperature=0.7, repetition_penalty=1.1):
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
@@ -464,14 +506,31 @@ class Qwen3CustomVoice:
         except Exception as e:
             print(f"DEBUG: Speaker case-matching failed: {e}", flush=True)
 
+        gen_kwargs = {
+            "top_p": top_p,
+            "temperature": temperature,
+            "repetition_penalty": repetition_penalty,
+        }
+
         try:
-            wavs, sr = model.generate_custom_voice(
-                text=text,
-                language=lang,
-                speaker=target_speaker,
-                instruct=inst,
-                max_new_tokens=max_new_tokens
-            )
+            try:
+                wavs, sr = model.generate_custom_voice(
+                    text=text,
+                    language=lang,
+                    speaker=target_speaker,
+                    instruct=inst,
+                    max_new_tokens=max_new_tokens,
+                    **gen_kwargs
+                )
+            except TypeError:
+                print("Warning: Model generation function does not support extra parameters (top_p, temperature, repetition_penalty). Ignoring them.")
+                wavs, sr = model.generate_custom_voice(
+                    text=text,
+                    language=lang,
+                    speaker=target_speaker,
+                    instruct=inst,
+                    max_new_tokens=max_new_tokens
+                )
         except ValueError as e:
             # Catch model type mismatch errors from qwen-tts
             msg = str(e)
@@ -495,29 +554,49 @@ class Qwen3VoiceDesign:
                     "French", "Russian", "Portuguese", "Spanish", "Italian"
                 ], {"default": "Auto"}),
                 "seed": ("INT", {"default": 42, "min": 1, "max": 0xffffffffffffffff}),
+            },
+            "optional": {
+                "top_p": ("FLOAT", {"default": 0.8, "min": 0.1, "max": 1.0, "step": 0.01}),
+                "temperature": ("FLOAT", {"default": 0.7, "min": 0.1, "max": 2.0, "step": 0.01}),
+                "repetition_penalty": ("FLOAT", {"default": 1.1, "min": 1.0, "max": 2.0, "step": 0.01, "tooltip": "Penalty for repetition. Increase (e.g., 1.1-1.2) to prevent infinite loops/stuttering."}),
             }
         }
     
     @classmethod
-    def IS_CHANGED(s, model, text, instruct, language, seed):
+    def IS_CHANGED(s, model, text, instruct, language, seed, top_p=0.8, temperature=0.7, repetition_penalty=1.1):
         return seed
 
     RETURN_TYPES = ("AUDIO",)
     FUNCTION = "generate"
     CATEGORY = "Qwen3-TTS"
 
-    def generate(self, model, text, instruct, language, seed):
+    def generate(self, model, text, instruct, language, seed, top_p=0.8, temperature=0.7, repetition_penalty=1.1):
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
         lang = language if language != "Auto" else None
         
+        gen_kwargs = {
+            "top_p": top_p,
+            "temperature": temperature,
+            "repetition_penalty": repetition_penalty,
+        }
+
         try:
-            wavs, sr = model.generate_voice_design(
-                text=text,
-                language=lang,
-                instruct=instruct
-            )
+            try:
+                wavs, sr = model.generate_voice_design(
+                    text=text,
+                    language=lang,
+                    instruct=instruct,
+                    **gen_kwargs
+                )
+            except TypeError:
+                print("Warning: Model generation function does not support extra parameters (top_p, temperature, repetition_penalty). Ignoring them.")
+                wavs, sr = model.generate_voice_design(
+                    text=text,
+                    language=lang,
+                    instruct=instruct
+                )
         except ValueError as e:
              msg = str(e)
              if "does not support generate_voice_design" in msg:
@@ -712,18 +791,21 @@ class Qwen3VoiceClone:
                 "prompt": ("QWEN3_PROMPT",),
                 "max_new_tokens": ("INT", {"default": 2048, "min": 64, "max": 8192, "step": 64}),
                 "ref_audio_max_seconds": ("FLOAT", {"default": 30.0, "min": -1.0, "max": 120.0, "step": 5.0}),
+                "top_p": ("FLOAT", {"default": 0.8, "min": 0.1, "max": 1.0, "step": 0.01}),
+                "temperature": ("FLOAT", {"default": 0.7, "min": 0.1, "max": 2.0, "step": 0.01}),
+                "repetition_penalty": ("FLOAT", {"default": 1.1, "min": 1.0, "max": 2.0, "step": 0.01, "tooltip": "Penalty for repetition. Increase (e.g., 1.1-1.2) to prevent infinite loops/stuttering."}),
             }
         }
     
     @classmethod
-    def IS_CHANGED(s, model, text, seed, language="Auto", ref_audio=None, ref_text=None, prompt=None, max_new_tokens=2048, ref_audio_max_seconds=30.0):
+    def IS_CHANGED(s, model, text, seed, language="Auto", ref_audio=None, ref_text=None, prompt=None, max_new_tokens=2048, ref_audio_max_seconds=30.0, top_p=0.8, temperature=0.7, repetition_penalty=1.1):
         return seed
 
     RETURN_TYPES = ("AUDIO",)
     FUNCTION = "generate"
     CATEGORY = "Qwen3-TTS"
 
-    def generate(self, model, text, seed, language="Auto", ref_audio=None, ref_text=None, prompt=None, max_new_tokens=2048, ref_audio_max_seconds=30.0):
+    def generate(self, model, text, seed, language="Auto", ref_audio=None, ref_text=None, prompt=None, max_new_tokens=2048, ref_audio_max_seconds=30.0, top_p=0.8, temperature=0.7, repetition_penalty=1.1):
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
@@ -731,16 +813,32 @@ class Qwen3VoiceClone:
         
         wavs = None
         sr = 0
+
+        gen_kwargs = {
+            "top_p": top_p,
+            "temperature": temperature,
+            "repetition_penalty": repetition_penalty,
+        }
         
         try:
             if prompt is not None:
                 # Use pre-calculated prompt
-                wavs, sr = model.generate_voice_clone(
-                    text=text,
-                    language=lang,
-                    voice_clone_prompt=prompt,
-                    max_new_tokens=max_new_tokens
-                )
+                try:
+                    wavs, sr = model.generate_voice_clone(
+                        text=text,
+                        language=lang,
+                        voice_clone_prompt=prompt,
+                        max_new_tokens=max_new_tokens,
+                        **gen_kwargs
+                    )
+                except TypeError:
+                    print("Warning: Model generation function does not support extra parameters. Ignoring them.")
+                    wavs, sr = model.generate_voice_clone(
+                        text=text,
+                        language=lang,
+                        voice_clone_prompt=prompt,
+                        max_new_tokens=max_new_tokens
+                    )
             elif ref_audio is not None and ref_text is not None and ref_text.strip() != "":
                 # Use on-the-fly prompt creation
                 audio_tuple = load_audio_input(ref_audio)
@@ -754,13 +852,24 @@ class Qwen3VoiceClone:
                         wav_data = wav_data[:max_samples]
                         audio_tuple = (wav_data, audio_sr)
                 
-                wavs, sr = model.generate_voice_clone(
-                    text=text,
-                    language=lang,
-                    ref_audio=audio_tuple,
-                    ref_text=ref_text,
-                    max_new_tokens=max_new_tokens
-                )
+                try:
+                    wavs, sr = model.generate_voice_clone(
+                        text=text,
+                        language=lang,
+                        ref_audio=audio_tuple,
+                        ref_text=ref_text,
+                        max_new_tokens=max_new_tokens,
+                        **gen_kwargs
+                    )
+                except TypeError:
+                     print("Warning: Model generation function does not support extra parameters. Ignoring them.")
+                     wavs, sr = model.generate_voice_clone(
+                        text=text,
+                        language=lang,
+                        ref_audio=audio_tuple,
+                        ref_text=ref_text,
+                        max_new_tokens=max_new_tokens
+                    )
             else:
                  raise ValueError("For Voice Clone, you must provide either 'prompt' OR ('ref_audio' AND 'ref_text').")
         except ValueError as e:
