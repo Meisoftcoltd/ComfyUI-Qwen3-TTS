@@ -342,6 +342,22 @@ class Qwen3Loader:
                         print(f"DEBUG: Successfully injected custom speaker mapping: {new_spk_id}", flush=True)
                     else:
                         print("DEBUG: Failed to find an appropriate config object to inject mapping into.", flush=True)
+
+                # Inject tts_model_type if present in checkpoint config
+                if "tts_model_type" in cfg_data:
+                    new_tts_model_type = cfg_data["tts_model_type"]
+
+                    # Inject into config objects
+                    for root_cfg in configs_to_update:
+                        if hasattr(root_cfg, "tts_model_type"):
+                            setattr(root_cfg, "tts_model_type", new_tts_model_type)
+
+                    # CRITICAL: Also update the direct attribute on the inner model
+                    # This is what generate_custom_voice() actually checks
+                    if hasattr(model, "model") and hasattr(model.model, "tts_model_type"):
+                        model.model.tts_model_type = new_tts_model_type
+
+                    print(f"DEBUG: Injected tts_model_type = {new_tts_model_type}", flush=True)
         except Exception as e:
             print(f"DEBUG: Error during deep speaker injection: {e}", flush=True)
         
@@ -957,7 +973,7 @@ class Qwen3FineTune:
                  "save_every_epochs": ("INT", {"default": 1, "min": 0, "max": 100, "tooltip": "Save checkpoint every N epochs. Set to 0 to only save final epoch. Ignored if save_every_steps > 0."}),
                  "save_every_steps": ("INT", {"default": 0, "min": 0, "max": 100000, "tooltip": "Save checkpoint every N steps. Set to 0 to use epoch-based saving instead."}),
                  # VRAM Optimizations
-                 "mixed_precision": (["bf16", "fp16", "no"], {"default": "bf16", "tooltip": "Mixed precision training mode. bf16 recommended for modern GPUs."}),
+                 "mixed_precision": (["bf16", "fp32"], {"default": "bf16", "tooltip": "bf16 recommended. Use fp32 only if GPU doesn't support bf16 (pre-Ampere)."}),
                  "gradient_accumulation": ("INT", {"default": 4, "min": 1, "max": 32, "tooltip": "Accumulate gradients over N steps before updating. Effective batch size = batch_size * gradient_accumulation."}),
                  "gradient_checkpointing": ("BOOLEAN", {"default": True, "tooltip": "Trade compute for VRAM by recomputing activations. Saves ~30-40% VRAM."}),
                  "use_8bit_optimizer": ("BOOLEAN", {"default": True, "tooltip": "Use 8-bit AdamW optimizer. Saves ~50% optimizer VRAM. Requires bitsandbytes."}),
@@ -1096,7 +1112,20 @@ class Qwen3FineTune:
                     os.environ.setdefault("MASTER_PORT", "29500")
                     print(f"Multi-GPU training enabled: {num_gpus} GPUs detected")
 
-                accelerator = Accelerator(gradient_accumulation_steps=gradient_accumulation, mixed_precision=mixed_precision, cpu=use_cpu)
+                # Check GPU bf16 support and fallback to fp32 if needed
+                actual_mixed_precision = mixed_precision
+                if not use_cpu and torch.cuda.is_available() and mixed_precision == "bf16":
+                    device_cap = torch.cuda.get_device_capability()
+                    gpu_name = torch.cuda.get_device_name()
+                    # bf16 requires compute capability >= 8.0 (Ampere+)
+                    if device_cap[0] < 8:
+                        print(f"Warning: {gpu_name} (compute {device_cap[0]}.{device_cap[1]}) does not support bf16.")
+                        print("Falling back to fp32. Note: FP32 uses ~2x more VRAM than bf16.")
+                        actual_mixed_precision = "fp32"
+
+                # Accelerator uses "no" for fp32
+                accel_precision = "no" if actual_mixed_precision == "fp32" else actual_mixed_precision
+                accelerator = Accelerator(gradient_accumulation_steps=gradient_accumulation, mixed_precision=accel_precision, cpu=use_cpu)
 
                 if resume_checkpoint_path:
                     print(f"Loading base model: {init_model_path} (will apply checkpoint weights from {resume_checkpoint_path})")
@@ -1114,7 +1143,7 @@ class Qwen3FineTune:
 
                 print(f"Using attention implementation: {attn_impl}")
 
-                dtype = torch.bfloat16 if mixed_precision == "bf16" else torch.float16 if mixed_precision == "fp16" else torch.float32
+                dtype = torch.bfloat16 if actual_mixed_precision == "bf16" else torch.float32
 
                 qwen3tts = Qwen3TTSModel.from_pretrained(
                     init_model_path,
