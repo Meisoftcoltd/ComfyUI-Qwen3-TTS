@@ -24,6 +24,7 @@ Una suite de nodos personalizados de ComfyUI para [Qwen3-TTS](https://github.com
 - **Comparación de Audio**: Evalúa modelos entrenados con métricas de similitud de hablante y espectrograma mel.
 - **Soporte Multilingüe**: Genera voz en chino, inglés, japonés, coreano, alemán, francés, ruso, portugués, español e italiano.
 - **Atención Flexible**: soporte robusto para `flash_attention_2` con retroceso automático a `sdpa` (atención estándar de PyTorch 2.0) si faltan dependencias.
+- **Soporte WSL2**: Corrección automática de rutas para usuarios de WSL2 que acceden a discos de Windows (ej. `Z:\` se mapea a `/mnt/z/`).
 
 ## Instalación
 
@@ -146,6 +147,13 @@ El modelo Qwen3-TTS puede entrar ocasionalmente en bucles de generación infinit
 Si no tienes FlashAttention 2 (común en Windows), la inferencia puede ser más lenta.
 - Configura **attention** en `sdpa` o `eager`.
 - Considera usar WSL2.
+
+### Problemas de rutas en WSL2 / "File Not Found"
+
+Si ejecutas ComfyUI dentro de WSL2 pero accedes a archivos en un disco de Windows (ej. `Z:\mi_audio.wav`), esta suite de nodos convierte automáticamente las rutas a sus equivalentes en WSL (ej. `/mnt/z/mi_audio.wav`).
+
+**Depuración:**
+- Revisa la consola de ComfyUI en busca de mensajes que empiecen por `[Qwen3-TTS DEBUG]`. Estos registros muestran la conversión exacta de rutas, así como el conteo de archivos para la creación de datasets y el progreso del entrenamiento.
 
 ## Créditos
 

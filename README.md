@@ -26,6 +26,7 @@ A ComfyUI custom node suite for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS)
 - **Audio Comparison**: Evaluate fine-tuned models with speaker similarity and mel spectrogram metrics.
 - **Cross-Lingual Support**: Generate speech in Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, and Italian.
 - **Flexible Attention**: robust support for `flash_attention_2` with automatic fallback to `sdpa` (standard PyTorch 2.0 attention) if dependencies are missing.
+- **WSL2 Support**: Built-in path correction for WSL2 users accessing Windows drives (e.g., `Z:\` maps to `/mnt/z/`).
 
 ## Installation
 
@@ -185,6 +186,13 @@ FlashAttention 2 is not easily available on Windows. Without it, inference may b
 - Set **attention** to `sdpa` (PyTorch 2.0+ native attention) for decent performance.
 - Use `eager` as a fallback if `sdpa` causes issues.
 - Consider using WSL2 with Linux for FlashAttention 2 support.
+
+### WSL2 Path Issues / "File Not Found"
+
+If you are running ComfyUI inside WSL2 but accessing files on a Windows drive (e.g., `Z:\my_audio.wav`), this node suite automatically converts paths to their WSL equivalents (e.g., `/mnt/z/my_audio.wav`).
+
+**Debugging:**
+- Check the ComfyUI console for logs starting with `[Qwen3-TTS DEBUG]`. These logs show the exact path conversion taking place, as well as file counts for dataset creation and training progress.
 
 ## Credits
 
