@@ -13,6 +13,25 @@ import numpy as np
 import folder_paths
 import comfy.model_management as mm
 from server import PromptServer
+import platform
+
+def fix_wsl_path(path):
+    """Helper to convert Windows paths to WSL paths if running on Linux."""
+    if not path or not isinstance(path, str):
+        return path
+    if platform.system() == "Linux":
+        # Check for Windows style path like "Z:\" or "C:\" or "Z:/"
+        # We look for [Letter]:
+        if len(path) >= 2 and path[1] == ':' and path[0].isalpha():
+            drive = path[0].lower()
+            rest = path[2:].replace('\\', '/')
+            if not rest.startswith('/'):
+                 rest = '/' + rest
+            new_path = f"/mnt/{drive}{rest}"
+            print(f"[Qwen3-TTS DEBUG] Detected Windows path in WSL: '{path}' -> converting to '{new_path}'")
+            return new_path
+    return path
+
 from qwen_tts import Qwen3TTSModel, Qwen3TTSTokenizer
 from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem
 from .dataset import TTSDataset
@@ -919,20 +938,28 @@ class Qwen3DatasetFromFolder:
 
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("jsonl_path",)
+    OUTPUT_NODE = True
     FUNCTION = "create_dataset"
     CATEGORY = "Qwen3-TTS/FineTuning"
 
     def create_dataset(self, folder_path, output_filename, ref_audio_path):
         folder_path = folder_path.strip().strip('"')
+        folder_path = fix_wsl_path(folder_path)
+        ref_audio_path = fix_wsl_path(ref_audio_path.strip().strip('"'))
+
+        print(f"[Qwen3-TTS DEBUG] create_dataset called. folder_path: {folder_path}")
+
         if not os.path.exists(folder_path):
             raise ValueError(f"Folder not found: {folder_path}")
             
         jsonl_path = os.path.join(folder_path, output_filename)
-        print(f"Creating dataset at: {jsonl_path}")
+        print(f"[Qwen3-TTS DEBUG] Creating dataset at: {jsonl_path}")
         
         # Get all files first to help matching
         all_files = os.listdir(folder_path)
+        print(f"[Qwen3-TTS DEBUG] Found {len(all_files)} files in directory")
         wav_files = [f for f in all_files if f.lower().endswith('.wav')]
+        print(f"[Qwen3-TTS DEBUG] Found {len(wav_files)} .wav files")
         
         if not wav_files:
              raise ValueError(f"No .wav files found in {folder_path}")
@@ -1021,16 +1048,21 @@ class Qwen3DataPrep:
 
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("processed_jsonl_path",)
+    OUTPUT_NODE = True
     FUNCTION = "process"
     CATEGORY = "Qwen3-TTS/FineTuning"
 
     def process(self, jsonl_path, tokenizer_repo, source, batch_size, unique_id=None):
+        jsonl_path = fix_wsl_path(jsonl_path)
+        print(f"[Qwen3-TTS DEBUG] DataPrep process started. Input: {jsonl_path}, Tokenizer: {tokenizer_repo}")
+
         # Helper to send progress text to UI
         def send_status(text):
             if unique_id:
                 PromptServer.instance.send_progress_text(text, unique_id)
 
         device = mm.get_torch_device()
+        print(f"[Qwen3-TTS DEBUG] Using device: {device}")
 
         output_path = jsonl_path.replace(".jsonl", "_codes.jsonl")
         meta_path = jsonl_path.replace(".jsonl", "_codes.meta.json")
@@ -1163,10 +1195,18 @@ class Qwen3FineTune:
 
     RETURN_TYPES = ("STRING", "STRING")
     RETURN_NAMES = ("model_path", "custom_speaker_name")
+    OUTPUT_NODE = True
     FUNCTION = "train"
     CATEGORY = "Qwen3-TTS/FineTuning"
 
     def train(self, train_jsonl, init_model, source, output_dir, epochs, batch_size, lr, speaker_name, seed, mixed_precision="bf16", resume_training=False, log_every_steps=10, save_every_epochs=1, save_every_steps=0, gradient_accumulation=4, gradient_checkpointing=True, use_8bit_optimizer=True, weight_decay=0.01, max_grad_norm=1.0, warmup_steps=0, warmup_ratio=0.0, save_optimizer_state=False, unique_id=None):
+        train_jsonl = fix_wsl_path(train_jsonl)
+        output_dir = fix_wsl_path(output_dir)
+        init_model = fix_wsl_path(init_model)
+
+        print(f"[Qwen3-TTS DEBUG] Train called. JSONL: {train_jsonl}, Output: {output_dir}")
+        print(f"[Qwen3-TTS DEBUG] Config: Epochs={epochs}, Batch={batch_size}, LR={lr}, MixedPrecision={mixed_precision}")
+
         # Helper to send progress text to UI
         def send_status(text):
             if unique_id:
@@ -1175,6 +1215,7 @@ class Qwen3FineTune:
         # Setup output directory
         full_output_dir = os.path.abspath(output_dir)
         os.makedirs(full_output_dir, exist_ok=True)
+        print(f"[Qwen3-TTS DEBUG] Full output directory: {full_output_dir}")
 
         # Check for resume checkpoint
         start_epoch = 0
@@ -1709,6 +1750,9 @@ class Qwen3LoadAudioFromPath:
     CATEGORY = "Qwen3-TTS"
 
     def load_audio(self, audio_path):
+        audio_path = fix_wsl_path(audio_path)
+        print(f"[Qwen3-TTS DEBUG] LoadAudioFromPath: {audio_path}")
+
         if not audio_path or not os.path.exists(audio_path):
             raise ValueError(f"Audio file not found: {audio_path}")
 
