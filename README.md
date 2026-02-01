@@ -11,8 +11,8 @@ A ComfyUI custom node suite for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS)
 
 ## Features
 
-- **Dynamic Model Selector**: Automatically detects downloaded models and local folders in `ComfyUI/models/Qwen3-TTS/`.
-- **ComfyUI Model Folder Integration**: Models are stored in `ComfyUI/models/Qwen3-TTS/`, keeping your models organized alongside other ComfyUI models.
+- **Dynamic Model Selector**: Automatically detects downloaded models and local folders in `ComfyUI/models/tts/`.
+- **ComfyUI Model Folder Integration**: Models are stored in `ComfyUI/models/tts/`, keeping your models organized alongside other ComfyUI models.
 - **On-Demand Download**: Only downloads the model you select—no need to pre-download all variants.
 - **Full Qwen3-TTS Support**:
   - **Custom Voice**: Use 9 preset high-quality voices (Vivian, Ryan, etc.).
@@ -56,7 +56,7 @@ A ComfyUI custom node suite for [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS)
 
 Models and tokenizers are automatically stored in your ComfyUI models folder:
 ```
-ComfyUI/models/Qwen3-TTS/
+ComfyUI/models/tts/
 ├── Qwen3-TTS-12Hz-1.7B-CustomVoice/
 ├── Qwen3-TTS-12Hz-1.7B-VoiceDesign/
 ├── Qwen3-TTS-12Hz-1.7B-Base/
@@ -118,7 +118,7 @@ Use the **Qwen3-TTS Prompt Maker** node to pre-calculate the voice features from
 
 You can save voice clone prompts to disk for reuse without recomputing:
 
-1. **Qwen3-TTS Save Prompt**: Takes a `QWEN3_PROMPT` and saves it to `models/Qwen3-TTS/prompts/<filename>.safetensors`
+1. **Qwen3-TTS Save Prompt**: Takes a `QWEN3_PROMPT` and saves it to `models/tts/prompts/<filename>.safetensors`
 2. **Qwen3-TTS Load Prompt**: Dropdown of saved prompts, outputs `QWEN3_PROMPT` directly usable by Voice Clone
 
 **Workflow example:**

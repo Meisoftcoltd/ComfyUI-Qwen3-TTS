@@ -29,12 +29,21 @@ from transformers.utils import cached_file
 from safetensors.torch import save_file, load_file
 
 # Register Qwen3-TTS models folder with ComfyUI
-QWEN3_TTS_MODELS_DIR = os.path.join(folder_paths.models_dir, "Qwen3-TTS")
-os.makedirs(QWEN3_TTS_MODELS_DIR, exist_ok=True)
-folder_paths.add_model_folder_path("Qwen3-TTS", QWEN3_TTS_MODELS_DIR)
+# We support both 'models/tts' (new default) and 'models/Qwen3-TTS' (legacy)
+TTS_MODELS_DIR = os.path.join(folder_paths.models_dir, "tts")
+OLD_QWEN3_TTS_MODELS_DIR = os.path.join(folder_paths.models_dir, "Qwen3-TTS")
+
+os.makedirs(TTS_MODELS_DIR, exist_ok=True)
+
+# Primary directory is now models/tts
+QWEN3_TTS_MODELS_DIR = TTS_MODELS_DIR
+
+folder_paths.add_model_folder_path("tts", TTS_MODELS_DIR)
+folder_paths.add_model_folder_path("Qwen3-TTS", OLD_QWEN3_TTS_MODELS_DIR)
 
 # Register Qwen3-TTS prompts folder for voice embeddings
-QWEN3_TTS_PROMPTS_DIR = os.path.join(folder_paths.models_dir, "Qwen3-TTS", "prompts")
+# Now stored in models/tts/prompts
+QWEN3_TTS_PROMPTS_DIR = os.path.join(TTS_MODELS_DIR, "prompts")
 os.makedirs(QWEN3_TTS_PROMPTS_DIR, exist_ok=True)
 folder_paths.add_model_folder_path("Qwen3-TTS-Prompts", QWEN3_TTS_PROMPTS_DIR)
 
@@ -55,7 +64,19 @@ QWEN3_TTS_TOKENIZERS = {
 def get_local_model_path(repo_id: str) -> str:
     """Get the local path for a model/tokenizer in ComfyUI's models folder."""
     folder_name = QWEN3_TTS_MODELS.get(repo_id) or QWEN3_TTS_TOKENIZERS.get(repo_id) or repo_id.replace("/", "_")
-    return os.path.join(QWEN3_TTS_MODELS_DIR, folder_name)
+
+    # Check new location first
+    new_path = os.path.join(TTS_MODELS_DIR, folder_name)
+    if os.path.exists(new_path):
+        return new_path
+
+    # Check old location
+    old_path = os.path.join(OLD_QWEN3_TTS_MODELS_DIR, folder_name)
+    if os.path.exists(old_path):
+        return old_path
+
+    # Default to new location for download
+    return new_path
 
 def compute_file_hash(file_path: str) -> str:
     """Compute SHA256 hash of file content."""
@@ -144,27 +165,32 @@ def get_available_models() -> list:
 
     # 1. Known Repo IDs
     for repo_id, folder_name in QWEN3_TTS_MODELS.items():
-        local_path = os.path.join(QWEN3_TTS_MODELS_DIR, folder_name)
+        # Always add the raw repo_id to ensure validation passes for existing workflows
+        available.append(repo_id)
+
+        local_path = get_local_model_path(repo_id)
         if os.path.exists(local_path) and os.listdir(local_path):
             available.append(f"✓ {repo_id}")
-        else:
-            available.append(repo_id)
 
     # 2. Other Local Folders (not matching known repos)
-    if os.path.exists(QWEN3_TTS_MODELS_DIR):
-        for item in os.listdir(QWEN3_TTS_MODELS_DIR):
-            item_path = os.path.join(QWEN3_TTS_MODELS_DIR, item)
-            if os.path.isdir(item_path):
-                # Check if this folder is already covered by the mapping
-                is_known = False
-                for repo_id, folder_name in QWEN3_TTS_MODELS.items():
-                    if item == folder_name:
-                        is_known = True
-                        break
-                if not is_known and item != "prompts":
-                    available.append(f"Local: {item}")
+    # Scan both new and old directories
+    for search_dir in [TTS_MODELS_DIR, OLD_QWEN3_TTS_MODELS_DIR]:
+        if os.path.exists(search_dir):
+            for item in os.listdir(search_dir):
+                item_path = os.path.join(search_dir, item)
+                if os.path.isdir(item_path):
+                    # Check if this folder is already covered by the mapping
+                    is_known = False
+                    for repo_id, folder_name in QWEN3_TTS_MODELS.items():
+                        if item == folder_name:
+                            is_known = True
+                            break
+                    if not is_known and item != "prompts":
+                        name = f"Local: {item}"
+                        if name not in available:
+                            available.append(name)
 
-    return sorted(available)
+    return sorted(list(set(available)))
 
 # Helper to convert audio to ComfyUI format
 def convert_audio(wav, sr):
@@ -1104,7 +1130,7 @@ class Qwen3FineTune:
                 "train_jsonl": ("STRING", {"default": "", "multiline": False, "tooltip": "Path to the preprocessed JSONL file containing training data with audio codes."}),
                 "init_model": (base_models, {"default": "Qwen/Qwen3-TTS-12Hz-1.7B-Base", "tooltip": "Base model to fine-tune. Must be a 'Base' model variant."}),
                 "source": (["HuggingFace", "ModelScope"], {"default": "HuggingFace", "tooltip": "Download source if model is not found locally."}),
-                "output_dir": ("STRING", {"default": "output/finetuned_model", "multiline": False, "tooltip": "Directory to save checkpoints and final model."}),
+                "output_dir": ("STRING", {"default": "models/tts/finetuned_model", "multiline": False, "tooltip": "Directory to save checkpoints and final model."}),
                 "epochs": ("INT", {"default": 3, "min": 1, "max": 1000, "tooltip": "Number of training epochs to run."}),
                 "batch_size": ("INT", {"default": 2, "min": 1, "max": 64, "tooltip": "Number of samples per batch. Lower values use less VRAM."}),
                 "lr": ("FLOAT", {"default": 2e-6, "step": 1e-7, "tooltip": "Learning rate. Qwen default (2e-5) is too aggressive for small batches, causing noise output. Defaults to 2e-6 for stability."}),

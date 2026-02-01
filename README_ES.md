@@ -9,7 +9,7 @@ Una suite de nodos personalizados de ComfyUI para [Qwen3-TTS](https://github.com
 
 ## Características
 
-- **Selector Dinámico de Modelos**: Detecta automáticamente modelos descargados y carpetas locales en `ComfyUI/models/Qwen3-TTS/`.
+- **Selector Dinámico de Modelos**: Detecta automáticamente modelos descargados y carpetas locales en `ComfyUI/models/tts/`.
 - **Integración con ComfyUI**: Los modelos se guardan organizados junto con otros modelos de ComfyUI.
 - **Descarga bajo demanda**: Solo descarga el modelo que seleccionas, no todos los variantes.
 - **Soporte completo de Qwen3-TTS**:
@@ -52,7 +52,7 @@ Una suite de nodos personalizados de ComfyUI para [Qwen3-TTS](https://github.com
 
 Los modelos y tokenizers se guardan automáticamente en tu carpeta de modelos de ComfyUI:
 ```
-ComfyUI/models/Qwen3-TTS/
+ComfyUI/models/tts/
 ├── Qwen3-TTS-12Hz-1.7B-CustomVoice/
 ├── Qwen3-TTS-12Hz-1.7B-VoiceDesign/
 ├── Qwen3-TTS-12Hz-1.7B-Base/
@@ -111,7 +111,7 @@ Usa el nodo **Qwen3-TTS Prompt Maker** para precalcular las características de 
 
 Puedes guardar los prompts de clonación de voz en disco para reutilizarlos:
 
-1. **💾 Qwen3-TTS Save Prompt**: Toma un `QWEN3_PROMPT` y lo guarda en `models/Qwen3-TTS/prompts/`.
+1. **💾 Qwen3-TTS Save Prompt**: Toma un `QWEN3_PROMPT` y lo guarda en `models/tts/prompts/`.
 2. **📂 Qwen3-TTS Load Prompt**: Desplegable de prompts guardados.
 
 ## Fine-Tuning (Entrenamiento)
