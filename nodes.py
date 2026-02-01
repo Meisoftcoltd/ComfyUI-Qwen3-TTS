@@ -1695,6 +1695,33 @@ class Qwen3FineTune:
                 return (final_output_path, speaker_name)
 
 
+class Qwen3LoadAudioFromPath:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "audio_path": ("STRING", {"default": "", "multiline": False}),
+            }
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    FUNCTION = "load_audio"
+    CATEGORY = "Qwen3-TTS"
+
+    def load_audio(self, audio_path):
+        if not audio_path or not os.path.exists(audio_path):
+            raise ValueError(f"Audio file not found: {audio_path}")
+
+        # Use soundfile to load
+        wav, sr = sf.read(audio_path)
+
+        # Convert to float32 if needed
+        if wav.dtype != np.float32:
+            wav = wav.astype(np.float32)
+
+        return (convert_audio(wav, sr),)
+
+
 class Qwen3AudioCompare:
     # Class-level cache for speaker encoder
     _speaker_encoder = None
