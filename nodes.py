@@ -1314,6 +1314,9 @@ class Qwen3DatasetFromFolder:
                 "min_duration": ("FLOAT", {"default": 0.8, "min": 0.1, "max": 10.0, "step": 0.1}),
                 "max_duration": ("FLOAT", {"default": 60.0, "min": 1.0, "max": 120.0, "step": 0.5, "tooltip": "Maximum duration (seconds) for a single training segment. Default 60s."}),
                 "silence_threshold": ("FLOAT", {"default": -40.0, "min": -100.0, "max": 0.0, "step": 1.0}),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
             }
         }
 
@@ -1323,7 +1326,7 @@ class Qwen3DatasetFromFolder:
     FUNCTION = "create_dataset"
     CATEGORY = "Qwen3-TTS/FineTuning"
 
-    def create_dataset(self, folder_path, whisper_model, output_filename="dataset.jsonl", output_dataset_folder="dataset_final", min_duration=0.8, max_duration=60.0, silence_threshold=-40.0):
+    def create_dataset(self, folder_path, whisper_model, output_filename="dataset.jsonl", output_dataset_folder="dataset_final", min_duration=0.8, max_duration=60.0, silence_threshold=-40.0, unique_id=None):
         if not HAS_WHISPER_PYDUB:
              raise ImportError("Please install 'openai-whisper' and 'pydub' to use this node.")
 
@@ -1361,7 +1364,8 @@ class Qwen3DatasetFromFolder:
             if not files:
                  raise ValueError(f"No .wav files found in {folder_path} to process.")
 
-            print(f"[Qwen3-TTS] Processing {len(files)} files in: {folder_path}")
+            total_files = len(files)
+            print(f"[Qwen3-TTS] Processing {total_files} files in: {folder_path}")
 
             total_clips = 0
 
@@ -1374,11 +1378,15 @@ class Qwen3DatasetFromFolder:
                 except:
                     return audio_segment
 
-            for filename in files:
+            for idx, filename in enumerate(files):
+                # Update progress
+                if unique_id:
+                    PromptServer.instance.send_progress(idx, total_files, unique_id)
+
                 filepath = os.path.join(folder_path, filename)
                 base_name = os.path.splitext(filename)[0]
 
-                print(f"--- Processing: {filename} ---")
+                print(f"--- Processing [{idx+1}/{total_files}]: {filename} ---")
 
                 try:
                     audio_full = AudioSegment.from_wav(filepath)
