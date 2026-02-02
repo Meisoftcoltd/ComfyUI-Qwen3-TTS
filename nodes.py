@@ -571,6 +571,158 @@ class Qwen3Loader:
         return (model,)
 
 
+class Qwen3LoadFineTuned:
+    @classmethod
+    def INPUT_TYPES(s):
+        # Scan finetuned_model directory
+        scan_paths = [
+            os.path.join(folder_paths.models_dir, "tts", "finetuned_model"),
+            os.path.join(folder_paths.models_dir, "Qwen3-TTS", "finetuned_model"),
+        ]
+
+        models = []
+        for base_path in scan_paths:
+            if os.path.exists(base_path):
+                for item in os.listdir(base_path):
+                    item_path = os.path.join(base_path, item)
+                    if os.path.isdir(item_path):
+                        # Verify it has config.json (valid model)
+                        if os.path.exists(os.path.join(item_path, "config.json")):
+                            models.append(item)
+
+        models = sorted(list(set(models)))
+        if not models:
+            models = ["No fine-tuned models found"]
+
+        return {
+            "required": {
+                "model_name": (models,),
+                "precision": (["fp16", "bf16", "fp32"], {"default": "bf16"}),
+                "attention": (["auto", "flash_attention_2", "sdpa", "eager"], {"default": "auto"}),
+            }
+        }
+
+    RETURN_TYPES = ("QWEN3_MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "load_model"
+    CATEGORY = "Qwen3-TTS"
+
+    def load_model(self, model_name, precision, attention):
+        if model_name == "No fine-tuned models found":
+            raise ValueError("No fine-tuned models found. Please train a model first or check models/tts/finetuned_model.")
+
+        # Resolve path
+        scan_paths = [
+            os.path.join(folder_paths.models_dir, "tts", "finetuned_model"),
+            os.path.join(folder_paths.models_dir, "Qwen3-TTS", "finetuned_model"),
+        ]
+
+        model_path = None
+        for base_path in scan_paths:
+            candidate = os.path.join(base_path, model_name)
+            if os.path.exists(candidate) and os.path.isdir(candidate):
+                model_path = candidate
+                break
+
+        if not model_path:
+             raise FileNotFoundError(f"Model '{model_name}' not found in finetuned_model directories.")
+
+        print(f"[Qwen3-TTS] Loading Fine-Tuned Model from: {model_path}")
+
+        device = mm.get_torch_device()
+
+        dtype = torch.float32
+        if precision == "bf16":
+            if device.type == "mps":
+                dtype = torch.float16
+                print("Note: Using fp16 on MPS (bf16 has limited support)")
+            else:
+                dtype = torch.bfloat16
+        elif precision == "fp16":
+            dtype = torch.float16
+
+        attn_impl = "sdpa"
+        if attention != "auto":
+            attn_impl = attention
+        else:
+            try:
+                import flash_attn
+                import importlib.metadata
+                importlib.metadata.version("flash_attn")
+                attn_impl = "flash_attention_2"
+            except Exception:
+                attn_impl = "sdpa"
+
+        print(f"Loading Qwen3-TTS model on {device} as {dtype} (Attn: {attn_impl})")
+
+        model = Qwen3TTSModel.from_pretrained(
+            model_path,
+            device_map=device,
+            dtype=dtype,
+            attn_implementation=attn_impl
+        )
+
+        # INJECTION LOGIC
+        try:
+            cfg_file = os.path.join(model_path, "config.json")
+            if os.path.exists(cfg_file):
+                with open(cfg_file, 'r', encoding='utf-8') as f:
+                    cfg_data = json.load(f)
+
+                # Helper to update recursive configs
+                configs_to_update = []
+                if hasattr(model, "config"): configs_to_update.append(model.config)
+                if hasattr(model, "model") and hasattr(model.model, "config"): configs_to_update.append(model.model.config)
+
+                if "talker_config" in cfg_data and "spk_id" in cfg_data["talker_config"]:
+                    new_spk_id = cfg_data["talker_config"]["spk_id"]
+                    new_spk_dialect = cfg_data["talker_config"].get("spk_is_dialect", {})
+
+                    found_any = False
+                    for root_cfg in configs_to_update:
+                        t_cfg = getattr(root_cfg, "talker_config", None)
+                        if t_cfg is not None:
+                            if not hasattr(t_cfg, "spk_id") or t_cfg.spk_id is None:
+                                t_cfg.spk_id = {}
+                            if isinstance(t_cfg.spk_id, dict):
+                                t_cfg.spk_id.update(new_spk_id)
+
+                            if not hasattr(t_cfg, "spk_is_dialect") or t_cfg.spk_is_dialect is None:
+                                t_cfg.spk_is_dialect = {}
+                            if isinstance(t_cfg.spk_is_dialect, dict):
+                                t_cfg.spk_is_dialect.update(new_spk_dialect)
+
+                            found_any = True
+
+                    # Update internal talker config (Critical for generation validation)
+                    if hasattr(model, "model") and hasattr(model.model, "talker") and hasattr(model.model.talker, "config"):
+                        st_cfg = model.model.talker.config
+                        if not hasattr(st_cfg, "spk_id") or st_cfg.spk_id is None:
+                            st_cfg.spk_id = {}
+                        if isinstance(st_cfg.spk_id, dict):
+                            st_cfg.spk_id.update(new_spk_id)
+                        found_any = True
+
+                    if found_any:
+                         print(f"DEBUG: Successfully injected custom speaker mapping from {model_name}: {list(new_spk_id.keys())}")
+
+                if "tts_model_type" in cfg_data:
+                    new_tts_model_type = cfg_data["tts_model_type"]
+                    for root_cfg in configs_to_update:
+                        if hasattr(root_cfg, "tts_model_type"):
+                            setattr(root_cfg, "tts_model_type", new_tts_model_type)
+
+                    if hasattr(model, "model") and hasattr(model.model, "tts_model_type"):
+                         model.model.tts_model_type = new_tts_model_type
+
+                    print(f"DEBUG: Injected tts_model_type = {new_tts_model_type}")
+
+        except Exception as e:
+            print(f"DEBUG: Error during deep speaker injection: {e}")
+
+        return (model,)
+
+
 class Qwen3CustomVoice:
     @classmethod
     def INPUT_TYPES(s):
@@ -1154,8 +1306,14 @@ class Qwen3DatasetFromFolder:
         return {
             "required": {
                 "folder_path": ("STRING", {"default": "", "multiline": False}),
+                "whisper_model": (["tiny", "base", "small", "medium", "large", "large-v3"], {"default": "medium"}),
+            },
+            "optional": {
                 "output_filename": ("STRING", {"default": "dataset.jsonl", "multiline": False}),
-                "ref_audio_path": ("STRING", {"default": "", "multiline": False}),
+                "output_dataset_folder": ("STRING", {"default": "dataset_final", "multiline": False, "tooltip": "Subfolder where processed wavs/txts will be saved."}),
+                "min_duration": ("FLOAT", {"default": 0.8, "min": 0.1, "max": 10.0, "step": 0.1}),
+                "max_duration": ("FLOAT", {"default": 15.0, "min": 1.0, "max": 30.0, "step": 0.5}),
+                "silence_threshold": ("FLOAT", {"default": -40.0, "min": -100.0, "max": 0.0, "step": 1.0}),
             }
         }
 
@@ -1165,69 +1323,159 @@ class Qwen3DatasetFromFolder:
     FUNCTION = "create_dataset"
     CATEGORY = "Qwen3-TTS/FineTuning"
 
-    def create_dataset(self, folder_path, output_filename, ref_audio_path):
+    def create_dataset(self, folder_path, whisper_model, output_filename="dataset.jsonl", output_dataset_folder="dataset_final", min_duration=0.8, max_duration=15.0, silence_threshold=-40.0):
+        if not HAS_WHISPER_PYDUB:
+             raise ImportError("Please install 'openai-whisper' and 'pydub' to use this node.")
+
         folder_path = folder_path.strip().strip('"')
         folder_path = fix_wsl_path(folder_path)
-        ref_audio_path = fix_wsl_path(ref_audio_path.strip().strip('"'))
 
         print(f"[Qwen3-TTS DEBUG] create_dataset called. folder_path: {folder_path}")
 
         if not os.path.exists(folder_path):
             raise ValueError(f"Folder not found: {folder_path}")
-            
-        jsonl_path = os.path.join(folder_path, output_filename)
-        print(f"[Qwen3-TTS DEBUG] Creating dataset at: {jsonl_path}")
         
-        # Get all files first to help matching
-        all_files = os.listdir(folder_path)
-        print(f"[Qwen3-TTS DEBUG] Found {len(all_files)} files in directory")
-        wav_files = [f for f in all_files if f.lower().endswith('.wav')]
-        print(f"[Qwen3-TTS DEBUG] Found {len(wav_files)} .wav files")
-        
-        if not wav_files:
-             raise ValueError(f"No .wav files found in {folder_path}")
+        # Define output directory for processed files
+        processed_dir = os.path.join(folder_path, output_dataset_folder)
+        os.makedirs(processed_dir, exist_ok=True)
 
-        if not ref_audio_path or not os.path.exists(ref_audio_path):
-            # Try to find default ref.wav
-            possible_ref = os.path.join(folder_path, "ref.wav")
-            if os.path.exists(possible_ref):
-                ref_audio_path = possible_ref
+        # Step 1: Check if processed files exist, if not, run Whisper processing
+        processed_wavs = [f for f in os.listdir(processed_dir) if f.lower().endswith('.wav')]
+        
+        if not processed_wavs:
+            print(f"[Qwen3-TTS] No processed files found in {processed_dir}. Starting Whisper processing...")
+
+            # Load Whisper
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            print(f"[Qwen3-TTS] Loading Whisper '{whisper_model}' on {device}...")
+            try:
+                model = whisper.load_model(whisper_model, device=device)
+            except Exception as e:
+                raise RuntimeError(f"Failed to load Whisper model: {e}")
+
+            # Find input files
+            files = [f for f in os.listdir(folder_path)
+                     if f.lower().endswith(".wav") and os.path.isfile(os.path.join(folder_path, f))]
+            files.sort()
+
+            if not files:
+                 raise ValueError(f"No .wav files found in {folder_path} to process.")
+
+            print(f"[Qwen3-TTS] Processing {len(files)} files in: {folder_path}")
+
+            total_clips = 0
+
+            def trim_silence(audio_segment, silence_threshold=-40.0, chunk_size=10):
+                try:
+                    start_trim = silence.detect_leading_silence(audio_segment, silence_threshold=silence_threshold, chunk_size=chunk_size)
+                    end_trim = silence.detect_leading_silence(audio_segment.reverse(), silence_threshold=silence_threshold, chunk_size=chunk_size)
+                    duration = len(audio_segment)
+                    return audio_segment[start_trim:duration-end_trim]
+                except:
+                    return audio_segment
+
+            for filename in files:
+                filepath = os.path.join(folder_path, filename)
+                base_name = os.path.splitext(filename)[0]
+
+                print(f"--- Processing: {filename} ---")
+
+                try:
+                    audio_full = AudioSegment.from_wav(filepath)
+                except Exception as e:
+                    print(f"   [Error reading audio] {e}")
+                    continue
+
+                # Transcribe
+                result = model.transcribe(filepath, language="es", verbose=False)
+
+                file_count = 0
+                for segment in result['segments']:
+                    start_ms = segment['start'] * 1000
+                    end_ms = segment['end'] * 1000
+                    text = segment['text'].strip()
+
+                    chunk = audio_full[start_ms:end_ms]
+
+                    # Trim Silence
+                    try:
+                        chunk_trimmed = trim_silence(chunk, silence_threshold=silence_threshold)
+                    except:
+                        chunk_trimmed = chunk
+
+                    duration_sec = len(chunk_trimmed) / 1000.0
+
+                    if duration_sec > max_duration:
+                        continue
+                    if duration_sec < min_duration:
+                        continue
+
+                    # Save
+                    chunk_name = f"{base_name}_{file_count:04d}"
+                    wav_path = os.path.join(processed_dir, f"{chunk_name}.wav")
+                    txt_path = os.path.join(processed_dir, f"{chunk_name}.txt")
+
+                    # Standard TTS Format: Mono, 22050Hz
+                    chunk_trimmed.set_frame_rate(22050).set_channels(1).export(wav_path, format="wav")
+
+                    with open(txt_path, "w", encoding="utf-8") as f:
+                        f.write(text)
+
+                    file_count += 1
+                    total_clips += 1
+
+            print(f"[Qwen3-TTS] Processing finished. {total_clips} clips generated.")
+
+            # Clean up VRAM
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # Refresh list of processed wavs
+            processed_wavs = [f for f in os.listdir(processed_dir) if f.lower().endswith('.wav')]
+        else:
+            print(f"[Qwen3-TTS] Found {len(processed_wavs)} existing processed files in {processed_dir}. Skipping Whisper step.")
+
+        # Step 2: Generate JSONL from processed files
+        jsonl_path = os.path.join(processed_dir, output_filename)
+        print(f"[Qwen3-TTS DEBUG] Generating dataset JSONL at: {jsonl_path}")
+
+        # Auto-detect reference audio
+        ref_audio_path = os.path.join(processed_dir, "ref.wav")
+        if not os.path.exists(ref_audio_path):
+            if processed_wavs:
+                # Use the first file as reference if no explicit ref.wav exists
+                # We sort to ensure determinism
+                processed_wavs.sort()
+                ref_audio_path = os.path.join(processed_dir, processed_wavs[0])
+                print(f"[Qwen3-TTS] Auto-selected reference audio: {ref_audio_path}")
             else:
-                # Fallback to first wav?
-                print("No ref.wav found and no ref_audio_path provided. Using the first wav file as reference (warning: this might include it in training context).")
-                ref_audio_path = os.path.join(folder_path, wav_files[0])
+                raise ValueError("No processed wav files found to generate dataset.")
         
         full_ref_path = os.path.abspath(ref_audio_path)
-        print(f"Reference Audio: {full_ref_path}")
         
         count = 0
         with open(jsonl_path, 'w', encoding='utf-8') as f:
-            for wav_file in wav_files:
-                wav_path = os.path.join(folder_path, wav_file)
+            for wav_file in processed_wavs:
+                wav_path = os.path.join(processed_dir, wav_file)
                 
-                # Check if this is the reference audio
+                # Check if this is the reference audio (avoid data leakage if it's the same file)
                 if os.path.abspath(wav_path) == full_ref_path:
-                    continue
-                    
+                    # Optional: Skip reference file in dataset or include it?
+                    # Usually reference should not be part of training data if it's just one file,
+                    # but if we picked it from data, we might lose a sample.
+                    # Qwen documentation doesn't strictly forbid it, but let's include it
+                    # unless it's explicitly named 'ref.wav' which might not have text?
+                    # If we auto-picked it, it has text.
+                    pass
+                
                 base_name = os.path.splitext(wav_file)[0]
                 
-                # Try finding text file with case matching or mismatch
-                # We look for base_name + .txt (case insensitive) in the file list
-                found_txt = None
-                expected_txt_lower = (base_name + ".txt").lower()
-                
-                for cand in all_files:
-                    if cand.lower() == expected_txt_lower:
-                        found_txt = cand
-                        break
-                
-                if not found_txt:
-                    print(f"Skipping {wav_file}: Expected text file '{base_name}.txt' not found in {folder_path}")
-                    # Debug: print what we have
-                    # print(f"Available files: {all_files}") 
+                # Look for corresponding .txt
+                txt_path = os.path.join(processed_dir, f"{base_name}.txt")
+                if not os.path.exists(txt_path):
                     continue
                     
-                txt_path = os.path.join(folder_path, found_txt)
                 try:
                     with open(txt_path, 'r', encoding='utf-8') as tf:
                         text = tf.read().strip()
@@ -1236,7 +1484,6 @@ class Qwen3DatasetFromFolder:
                     continue
                 
                 if not text:
-                    print(f"Skipping {wav_file}: {found_txt} is empty.")
                     continue
 
                 entry = {
@@ -1250,7 +1497,7 @@ class Qwen3DatasetFromFolder:
         if count == 0:
             print("Warning: No valid samples were added to the dataset!")
         else:
-            print(f"Dataset created with {count} samples at {jsonl_path}")
+            print(f"Dataset JSONL created with {count} samples at {jsonl_path}")
             
         return (jsonl_path,)
 
@@ -2198,6 +2445,7 @@ Audio Details:
 # Node Mappings
 NODE_CLASS_MAPPINGS = {
     "Qwen3Loader": Qwen3Loader,
+    "Qwen3LoadFineTuned": Qwen3LoadFineTuned,
     "Qwen3CustomVoice": Qwen3CustomVoice,
     "Qwen3VoiceDesign": Qwen3VoiceDesign,
     "Qwen3PromptMaker": Qwen3PromptMaker,
@@ -2214,6 +2462,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Qwen3Loader": "Qwen3-TTS Loader",
+    "Qwen3LoadFineTuned": "Qwen3-TTS Load Fine-Tuned",
     "Qwen3CustomVoice": "Qwen3-TTS Custom Voice",
     "Qwen3VoiceDesign": "Qwen3-TTS Voice Design",
     "Qwen3PromptMaker": "Qwen3-TTS Prompt Maker",
