@@ -1312,7 +1312,7 @@ class Qwen3DatasetFromFolder:
                 "output_filename": ("STRING", {"default": "dataset.jsonl", "multiline": False}),
                 "output_dataset_folder": ("STRING", {"default": "dataset_final", "multiline": False, "tooltip": "Subfolder where processed wavs/txts will be saved."}),
                 "min_duration": ("FLOAT", {"default": 0.8, "min": 0.1, "max": 10.0, "step": 0.1}),
-                "max_duration": ("FLOAT", {"default": 15.0, "min": 1.0, "max": 30.0, "step": 0.5}),
+                "max_duration": ("FLOAT", {"default": 60.0, "min": 1.0, "max": 120.0, "step": 0.5, "tooltip": "Maximum duration (seconds) for a single training segment. Default 60s."}),
                 "silence_threshold": ("FLOAT", {"default": -40.0, "min": -100.0, "max": 0.0, "step": 1.0}),
             }
         }
@@ -1323,7 +1323,7 @@ class Qwen3DatasetFromFolder:
     FUNCTION = "create_dataset"
     CATEGORY = "Qwen3-TTS/FineTuning"
 
-    def create_dataset(self, folder_path, whisper_model, output_filename="dataset.jsonl", output_dataset_folder="dataset_final", min_duration=0.8, max_duration=15.0, silence_threshold=-40.0):
+    def create_dataset(self, folder_path, whisper_model, output_filename="dataset.jsonl", output_dataset_folder="dataset_final", min_duration=0.8, max_duration=60.0, silence_threshold=-40.0):
         if not HAS_WHISPER_PYDUB:
              raise ImportError("Please install 'openai-whisper' and 'pydub' to use this node.")
 
