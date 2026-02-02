@@ -8,3 +8,5 @@ accelerate
 librosa
 tensorboard
 safetensors
+openai-whisper
+pydub
