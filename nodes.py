@@ -264,6 +264,7 @@ def get_available_models() -> list:
     # Scan both new and old directories
     for search_dir in [TTS_MODELS_DIR, OLD_QWEN3_TTS_MODELS_DIR]:
         if os.path.exists(search_dir):
+            # 2a. Top-level folders
             for item in os.listdir(search_dir):
                 item_path = os.path.join(search_dir, item)
                 if os.path.isdir(item_path):
@@ -275,6 +276,23 @@ def get_available_models() -> list:
                             break
                     if not is_known and item != "prompts":
                         name = f"Local: {item}"
+                        if name not in available:
+                            available.append(name)
+
+            # 2b. Scan 'finetuned_model' subdirectories for valid checkpoints
+            # We look for folders containing 'config.json' inside finetuned_model/
+            finetuned_dir = os.path.join(search_dir, "finetuned_model")
+            if os.path.exists(finetuned_dir):
+                for root, dirs, files in os.walk(finetuned_dir):
+                    if "config.json" in files:
+                        # Get relative path from search_dir (models/tts)
+                        rel_path = os.path.relpath(root, search_dir)
+                        # On Windows relpath might use backslashes, force forward slashes for consistency
+                        rel_path = rel_path.replace("\\", "/")
+
+                        # Avoid duplicates (e.g. if root IS finetuned_dir and we already added it in 2a)
+                        # Though finetuned_dir usually doesn't have config.json directly if it's just a container
+                        name = f"Local: {rel_path}"
                         if name not in available:
                             available.append(name)
 
