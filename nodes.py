@@ -19,6 +19,10 @@ def fix_wsl_path(path):
     """Helper to convert Windows paths to WSL paths if running on Linux."""
     if not path or not isinstance(path, str):
         return path
+
+    # Clean up quotes and whitespace first
+    path = path.strip().strip('"').strip("'")
+
     if platform.system() == "Linux":
         # Check for Windows style path like "Z:\" or "C:\" or "Z:/"
         # We look for [Letter]:
@@ -35,6 +39,12 @@ def fix_wsl_path(path):
 from qwen_tts import Qwen3TTSModel, Qwen3TTSTokenizer
 from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem
 from .dataset import TTSDataset
+try:
+    import whisper
+    from pydub import AudioSegment, silence
+    HAS_WHISPER_PYDUB = True
+except ImportError:
+    HAS_WHISPER_PYDUB = False
 from accelerate import Accelerator
 from torch.optim import AdamW
 try:
@@ -79,6 +89,65 @@ QWEN3_TTS_MODELS = {
 QWEN3_TTS_TOKENIZERS = {
     "Qwen/Qwen3-TTS-Tokenizer-12Hz": "Qwen3-TTS-Tokenizer-12Hz",
 }
+
+def get_finetuned_speakers() -> list:
+    """Scan configured output directories for fine-tuned speakers."""
+    speakers = [
+        "Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric",
+        "Ryan", "Aiden", "Ono_Anna", "Sohee"
+    ]
+
+    # Paths to scan
+    scan_paths = [
+        os.path.join(folder_paths.models_dir, "tts", "finetuned_model"), # Default output
+        os.path.join(folder_paths.models_dir, "Qwen3-TTS", "finetuned_model"), # Legacy
+        os.path.abspath("models/tts/finetuned_model"), # Relative fallback
+    ]
+
+    found_speakers = []
+
+    for base_path in scan_paths:
+        if os.path.exists(base_path):
+            # Check immediate subfolders (epochs)
+            # Actually, typically structure is output_dir/epoch_3/config.json
+            # But the 'speaker' name is what we need.
+            # In Qwen3FineTune, we ask for 'speaker_name'.
+            # It saves config.json with "spk_id": { "speaker_name": 3000 } inside the checkpoint folder.
+            # So any valid checkpoint folder effectively contains a speaker.
+            # BUT, the user wants the NAME to appear in the list.
+            # We can't easily know the name without reading every config.json.
+            # Alternatively, if the user followed conventions, maybe the folder name helps?
+            # But usually folder is 'epoch_3' or 'ckpt_step_100'.
+
+            # Wait, the user request says: "las voces creadas quiseran que aparecieran en su nodo correspondiente autodetectadas a través de combo"
+            # If they use "AudioToDataset", they get a dataset folder.
+            # If they Train, they get a model folder.
+
+            # If they use Qwen3CustomVoice, they load a model.
+            # If the model IS the fine-tuned model, then 'speaker' input should likely match what was trained.
+            # But Qwen3CustomVoice takes a 'model' input. The speaker list is static in INPUT_TYPES.
+            # Changing INPUT_TYPES dynamically based on disk scan is possible but static per session.
+
+            # Let's try to find speaker names from config.json files in subdirectories of known paths.
+             for root, dirs, files in os.walk(base_path):
+                if "config.json" in files:
+                    try:
+                        with open(os.path.join(root, "config.json"), 'r', encoding='utf-8') as f:
+                            cfg = json.load(f)
+                            if "talker_config" in cfg and "spk_id" in cfg["talker_config"]:
+                                spk_ids = cfg["talker_config"]["spk_id"]
+                                for name in spk_ids.keys():
+                                    if name not in speakers and name not in found_speakers:
+                                        found_speakers.append(name)
+                    except:
+                        pass
+
+    # Also allow scanning "dataset_final" folders if that's what the user meant by "voces creadas"?
+    # "voces creadas" might mean the dataset folders for reference?
+    # No, Qwen3CustomVoice needs the speaker name defined in the model config.
+    # So scanning config.json of fine-tuned models is the correct approach.
+
+    return sorted(found_speakers) + speakers
 
 def get_local_model_path(repo_id: str) -> str:
     """Get the local path for a model/tokenizer in ComfyUI's models folder."""
@@ -495,10 +564,7 @@ class Qwen3CustomVoice:
                     "Auto", "Chinese", "English", "Japanese", "Korean", "German", 
                     "French", "Russian", "Portuguese", "Spanish", "Italian"
                 ], {"default": "Auto"}),
-                "speaker": ([
-                    "Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric", 
-                    "Ryan", "Aiden", "Ono_Anna", "Sohee"
-                ], {"default": "Vivian"}),
+                "speaker": (get_finetuned_speakers(), {"default": "Vivian"}),
                 "seed": ("INT", {"default": 42, "min": 1, "max": 0xffffffffffffffff}),
             },
             "optional": {
@@ -924,6 +990,145 @@ class Qwen3VoiceClone:
             raise e
              
         return (convert_audio(wavs[0], sr),)
+
+class Qwen3AudioToDataset:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "audio_folder": ("STRING", {"default": "", "multiline": False}),
+                "model_size": (["tiny", "base", "small", "medium", "large", "large-v3"], {"default": "medium"}),
+            },
+            "optional": {
+                "output_folder_name": ("STRING", {"default": "dataset_final"}),
+                "min_duration": ("FLOAT", {"default": 0.8, "min": 0.1, "max": 10.0, "step": 0.1}),
+                "max_duration": ("FLOAT", {"default": 15.0, "min": 1.0, "max": 30.0, "step": 0.5}),
+                "silence_threshold": ("FLOAT", {"default": -40.0, "min": -100.0, "max": 0.0, "step": 1.0}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("dataset_path",)
+    OUTPUT_NODE = True
+    FUNCTION = "process"
+    CATEGORY = "Qwen3-TTS/FineTuning"
+
+    def process(self, audio_folder, model_size, output_folder_name="dataset_final", min_duration=0.8, max_duration=15.0, silence_threshold=-40.0):
+        if not HAS_WHISPER_PYDUB:
+             raise ImportError("Please install 'openai-whisper' and 'pydub' to use this node.")
+
+        audio_folder = fix_wsl_path(audio_folder)
+        print(f"[Qwen3-TTS] AudioToDataset: Processing {audio_folder}")
+
+        if not os.path.exists(audio_folder):
+            raise ValueError(f"Audio folder not found: {audio_folder}")
+
+        # Determine output folder
+        # If output_folder_name is relative, put it inside audio_folder parent or similar?
+        # User script put it in "dataset_final" inside CURRENT_DIR.
+        # Let's put it as a subfolder of audio_folder by default if not absolute.
+        if os.path.isabs(output_folder_name):
+            output_folder = output_folder_name
+        else:
+            output_folder = os.path.join(audio_folder, output_folder_name)
+
+        os.makedirs(output_folder, exist_ok=True)
+        print(f"[Qwen3-TTS] Output folder: {output_folder}")
+
+        # Load Whisper
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[Qwen3-TTS] Loading Whisper '{model_size}' on {device}...")
+        try:
+             model = whisper.load_model(model_size, device=device)
+        except Exception as e:
+             raise RuntimeError(f"Failed to load Whisper model: {e}")
+
+        # Find files
+        files = [f for f in os.listdir(audio_folder)
+                 if f.lower().endswith(".wav") and os.path.isfile(os.path.join(audio_folder, f))]
+        files.sort()
+
+        if not files:
+             raise ValueError(f"No .wav files found in {audio_folder}")
+
+        print(f"[Qwen3-TTS] Found {len(files)} files")
+
+        total_clips = 0
+
+        def trim_silence_wrapper(audio_segment, thresh, chunk=10):
+            try:
+                start_trim = silence.detect_leading_silence(audio_segment, silence_threshold=thresh, chunk_size=chunk)
+                end_trim = silence.detect_leading_silence(audio_segment.reverse(), silence_threshold=thresh, chunk_size=chunk)
+                duration = len(audio_segment)
+                return audio_segment[start_trim:duration-end_trim]
+            except:
+                return audio_segment
+
+        for filename in files:
+            filepath = os.path.join(audio_folder, filename)
+            base_name = os.path.splitext(filename)[0]
+
+            print(f"Processing: {filename}")
+
+            try:
+                audio_full = AudioSegment.from_wav(filepath)
+            except Exception as e:
+                print(f"Error reading {filename}: {e}")
+                continue
+
+            # Transcribe
+            result = model.transcribe(filepath, language="es", verbose=False)
+
+            file_count = 0
+            for segment in result['segments']:
+                start_ms = segment['start'] * 1000
+                end_ms = segment['end'] * 1000
+                text = segment['text'].strip()
+
+                if not text:
+                    continue
+
+                chunk = audio_full[start_ms:end_ms]
+                chunk_trimmed = trim_silence_wrapper(chunk, silence_threshold)
+
+                duration_sec = len(chunk_trimmed) / 1000.0
+
+                if duration_sec > max_duration:
+                     continue
+                if duration_sec < min_duration:
+                     continue
+
+                chunk_name = f"{base_name}_{file_count:04d}"
+                wav_path = os.path.join(output_folder, f"{chunk_name}.wav")
+                txt_path = os.path.join(output_folder, f"{chunk_name}.txt")
+
+                # Export: Mono, 22050Hz (Standard TTS)
+                # Qwen actually uses 24kHz or similar but 22050 is fine for general TTS datasets usually?
+                # Qwen3-TTS usually expects 24kHz in other nodes, let's stick to 24000 to match Qwen3 reqs better?
+                # But user script had 22050. Let's respect user script (22050) or upgrade?
+                # User script: chunk_trimmed.set_frame_rate(22050).set_channels(1)
+                # Qwen nodes.py: convert_audio handles resampling if needed or librosa loads at 24k.
+                # Let's stick to user script 22050 to stay safe, or 24000?
+                # Let's use 24000 to match Qwen3 native preference if possible, but 22050 is safe standard.
+                # I'll stick to 22050 as requested in script.
+
+                chunk_trimmed.set_frame_rate(22050).set_channels(1).export(wav_path, format="wav")
+
+                with open(txt_path, "w", encoding="utf-8") as f:
+                    f.write(text)
+
+                file_count += 1
+                total_clips += 1
+
+        print(f"[Qwen3-TTS] Process finished. Generated {total_clips} clips in {output_folder}")
+
+        # Clean up VRAM
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return (output_folder,)
+
 
 class Qwen3DatasetFromFolder:
     @classmethod
@@ -1750,8 +1955,9 @@ class Qwen3LoadAudioFromPath:
     CATEGORY = "Qwen3-TTS"
 
     def load_audio(self, audio_path):
+        print(f"[Qwen3-TTS DEBUG] LoadAudioFromPath [RAW]: {audio_path}")
         audio_path = fix_wsl_path(audio_path)
-        print(f"[Qwen3-TTS DEBUG] LoadAudioFromPath: {audio_path}")
+        print(f"[Qwen3-TTS DEBUG] LoadAudioFromPath [FIXED]: {audio_path}")
 
         if not audio_path or not os.path.exists(audio_path):
             raise ValueError(f"Audio file not found: {audio_path}")
@@ -1970,3 +2176,36 @@ Audio Details:
 
         print(report)
         return (report,)
+
+# Node Mappings
+NODE_CLASS_MAPPINGS = {
+    "Qwen3Loader": Qwen3Loader,
+    "Qwen3CustomVoice": Qwen3CustomVoice,
+    "Qwen3VoiceDesign": Qwen3VoiceDesign,
+    "Qwen3PromptMaker": Qwen3PromptMaker,
+    "Qwen3SavePrompt": Qwen3SavePrompt,
+    "Qwen3LoadPrompt": Qwen3LoadPrompt,
+    "Qwen3VoiceClone": Qwen3VoiceClone,
+    "Qwen3DatasetFromFolder": Qwen3DatasetFromFolder,
+    "Qwen3DataPrep": Qwen3DataPrep,
+    "Qwen3FineTune": Qwen3FineTune,
+    "Qwen3LoadAudioFromPath": Qwen3LoadAudioFromPath,
+    "Qwen3AudioCompare": Qwen3AudioCompare,
+    "Qwen3AudioToDataset": Qwen3AudioToDataset,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "Qwen3Loader": "Qwen3-TTS Loader",
+    "Qwen3CustomVoice": "Qwen3-TTS Custom Voice",
+    "Qwen3VoiceDesign": "Qwen3-TTS Voice Design",
+    "Qwen3PromptMaker": "Qwen3-TTS Prompt Maker",
+    "Qwen3SavePrompt": "Qwen3-TTS Save Prompt",
+    "Qwen3LoadPrompt": "Qwen3-TTS Load Prompt",
+    "Qwen3VoiceClone": "Qwen3-TTS Voice Clone",
+    "Qwen3DatasetFromFolder": "Qwen3-TTS Dataset Maker",
+    "Qwen3DataPrep": "Qwen3-TTS Data Prep",
+    "Qwen3FineTune": "Qwen3-TTS Fine-Tune",
+    "Qwen3LoadAudioFromPath": "Qwen3-TTS Load Audio (Path)",
+    "Qwen3AudioCompare": "Qwen3-TTS Audio Compare",
+    "Qwen3AudioToDataset": "Qwen3-TTS Audio To Dataset (Whisper)",
+}
