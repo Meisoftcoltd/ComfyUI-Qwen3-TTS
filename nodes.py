@@ -45,6 +45,11 @@ try:
     HAS_WHISPER_PYDUB = True
 except ImportError:
     HAS_WHISPER_PYDUB = False
+try:
+    import librosa
+    HAS_LIBROSA = True
+except ImportError:
+    HAS_LIBROSA = False
 from accelerate import Accelerator
 from torch.optim import AdamW
 try:
@@ -53,7 +58,7 @@ try:
 except ImportError:
     HAS_BNB = False
 from torch.utils.data import DataLoader
-from transformers import AutoConfig, get_linear_schedule_with_warmup
+from transformers import AutoConfig, get_linear_schedule_with_warmup, AutoProcessor, Qwen2AudioForConditionalGeneration
 from transformers.utils import cached_file
 from safetensors.torch import save_file, load_file
 
@@ -1300,19 +1305,50 @@ class Qwen3AudioToDataset:
         return (output_folder,)
 
 
-class Qwen3DatasetFromFolder:
+class Qwen3LoadDatasetAudio:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
                 "folder_path": ("STRING", {"default": "", "multiline": False}),
+            }
+        }
+
+    RETURN_TYPES = ("DATASET_AUDIO_LIST",)
+    RETURN_NAMES = ("audio_list",)
+    FUNCTION = "load_audio"
+    CATEGORY = "Qwen3-TTS/FineTuning"
+
+    def load_audio(self, folder_path):
+        folder_path = folder_path.strip().strip('"')
+        folder_path = fix_wsl_path(folder_path)
+
+        if not os.path.exists(folder_path):
+            raise ValueError(f"Folder not found: {folder_path}")
+
+        files = [f for f in os.listdir(folder_path)
+                 if f.lower().endswith(".wav") and os.path.isfile(os.path.join(folder_path, f))]
+        files.sort()
+
+        if not files:
+             raise ValueError(f"No .wav files found in {folder_path}")
+
+        print(f"[Qwen3-TTS] Found {len(files)} .wav files in {folder_path}")
+        return ({"folder_path": folder_path, "files": files},)
+
+
+class Qwen3TranscribeWhisper:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "audio_list": ("DATASET_AUDIO_LIST",),
                 "whisper_model": (["tiny", "base", "small", "medium", "large", "large-v3"], {"default": "medium"}),
             },
             "optional": {
-                "output_filename": ("STRING", {"default": "dataset.jsonl", "multiline": False}),
-                "output_dataset_folder": ("STRING", {"default": "dataset_final", "multiline": False, "tooltip": "Subfolder where processed wavs/txts will be saved."}),
+                "output_dataset_folder": ("STRING", {"default": "dataset_final", "multiline": False}),
                 "min_duration": ("FLOAT", {"default": 0.8, "min": 0.1, "max": 10.0, "step": 0.1}),
-                "max_duration": ("FLOAT", {"default": 60.0, "min": 1.0, "max": 120.0, "step": 0.5, "tooltip": "Maximum duration (seconds) for a single training segment. Default 60s."}),
+                "max_duration": ("FLOAT", {"default": 60.0, "min": 1.0, "max": 120.0, "step": 0.5}),
                 "silence_threshold": ("FLOAT", {"default": -40.0, "min": -100.0, "max": 0.0, "step": 1.0}),
             },
             "hidden": {
@@ -1320,31 +1356,26 @@ class Qwen3DatasetFromFolder:
             }
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("jsonl_path",)
+    RETURN_TYPES = ("DATASET_ITEMS",)
+    RETURN_NAMES = ("dataset_items",)
     OUTPUT_NODE = True
-    FUNCTION = "create_dataset"
+    FUNCTION = "process"
     CATEGORY = "Qwen3-TTS/FineTuning"
 
-    def create_dataset(self, folder_path, whisper_model, output_filename="dataset.jsonl", output_dataset_folder="dataset_final", min_duration=0.8, max_duration=60.0, silence_threshold=-40.0, unique_id=None):
+    def process(self, audio_list, whisper_model, output_dataset_folder="dataset_final", min_duration=0.8, max_duration=60.0, silence_threshold=-40.0, unique_id=None):
         if not HAS_WHISPER_PYDUB:
              raise ImportError("Please install 'openai-whisper' and 'pydub' to use this node.")
 
-        folder_path = folder_path.strip().strip('"')
-        folder_path = fix_wsl_path(folder_path)
-
-        print(f"[Qwen3-TTS DEBUG] create_dataset called. folder_path: {folder_path}")
-
-        if not os.path.exists(folder_path):
-            raise ValueError(f"Folder not found: {folder_path}")
+        folder_path = audio_list["folder_path"]
+        files = audio_list["files"]
         
         # Define output directory for processed files
         processed_dir = os.path.join(folder_path, output_dataset_folder)
         os.makedirs(processed_dir, exist_ok=True)
-
-        # Step 1: Check if processed files exist, if not, run Whisper processing
-        processed_wavs = [f for f in os.listdir(processed_dir) if f.lower().endswith('.wav')]
         
+        # Check if processed files exist
+        processed_wavs = [f for f in os.listdir(processed_dir) if f.lower().endswith('.wav')]
+
         if not processed_wavs:
             print(f"[Qwen3-TTS] No processed files found in {processed_dir}. Starting Whisper processing...")
 
@@ -1356,18 +1387,8 @@ class Qwen3DatasetFromFolder:
             except Exception as e:
                 raise RuntimeError(f"Failed to load Whisper model: {e}")
 
-            # Find input files
-            files = [f for f in os.listdir(folder_path)
-                     if f.lower().endswith(".wav") and os.path.isfile(os.path.join(folder_path, f))]
-            files.sort()
-
-            if not files:
-                 raise ValueError(f"No .wav files found in {folder_path} to process.")
-
             total_files = len(files)
-            print(f"[Qwen3-TTS] Processing {total_files} files in: {folder_path}")
-
-            total_clips = 0
+            print(f"[Qwen3-TTS] Processing {total_files} files...")
 
             def trim_silence(audio_segment, silence_threshold=-40.0, chunk_size=10):
                 try:
@@ -1430,83 +1451,185 @@ class Qwen3DatasetFromFolder:
                         f.write(text)
 
                     file_count += 1
-                    total_clips += 1
-
-            print(f"[Qwen3-TTS] Processing finished. {total_clips} clips generated.")
 
             # Clean up VRAM
             del model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            # Refresh list of processed wavs
+            # Refresh list
             processed_wavs = [f for f in os.listdir(processed_dir) if f.lower().endswith('.wav')]
         else:
-            print(f"[Qwen3-TTS] Found {len(processed_wavs)} existing processed files in {processed_dir}. Skipping Whisper step.")
+            print(f"[Qwen3-TTS] Found {len(processed_wavs)} existing processed files. Skipping Whisper.")
 
-        # Step 2: Generate JSONL from processed files
-        jsonl_path = os.path.join(processed_dir, output_filename)
-        print(f"[Qwen3-TTS DEBUG] Generating dataset JSONL at: {jsonl_path}")
+        # Build list of items for next step
+        items = []
+        for wav_file in processed_wavs:
+            base_name = os.path.splitext(wav_file)[0]
+            txt_path = os.path.join(processed_dir, f"{base_name}.txt")
+            if os.path.exists(txt_path):
+                with open(txt_path, 'r', encoding='utf-8') as f:
+                    text = f.read().strip()
+                if text:
+                    items.append({
+                        "audio_path": os.path.join(processed_dir, wav_file),
+                        "text": text
+                    })
 
-        # Auto-detect reference audio
-        ref_audio_path = os.path.join(processed_dir, "ref.wav")
-        if not os.path.exists(ref_audio_path):
-            if processed_wavs:
-                # Use the first file as reference if no explicit ref.wav exists
-                # We sort to ensure determinism
-                processed_wavs.sort()
-                ref_audio_path = os.path.join(processed_dir, processed_wavs[0])
-                print(f"[Qwen3-TTS] Auto-selected reference audio: {ref_audio_path}")
-            else:
-                raise ValueError("No processed wav files found to generate dataset.")
-        
-        full_ref_path = os.path.abspath(ref_audio_path)
-        
+        return (items,)
+
+
+class Qwen3AutoLabelEmotions:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "dataset_items": ("DATASET_ITEMS",),
+                "model": (["Qwen/Qwen2-Audio-7B-Instruct"], {"default": "Qwen/Qwen2-Audio-7B-Instruct"}),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            }
+        }
+
+    RETURN_TYPES = ("DATASET_ITEMS",)
+    RETURN_NAMES = ("labeled_items",)
+    OUTPUT_NODE = True
+    FUNCTION = "label_emotions"
+    CATEGORY = "Qwen3-TTS/FineTuning"
+
+    def label_emotions(self, dataset_items, model, unique_id=None):
+        if not HAS_LIBROSA:
+             raise ImportError("Please install 'librosa' to use this node.")
+
+        print(f"[Qwen3-TTS] Auto-Labeling Emotions for {len(dataset_items)} items...")
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Loading Qwen2-Audio on {device}...")
+
+        try:
+            processor = AutoProcessor.from_pretrained(model, trust_remote_code=True)
+            model_obj = Qwen2AudioForConditionalGeneration.from_pretrained(model, device_map="auto", trust_remote_code=True)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load Qwen2-Audio model: {e}")
+
+        system_prompt = "Describe the voice gender, emotion, tone, and speed concisely. Output ONLY the description."
+
+        total = len(dataset_items)
+        for idx, item in enumerate(dataset_items):
+            if unique_id:
+                PromptServer.instance.send_progress(idx, total, unique_id)
+
+            # Skip if already labeled (in case of re-run or partial)
+            if "instruction" in item and item["instruction"]:
+                continue
+
+            file_path = item["audio_path"]
+            print(f"[{idx+1}/{total}] Labeling: {os.path.basename(file_path)}")
+
+            try:
+                # Load audio
+                audio, sr = librosa.load(file_path, sr=processor.feature_extractor.sampling_rate)
+
+                conversation = [
+                    {"role": "user", "content": [
+                        {"type": "audio", "audio_url": file_path},
+                        {"type": "text", "text": system_prompt}
+                    ]}
+                ]
+
+                text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
+
+                inputs = processor(
+                    text=text,
+                    audios=audio,
+                    sampling_rate=sr,
+                    return_tensors="pt",
+                    padding=True
+                )
+                inputs = inputs.to(model_obj.device)
+
+                with torch.no_grad():
+                    generated_ids = model_obj.generate(**inputs, max_new_tokens=50)
+
+                generated_ids = generated_ids[:, inputs.input_ids.size(1):]
+                response = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+                instruction = response.strip()
+
+                item["instruction"] = instruction
+                print(f" -> {instruction}")
+
+            except Exception as e:
+                print(f"Error labeling {file_path}: {e}")
+                item["instruction"] = "unknown"
+
+        # Cleanup
+        del model_obj
+        del processor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return (dataset_items,)
+
+
+class Qwen3ExportJSONL:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "dataset_items": ("DATASET_ITEMS",),
+                "output_filename": ("STRING", {"default": "dataset.jsonl", "multiline": False}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("jsonl_path",)
+    OUTPUT_NODE = True
+    FUNCTION = "export"
+    CATEGORY = "Qwen3-TTS/FineTuning"
+
+    def export(self, dataset_items, output_filename):
+        if not dataset_items:
+            raise ValueError("No dataset items to export.")
+
+        # Determine output folder from first item
+        first_path = dataset_items[0]["audio_path"]
+        output_dir = os.path.dirname(first_path)
+        jsonl_path = os.path.join(output_dir, output_filename)
+
+        # Auto-detect reference
+        # Try to find 'ref.wav' in the same folder
+        ref_path = os.path.join(output_dir, "ref.wav")
+        if not os.path.exists(ref_path):
+            # Use first item
+            ref_path = first_path
+            print(f"Using auto-selected reference: {ref_path}")
+
+        full_ref_path = os.path.abspath(ref_path)
+
         count = 0
         with open(jsonl_path, 'w', encoding='utf-8') as f:
-            for wav_file in processed_wavs:
-                wav_path = os.path.join(processed_dir, wav_file)
-                
-                # Check if this is the reference audio (avoid data leakage if it's the same file)
-                if os.path.abspath(wav_path) == full_ref_path:
-                    # Optional: Skip reference file in dataset or include it?
-                    # Usually reference should not be part of training data if it's just one file,
-                    # but if we picked it from data, we might lose a sample.
-                    # Qwen documentation doesn't strictly forbid it, but let's include it
-                    # unless it's explicitly named 'ref.wav' which might not have text?
-                    # If we auto-picked it, it has text.
+            for item in dataset_items:
+                wav_path = os.path.abspath(item["audio_path"])
+
+                # Check reference
+                if wav_path == full_ref_path:
                     pass
-                
-                base_name = os.path.splitext(wav_file)[0]
-                
-                # Look for corresponding .txt
-                txt_path = os.path.join(processed_dir, f"{base_name}.txt")
-                if not os.path.exists(txt_path):
-                    continue
-                    
-                try:
-                    with open(txt_path, 'r', encoding='utf-8') as tf:
-                        text = tf.read().strip()
-                except Exception as e:
-                    print(f"Error reading {txt_path}: {e}")
-                    continue
-                
-                if not text:
-                    continue
 
                 entry = {
-                    "audio": os.path.abspath(wav_path),
-                    "text": text,
+                    "audio": wav_path,
+                    "text": item["text"],
                     "ref_audio": full_ref_path
                 }
+
+                # Add instruction if present
+                if "instruction" in item:
+                    entry["instruction"] = item["instruction"]
+
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
                 count += 1
-                
-        if count == 0:
-            print("Warning: No valid samples were added to the dataset!")
-        else:
-            print(f"Dataset JSONL created with {count} samples at {jsonl_path}")
-            
+
+        print(f"Exported {count} items to {jsonl_path}")
         return (jsonl_path,)
 
 class Qwen3DataPrep:
@@ -2460,7 +2583,10 @@ NODE_CLASS_MAPPINGS = {
     "Qwen3SavePrompt": Qwen3SavePrompt,
     "Qwen3LoadPrompt": Qwen3LoadPrompt,
     "Qwen3VoiceClone": Qwen3VoiceClone,
-    "Qwen3DatasetFromFolder": Qwen3DatasetFromFolder,
+    "Qwen3LoadDatasetAudio": Qwen3LoadDatasetAudio,
+    "Qwen3TranscribeWhisper": Qwen3TranscribeWhisper,
+    "Qwen3AutoLabelEmotions": Qwen3AutoLabelEmotions,
+    "Qwen3ExportJSONL": Qwen3ExportJSONL,
     "Qwen3DataPrep": Qwen3DataPrep,
     "Qwen3FineTune": Qwen3FineTune,
     "Qwen3LoadAudioFromPath": Qwen3LoadAudioFromPath,
@@ -2477,7 +2603,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Qwen3SavePrompt": "Qwen3-TTS Save Prompt",
     "Qwen3LoadPrompt": "Qwen3-TTS Load Prompt",
     "Qwen3VoiceClone": "Qwen3-TTS Voice Clone",
-    "Qwen3DatasetFromFolder": "Qwen3-TTS Dataset Maker",
+    "Qwen3LoadDatasetAudio": "Qwen3-TTS Step 1: Load Audio Folder",
+    "Qwen3TranscribeWhisper": "Qwen3-TTS Step 2: Transcribe (Whisper)",
+    "Qwen3AutoLabelEmotions": "Qwen3-TTS Step 3: Label Emotions (Qwen2-Audio)",
+    "Qwen3ExportJSONL": "Qwen3-TTS Step 4: Export JSONL",
     "Qwen3DataPrep": "Qwen3-TTS Data Prep",
     "Qwen3FineTune": "Qwen3-TTS Fine-Tune",
     "Qwen3LoadAudioFromPath": "Qwen3-TTS Load Audio (Path)",
