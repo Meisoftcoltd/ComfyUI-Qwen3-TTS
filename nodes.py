@@ -834,7 +834,6 @@ class Qwen3VoiceDesign:
             "required": {
                 "model": ("QWEN3_MODEL",),
                 "text": ("STRING", {"multiline": True}),
-                "instruct": ("STRING", {"multiline": True}),
                 "language": ([
                     "Auto", "Chinese", "English", "Japanese", "Korean", "German", 
                     "French", "Russian", "Portuguese", "Spanish", "Italian"
@@ -842,6 +841,19 @@ class Qwen3VoiceDesign:
                 "seed": ("INT", {"default": 42, "min": 1, "max": 0xffffffffffffffff}),
             },
             "optional": {
+                "gender": ("STRING", {"default": "Male", "multiline": False}),
+                "pitch": ("STRING", {"default": "Deep and resonant with subtle downward inflections suggesting gravity", "multiline": True}),
+                "speed": ("STRING", {"default": "Deliberately slow with extended pauses between sentences", "multiline": True}),
+                "volume": ("STRING", {"default": "Moderate to soft, creating an intimate atmosphere", "multiline": True}),
+                "age": ("STRING", {"default": "Middle-aged to older adult", "multiline": False}),
+                "clarity": ("STRING", {"default": "Crystal clear enunciation with careful articulation", "multiline": True}),
+                "fluency": ("STRING", {"default": "Smooth and controlled with intentional dramatic pauses", "multiline": True}),
+                "accent": ("STRING", {"default": "Standard American English", "multiline": False}),
+                "texture": ("STRING", {"default": "Rich and velvety with a slightly smoky quality", "multiline": True}),
+                "emotion": ("STRING", {"default": "Contemplative and intriguing", "multiline": True}),
+                "tone": ("STRING", {"default": "Mysterious, philosophical, and atmospheric", "multiline": True}),
+                "personality": ("STRING", {"default": "Introspective, wise, and captivating", "multiline": True}),
+                "custom_instruction": ("STRING", {"default": "", "multiline": True, "tooltip": "Any additional custom instructions to append."}),
                 "top_p": ("FLOAT", {"default": 0.8, "min": 0.1, "max": 1.0, "step": 0.01}),
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.1, "max": 2.0, "step": 0.01}),
                 "repetition_penalty": ("FLOAT", {"default": 1.1, "min": 1.0, "max": 2.0, "step": 0.01, "tooltip": "Penalty for repetition. Increase (e.g., 1.1-1.2) to prevent infinite loops/stuttering."}),
@@ -849,19 +861,47 @@ class Qwen3VoiceDesign:
         }
     
     @classmethod
-    def IS_CHANGED(s, model, text, instruct, language, seed, top_p=0.8, temperature=0.7, repetition_penalty=1.1):
+    def IS_CHANGED(s, seed, **kwargs):
         return seed
 
     RETURN_TYPES = ("AUDIO",)
     FUNCTION = "generate"
     CATEGORY = "Qwen3-TTS"
 
-    def generate(self, model, text, instruct, language, seed, top_p=0.8, temperature=0.7, repetition_penalty=1.1):
+    def generate(self, model, text, language, seed, top_p=0.8, temperature=0.7, repetition_penalty=1.1, **kwargs):
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
         lang = language if language != "Auto" else None
         
+        # Construct instruct string from kwargs
+        fields = [
+            ("gender", kwargs.get("gender")),
+            ("pitch", kwargs.get("pitch")),
+            ("speed", kwargs.get("speed")),
+            ("volume", kwargs.get("volume")),
+            ("age", kwargs.get("age")),
+            ("clarity", kwargs.get("clarity")),
+            ("fluency", kwargs.get("fluency")),
+            ("accent", kwargs.get("accent")),
+            ("texture", kwargs.get("texture")),
+            ("emotion", kwargs.get("emotion")),
+            ("tone", kwargs.get("tone")),
+            ("personality", kwargs.get("personality")),
+        ]
+
+        prompt_lines = []
+        for key, value in fields:
+            if value and value.strip():
+                prompt_lines.append(f"{key}: {value.strip()}")
+
+        custom_instruction = kwargs.get("custom_instruction")
+        if custom_instruction and custom_instruction.strip():
+            prompt_lines.append(custom_instruction.strip())
+
+        instruct = "\n".join(prompt_lines)
+        print(f"[Qwen3-TTS] Generated Voice Design Prompt:\n{instruct}")
+
         gen_kwargs = {
             "top_p": top_p,
             "temperature": temperature,
@@ -892,60 +932,6 @@ class Qwen3VoiceDesign:
         return (convert_audio(wavs[0], sr),)
 
 
-class Qwen3VoiceDesignConstructor:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "gender": ("STRING", {"default": "Male", "multiline": False}),
-                "pitch": ("STRING", {"default": "Deep and resonant with subtle downward inflections suggesting gravity", "multiline": True}),
-                "speed": ("STRING", {"default": "Deliberately slow with extended pauses between sentences", "multiline": True}),
-                "volume": ("STRING", {"default": "Moderate to soft, creating an intimate atmosphere", "multiline": True}),
-                "age": ("STRING", {"default": "Middle-aged to older adult", "multiline": False}),
-                "clarity": ("STRING", {"default": "Crystal clear enunciation with careful articulation", "multiline": True}),
-                "fluency": ("STRING", {"default": "Smooth and controlled with intentional dramatic pauses", "multiline": True}),
-                "accent": ("STRING", {"default": "Standard American English", "multiline": False}),
-                "texture": ("STRING", {"default": "Rich and velvety with a slightly smoky quality", "multiline": True}),
-                "emotion": ("STRING", {"default": "Contemplative and intriguing", "multiline": True}),
-                "tone": ("STRING", {"default": "Mysterious, philosophical, and atmospheric", "multiline": True}),
-                "personality": ("STRING", {"default": "Introspective, wise, and captivating", "multiline": True}),
-            },
-            "optional": {
-                "custom_instruction": ("STRING", {"default": "", "multiline": True, "tooltip": "Any additional custom instructions to append."}),
-            }
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("prompt",)
-    FUNCTION = "construct_prompt"
-    CATEGORY = "Qwen3-TTS/Prompting"
-
-    def construct_prompt(self, gender, pitch, speed, volume, age, clarity, fluency, accent, texture, emotion, tone, personality, custom_instruction=""):
-        fields = [
-            ("gender", gender),
-            ("pitch", pitch),
-            ("speed", speed),
-            ("volume", volume),
-            ("age", age),
-            ("clarity", clarity),
-            ("fluency", fluency),
-            ("accent", accent),
-            ("texture", texture),
-            ("emotion", emotion),
-            ("tone", tone),
-            ("personality", personality),
-        ]
-
-        prompt_lines = []
-        for key, value in fields:
-            if value and value.strip():
-                prompt_lines.append(f"{key}: {value.strip()}")
-
-        if custom_instruction and custom_instruction.strip():
-            prompt_lines.append(custom_instruction.strip())
-
-        result = "\n".join(prompt_lines)
-        return (result,)
 
 
 class Qwen3PromptMaker:
@@ -2639,7 +2625,6 @@ NODE_CLASS_MAPPINGS = {
     "Qwen3SavePrompt": Qwen3SavePrompt,
     "Qwen3LoadPrompt": Qwen3LoadPrompt,
     "Qwen3VoiceClone": Qwen3VoiceClone,
-    "Qwen3VoiceDesignConstructor": Qwen3VoiceDesignConstructor,
     "Qwen3LoadDatasetAudio": Qwen3LoadDatasetAudio,
     "Qwen3TranscribeWhisper": Qwen3TranscribeWhisper,
     "Qwen3AutoLabelEmotions": Qwen3AutoLabelEmotions,
@@ -2655,12 +2640,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Qwen3Loader": "Qwen3-TTS Loader",
     "Qwen3LoadFineTuned": "Qwen3-TTS Load Fine-Tuned",
     "Qwen3CustomVoice": "Qwen3-TTS Custom Voice",
-    "Qwen3VoiceDesign": "Qwen3-TTS Voice Design",
+    "Qwen3VoiceDesign": "🎨 Qwen3-TTS Voice Design (Advanced)",
     "Qwen3PromptMaker": "Qwen3-TTS Prompt Maker",
     "Qwen3SavePrompt": "Qwen3-TTS Save Prompt",
     "Qwen3LoadPrompt": "Qwen3-TTS Load Prompt",
     "Qwen3VoiceClone": "Qwen3-TTS Voice Clone",
-    "Qwen3VoiceDesignConstructor": "📝 Qwen3-TTS Voice Design Prompt",
     "Qwen3LoadDatasetAudio": "📁 Qwen3-TTS Step 1: Load Audio Folder",
     "Qwen3TranscribeWhisper": "🎙️ Qwen3-TTS Step 2: Transcribe (Whisper)",
     "Qwen3AutoLabelEmotions": "🎭 Qwen3-TTS Step 3: Label Emotions (Qwen2-Audio)",
