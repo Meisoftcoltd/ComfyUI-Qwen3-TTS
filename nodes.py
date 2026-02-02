@@ -892,6 +892,62 @@ class Qwen3VoiceDesign:
         return (convert_audio(wavs[0], sr),)
 
 
+class Qwen3VoiceDesignConstructor:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "gender": ("STRING", {"default": "Male", "multiline": False}),
+                "pitch": ("STRING", {"default": "Deep and resonant with subtle downward inflections suggesting gravity", "multiline": True}),
+                "speed": ("STRING", {"default": "Deliberately slow with extended pauses between sentences", "multiline": True}),
+                "volume": ("STRING", {"default": "Moderate to soft, creating an intimate atmosphere", "multiline": True}),
+                "age": ("STRING", {"default": "Middle-aged to older adult", "multiline": False}),
+                "clarity": ("STRING", {"default": "Crystal clear enunciation with careful articulation", "multiline": True}),
+                "fluency": ("STRING", {"default": "Smooth and controlled with intentional dramatic pauses", "multiline": True}),
+                "accent": ("STRING", {"default": "Standard American English", "multiline": False}),
+                "texture": ("STRING", {"default": "Rich and velvety with a slightly smoky quality", "multiline": True}),
+                "emotion": ("STRING", {"default": "Contemplative and intriguing", "multiline": True}),
+                "tone": ("STRING", {"default": "Mysterious, philosophical, and atmospheric", "multiline": True}),
+                "personality": ("STRING", {"default": "Introspective, wise, and captivating", "multiline": True}),
+            },
+            "optional": {
+                "custom_instruction": ("STRING", {"default": "", "multiline": True, "tooltip": "Any additional custom instructions to append."}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("prompt",)
+    FUNCTION = "construct_prompt"
+    CATEGORY = "Qwen3-TTS/Prompting"
+
+    def construct_prompt(self, gender, pitch, speed, volume, age, clarity, fluency, accent, texture, emotion, tone, personality, custom_instruction=""):
+        fields = [
+            ("gender", gender),
+            ("pitch", pitch),
+            ("speed", speed),
+            ("volume", volume),
+            ("age", age),
+            ("clarity", clarity),
+            ("fluency", fluency),
+            ("accent", accent),
+            ("texture", texture),
+            ("emotion", emotion),
+            ("tone", tone),
+            ("personality", personality),
+        ]
+
+        prompt_lines = []
+        for key, value in fields:
+            if value and value.strip():
+                prompt_lines.append(f"{key}: {value.strip()}")
+
+        if custom_instruction and custom_instruction.strip():
+            prompt_lines.append(custom_instruction.strip())
+
+        result = "\n".join(prompt_lines)
+        return (result,)
+
+
 class Qwen3PromptMaker:
     @classmethod
     def INPUT_TYPES(s):
@@ -2583,6 +2639,7 @@ NODE_CLASS_MAPPINGS = {
     "Qwen3SavePrompt": Qwen3SavePrompt,
     "Qwen3LoadPrompt": Qwen3LoadPrompt,
     "Qwen3VoiceClone": Qwen3VoiceClone,
+    "Qwen3VoiceDesignConstructor": Qwen3VoiceDesignConstructor,
     "Qwen3LoadDatasetAudio": Qwen3LoadDatasetAudio,
     "Qwen3TranscribeWhisper": Qwen3TranscribeWhisper,
     "Qwen3AutoLabelEmotions": Qwen3AutoLabelEmotions,
@@ -2603,10 +2660,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Qwen3SavePrompt": "Qwen3-TTS Save Prompt",
     "Qwen3LoadPrompt": "Qwen3-TTS Load Prompt",
     "Qwen3VoiceClone": "Qwen3-TTS Voice Clone",
-    "Qwen3LoadDatasetAudio": "Qwen3-TTS Step 1: Load Audio Folder",
-    "Qwen3TranscribeWhisper": "Qwen3-TTS Step 2: Transcribe (Whisper)",
-    "Qwen3AutoLabelEmotions": "Qwen3-TTS Step 3: Label Emotions (Qwen2-Audio)",
-    "Qwen3ExportJSONL": "Qwen3-TTS Step 4: Export JSONL",
+    "Qwen3VoiceDesignConstructor": "📝 Qwen3-TTS Voice Design Prompt",
+    "Qwen3LoadDatasetAudio": "📁 Qwen3-TTS Step 1: Load Audio Folder",
+    "Qwen3TranscribeWhisper": "🎙️ Qwen3-TTS Step 2: Transcribe (Whisper)",
+    "Qwen3AutoLabelEmotions": "🎭 Qwen3-TTS Step 3: Label Emotions (Qwen2-Audio)",
+    "Qwen3ExportJSONL": "💾 Qwen3-TTS Step 4: Export JSONL",
     "Qwen3DataPrep": "Qwen3-TTS Data Prep",
     "Qwen3FineTune": "Qwen3-TTS Fine-Tune",
     "Qwen3LoadAudioFromPath": "Qwen3-TTS Load Audio (Path)",
