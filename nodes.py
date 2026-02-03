@@ -2890,6 +2890,18 @@ class Qwen3TrainLoRA:
         if hasattr(hf_model, "gradient_checkpointing_enable"):
             hf_model.gradient_checkpointing_enable()
 
+        # PATCH: Fix for transformers 'KeyError: dtype' during Trainer init
+        # The Qwen3TTSConfig might not match standard HF serialization expectations.
+        # We replace to_diff_dict with a safe version that skips the recursive diff comparison.
+        if hasattr(hf_model, "config"):
+            def safe_to_diff_dict(self):
+                # Return the full dict instead of trying to compute a diff against defaults
+                # which causes the KeyError if defaults are missing keys present in instance
+                return self.to_dict()
+            import types
+            hf_model.config.to_diff_dict = types.MethodType(safe_to_diff_dict, hf_model.config)
+            print("[Qwen3-TTS] Patched model.config.to_diff_dict to avoid Trainer serialization error.")
+
         # Configure LoRA
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
