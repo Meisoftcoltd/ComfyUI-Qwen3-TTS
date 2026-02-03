@@ -9,6 +9,7 @@ app.registerExtension({
         const config = {
             "Qwen3LoadDatasetAudio": [{ widget: "folder_path", type: "folder" }],
             "Qwen3LoadAudioFromPath": [{ widget: "audio_path", type: "file" }],
+            "Qwen3SaveAudio": [{ widget: "output_subfolder", type: "folder" }],
             "Qwen3FineTune": [{ widget: "output_dir", type: "folder" }],
             "Qwen3TrainLoRA": [{ widget: "save_path", type: "folder" }],
             "Qwen3DataPrep": [{ widget: "jsonl_path", type: "file" }],

@@ -2453,6 +2453,71 @@ class Qwen3FineTune:
         return (convert_audio(wav, sr),)
 
 
+class Qwen3SaveAudio:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "filename_prefix": ("STRING", {"default": "audio", "multiline": False}),
+            },
+            "optional": {
+                "output_subfolder": ("STRING", {"default": "Qwen3-TTS/output", "multiline": False}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("output_path",)
+    OUTPUT_NODE = True
+    FUNCTION = "save_audio"
+    CATEGORY = "Qwen3-TTS/Utils"
+
+    def save_audio(self, audio, filename_prefix, output_subfolder=""):
+        # Determine output directory
+        base_output = folder_paths.get_output_directory()
+        if output_subfolder:
+            out_dir = os.path.join(base_output, output_subfolder)
+        else:
+            out_dir = base_output
+
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Handle audio input
+        # ComfyUI Audio format: {"waveform": tensor[B, C, T], "sample_rate": int}
+        waveform = audio["waveform"]
+        sample_rate = audio["sample_rate"]
+
+        # Ensure we have a batch dimension
+        if waveform.dim() == 2:
+            waveform = waveform.unsqueeze(0)
+
+        batch_size = waveform.shape[0]
+
+        # Save each item in batch
+        # Generate unique counter/timestamp to avoid overwrites within session if needed,
+        # or rely on ComfyUI standard prefix logic.
+        # For simplicity and batch handling:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        for i in range(batch_size):
+            # Extract single waveform: [Channels, Samples]
+            wav = waveform[i]
+
+            # Convert to numpy for soundfile
+            # Soundfile expects [Samples, Channels] usually
+            wav_np = wav.cpu().numpy()
+            if wav_np.shape[0] < wav_np.shape[1]:
+                wav_np = wav_np.transpose(1, 0) # [C, T] -> [T, C]
+
+            file_name = f"{filename_prefix}_{timestamp}_{i:04d}.wav"
+            file_path = os.path.join(out_dir, file_name)
+
+            sf.write(file_path, wav_np, sample_rate)
+            print(f"[Qwen3-TTS] Saved audio to: {file_path}")
+
+        return (out_dir,)
+
+
 class Qwen3LoadAudioFromPath:
     @classmethod
     def INPUT_TYPES(s):
@@ -2705,6 +2770,7 @@ NODE_CLASS_MAPPINGS = {
     "Qwen3ExportJSONL": Qwen3ExportJSONL,
     "Qwen3DataPrep": Qwen3DataPrep,
     "Qwen3FineTune": Qwen3FineTune,
+    "Qwen3SaveAudio": Qwen3SaveAudio,
     "Qwen3LoadAudioFromPath": Qwen3LoadAudioFromPath,
     "Qwen3AudioCompare": Qwen3AudioCompare,
     "Qwen3AudioToDataset": Qwen3AudioToDataset,
@@ -2725,6 +2791,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Qwen3ExportJSONL": "💾 Qwen3-TTS Step 4: Export JSONL",
     "Qwen3DataPrep": "⚙️ Qwen3-TTS Data Prep",
     "Qwen3FineTune": "🎓 Qwen3-TTS Fine-Tune",
+    "Qwen3SaveAudio": "📁 Qwen3-TTS Save Audio",
     "Qwen3LoadAudioFromPath": "📁 Qwen3-TTS Load Audio (Path)",
     "Qwen3AudioCompare": "📊 Qwen3-TTS Audio Compare",
     "Qwen3AudioToDataset": "🔄 Qwen3-TTS Audio To Dataset (Whisper)",
