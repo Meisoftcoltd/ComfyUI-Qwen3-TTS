@@ -1591,12 +1591,26 @@ class Qwen3AutoLabelEmotions:
 
         total = len(dataset_items)
         for idx, item in enumerate(tqdm(dataset_items, desc="Labeling Emotions", unit="item")):
-            # Skip if already labeled (in case of re-run or partial)
+            # Skip if already labeled (in case of re-run or partial input)
             if "instruction" in item and item["instruction"]:
                 continue
 
             file_path = item["audio_path"]
             filename = os.path.basename(file_path)
+            # Check for existing label file (.emotion.txt)
+            label_path = os.path.splitext(file_path)[0] + ".emotion.txt"
+
+            if os.path.exists(label_path):
+                try:
+                    with open(label_path, 'r', encoding='utf-8') as f:
+                        cached_label = f.read().strip()
+                    if cached_label:
+                        item["instruction"] = cached_label
+                        print(f"[{idx+1}/{total}] Skipping {filename} (Loaded cache): {cached_label}")
+                        continue
+                except Exception as e:
+                    print(f"Error reading cache for {filename}: {e}")
+
             path_lower = file_path.lower()
 
             # --- PHASE 1: Keyword Detection (Deterministic) ---
@@ -1609,6 +1623,12 @@ class Qwen3AutoLabelEmotions:
 
             if detected_instruction:
                 item["instruction"] = detected_instruction
+                # Save to cache
+                try:
+                    with open(label_path, 'w', encoding='utf-8') as f:
+                        f.write(detected_instruction)
+                except Exception:
+                    pass
                 continue
 
             # --- PHASE 2: AI Inference (If no keyword found) ---
@@ -1650,6 +1670,13 @@ class Qwen3AutoLabelEmotions:
 
                 item["instruction"] = instruction
                 print(f" -> {instruction}")
+
+                # Save to cache file
+                try:
+                    with open(label_path, 'w', encoding='utf-8') as f:
+                        f.write(instruction)
+                except Exception as e:
+                    print(f"Warning: Could not save emotion label cache: {e}")
 
             except Exception as e:
                 print(f"Error labeling {file_path}: {e}")
