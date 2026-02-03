@@ -416,7 +416,7 @@ class Qwen3Loader:
     RETURN_TYPES = ("QWEN3_MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "load_model"
-    CATEGORY = "Qwen3-TTS"
+    CATEGORY = "Qwen3-TTS/Loader"
 
     def load_model(self, repo_id, source, precision, attention, local_model_path=""):
         # Handle "✓ " prefix or "Local: " prefix
@@ -615,7 +615,7 @@ class Qwen3LoadFineTuned:
     RETURN_TYPES = ("QWEN3_MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "load_model"
-    CATEGORY = "Qwen3-TTS"
+    CATEGORY = "Qwen3-TTS/Loader"
 
     def load_model(self, model_name, precision, attention):
         if model_name == "No fine-tuned models found":
@@ -763,7 +763,7 @@ class Qwen3CustomVoice:
 
     RETURN_TYPES = ("AUDIO",)
     FUNCTION = "generate"
-    CATEGORY = "Qwen3-TTS"
+    CATEGORY = "Qwen3-TTS/Inference"
 
     def generate(self, model, text, language, speaker, seed, instruct="", custom_speaker_name="", max_new_tokens=8192, top_p=0.8, temperature=0.7, repetition_penalty=1.1):
         torch.manual_seed(seed)
@@ -871,7 +871,7 @@ class Qwen3VoiceDesign:
 
     RETURN_TYPES = ("AUDIO",)
     FUNCTION = "generate"
-    CATEGORY = "Qwen3-TTS"
+    CATEGORY = "Qwen3-TTS/Inference"
 
     def generate(self, model, text, language, seed, top_p=0.8, temperature=0.7, repetition_penalty=1.1, **kwargs):
         torch.manual_seed(seed)
@@ -955,7 +955,7 @@ class Qwen3PromptMaker:
 
     RETURN_TYPES = ("QWEN3_PROMPT",)
     FUNCTION = "create_prompt"
-    CATEGORY = "Qwen3-TTS"
+    CATEGORY = "Qwen3-TTS/Inference"
 
     def create_prompt(self, model, ref_audio, ref_text, ref_audio_max_seconds=30.0):
         audio_tuple = load_audio_input(ref_audio)
@@ -1000,7 +1000,7 @@ class Qwen3SavePrompt:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("filepath",)
     FUNCTION = "save_prompt"
-    CATEGORY = "Qwen3-TTS"
+    CATEGORY = "Qwen3-TTS/Utils"
     OUTPUT_NODE = True
 
     def save_prompt(self, prompt, filename):
@@ -1060,7 +1060,7 @@ class Qwen3LoadPrompt:
     RETURN_TYPES = ("QWEN3_PROMPT",)
     RETURN_NAMES = ("prompt",)
     FUNCTION = "load_prompt"
-    CATEGORY = "Qwen3-TTS"
+    CATEGORY = "Qwen3-TTS/Utils"
 
     @classmethod
     def IS_CHANGED(s, prompt_file):
@@ -1136,7 +1136,7 @@ class Qwen3VoiceClone:
 
     RETURN_TYPES = ("AUDIO",)
     FUNCTION = "generate"
-    CATEGORY = "Qwen3-TTS"
+    CATEGORY = "Qwen3-TTS/Inference"
 
     def generate(self, model, text, seed, language="Auto", ref_audio=None, ref_text=None, prompt=None, max_new_tokens=2048, ref_audio_max_seconds=30.0, top_p=0.8, temperature=0.7, repetition_penalty=1.1):
         torch.manual_seed(seed)
@@ -1233,7 +1233,7 @@ class Qwen3AudioToDataset:
     RETURN_NAMES = ("dataset_path",)
     OUTPUT_NODE = True
     FUNCTION = "process"
-    CATEGORY = "Qwen3-TTS/FineTuning"
+    CATEGORY = "Qwen3-TTS/Dataset"
 
     def process(self, audio_folder, model_size, output_folder_name="dataset_final", min_duration=0.8, max_duration=15.0, silence_threshold=-40.0):
         if not HAS_WHISPER_PYDUB:
@@ -1364,7 +1364,7 @@ class Qwen3LoadDatasetAudio:
     RETURN_TYPES = ("DATASET_AUDIO_LIST",)
     RETURN_NAMES = ("audio_list",)
     FUNCTION = "load_audio"
-    CATEGORY = "Qwen3-TTS/FineTuning"
+    CATEGORY = "Qwen3-TTS/Dataset"
 
     def load_audio(self, folder_path):
         folder_path = folder_path.strip().strip('"')
@@ -1407,7 +1407,7 @@ class Qwen3TranscribeWhisper:
     RETURN_NAMES = ("dataset_items",)
     OUTPUT_NODE = True
     FUNCTION = "process"
-    CATEGORY = "Qwen3-TTS/FineTuning"
+    CATEGORY = "Qwen3-TTS/Dataset"
 
     def process(self, audio_list, whisper_model, output_dataset_folder="dataset_final", min_duration=0.8, max_duration=60.0, silence_threshold=-40.0, unique_id=None):
         if not HAS_WHISPER_PYDUB:
@@ -1543,7 +1543,7 @@ class Qwen3AutoLabelEmotions:
     RETURN_NAMES = ("labeled_items",)
     OUTPUT_NODE = True
     FUNCTION = "label_emotions"
-    CATEGORY = "Qwen3-TTS/FineTuning"
+    CATEGORY = "Qwen3-TTS/Dataset"
 
     def label_emotions(self, dataset_items, model, unique_id=None):
         if not HAS_LIBROSA:
@@ -1633,7 +1633,7 @@ class Qwen3ExportJSONL:
     RETURN_NAMES = ("jsonl_path",)
     OUTPUT_NODE = True
     FUNCTION = "export"
-    CATEGORY = "Qwen3-TTS/FineTuning"
+    CATEGORY = "Qwen3-TTS/Dataset"
 
     def export(self, dataset_items, output_filename):
         if not dataset_items:
@@ -1704,7 +1704,7 @@ class Qwen3DataPrep:
     RETURN_NAMES = ("processed_jsonl_path",)
     OUTPUT_NODE = True
     FUNCTION = "process"
-    CATEGORY = "Qwen3-TTS/FineTuning"
+    CATEGORY = "Qwen3-TTS/Dataset"
 
     def process(self, jsonl_path, audio_tokenizer_repo, text_tokenizer_repo, source, batch_size, unique_id=None):
         jsonl_path = fix_wsl_path(jsonl_path)
@@ -1886,7 +1886,7 @@ class Qwen3FineTune:
     RETURN_NAMES = ("model_path", "custom_speaker_name")
     OUTPUT_NODE = True
     FUNCTION = "train"
-    CATEGORY = "Qwen3-TTS/FineTuning"
+    CATEGORY = "Qwen3-TTS/Training"
 
     def train(self, train_jsonl, init_model, source, output_dir, epochs, batch_size, lr, speaker_name, seed, mixed_precision="bf16", resume_training=False, log_every_steps=10, save_every_epochs=1, save_every_steps=0, gradient_accumulation=4, gradient_checkpointing=True, use_8bit_optimizer=True, weight_decay=0.01, max_grad_norm=1.0, warmup_steps=0, warmup_ratio=0.0, save_optimizer_state=False, unique_id=None):
         train_jsonl = fix_wsl_path(train_jsonl)
@@ -2433,7 +2433,7 @@ class Qwen3FineTune:
 
     RETURN_TYPES = ("AUDIO",)
     FUNCTION = "load_audio"
-    CATEGORY = "Qwen3-TTS"
+    CATEGORY = "Qwen3-TTS/Utils"
 
     def load_audio(self, audio_path):
         print(f"[Qwen3-TTS DEBUG] LoadAudioFromPath [RAW]: {audio_path}")
@@ -2508,7 +2508,7 @@ class Qwen3AudioCompare:
     RETURN_NAMES = ("report",)
     OUTPUT_NODE = True
     FUNCTION = "compare"
-    CATEGORY = "Qwen3-TTS/Evaluation"
+    CATEGORY = "Qwen3-TTS/Utils"
 
     def _load_speaker_encoder(self, model_repo, local_model_path=""):
         """Load only the speaker encoder from a Base model (not the full model)."""
@@ -2793,7 +2793,7 @@ class Qwen3TrainLoRA:
     FUNCTION = "train"
     CATEGORY = "Qwen3-TTS/Training"
 
-    def train(self, model, dataset_path, lora_name, rank, alpha, epochs, batch_size, learning_rate, save_path):
+    def train(self, model, dataset_path, lora_name, rank, alpha, epochs, batch_size, learning_rate, save_path, unique_id=None):
         # Unwrap model
         hf_model = model.model if hasattr(model, 'model') else model
 
@@ -2880,7 +2880,7 @@ class Qwen3ApplyLoRA:
     RETURN_TYPES = ("QWEN3_MODEL",)
     RETURN_NAMES = ("model_with_lora",)
     FUNCTION = "apply_lora"
-    CATEGORY = "Qwen3-TTS/Loaders"
+    CATEGORY = "Qwen3-TTS/Inference"
 
     def apply_lora(self, model, lora_path):
         if not os.path.exists(lora_path):
