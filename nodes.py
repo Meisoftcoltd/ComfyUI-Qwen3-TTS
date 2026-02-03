@@ -2942,34 +2942,54 @@ class Qwen3TrainLoRA:
         import types
 
         # ============================================================
-        # 🔍 CRITICAL FIX: DEEP UNWRAP
+        # 🔍 FIX CRÍTICO V2: BUSCADOR DE CEREBROS (DEEP SEEKER)
         # ============================================================
 
         def find_base_model(obj):
-            # Dig down until we find the real model with a 'forward' method
             current_obj = obj
-            print(f" -> Inspecting: {type(current_obj)}")
+            print(f" 🕵️ Inspecting object type: {type(current_obj)}")
 
-            # Attempt 1: Standard ComfyUI unwrapping
-            while hasattr(current_obj, "model"):
-                print("   -> Found '.model' attribute, unwrapping...")
-                current_obj = current_obj.model
+            # Lista de nombres comunes donde los wrappers esconden el modelo real
+            # 'llm' es muy común en Qwen-Audio/TTS
+            candidates = ["model", "transformer", "llm", "language_model", "backbone"]
 
-            # Attempt 2: Sometimes it's inside 'transformer' or 'llm'
-            if hasattr(current_obj, "transformer"):
-                 print("   -> Found '.transformer' attribute, unwrapping...")
-                 current_obj = current_obj.transformer
+            # Intentamos bajar hasta 5 niveles de profundidad
+            for i in range(5):
+                # 1. ¿Este objeto ya sabe entrenar? (Tiene forward implementado)
+                # Truco: Verificamos si forward NO es el por defecto de torch.nn.Module
+                if hasattr(current_obj, "forward"):
+                    # Verificamos si es el forward "falso" que da error
+                    try:
+                        # Un modelo real suele tener 'config'
+                        if hasattr(current_obj, "config"):
+                            print(f" ✅ Brain found at depth {i}: {type(current_obj)}")
+                            return current_obj
+                    except:
+                        pass
 
+                # 2. Si no es el cerebro, buscamos dentro de los candidatos
+                found_next = False
+                for name in candidates:
+                    if hasattr(current_obj, name):
+                        print(f"   ⬇️  Found attribute '.{name}', going deeper...")
+                        current_obj = getattr(current_obj, name)
+                        found_next = True
+                        break # Bajamos un nivel y reiniciamos búsqueda
+
+                if not found_next:
+                    print("   ⚠️  No inner model attributes found here.")
+                    break
+
+            # Si llegamos aquí, devolvemos lo último que encontramos y rezamos
             return current_obj
 
-        # Execute search for the real model
+        # Ejecutamos la búsqueda
         hf_model = find_base_model(model)
 
-        # FINAL VERIFICATION
-        if not hasattr(hf_model, "forward"):
-            raise AttributeError(f"CRITICAL ERROR: The extracted object {type(hf_model)} has no 'forward' method. We are trying to train the wrong object!")
-
-        print(f"✅ Target Model Found: {type(hf_model)}")
+        # DIAGNÓSTICO DE ÚLTIMO RECURSO
+        print(f" 🎯 Target locked on: {type(hf_model)}")
+        if not hasattr(hf_model, "config"):
+             print(f" ❌ CRITICAL: The target object {type(hf_model)} allows no config access. Keys: {dir(hf_model)[:20]}...")
 
         # ============================================================
         # 🛡️ THE NUCLEAR PATCH (FIXES DTYPE AND SERIALIZATION)
