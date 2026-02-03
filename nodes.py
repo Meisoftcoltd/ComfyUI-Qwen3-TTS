@@ -2875,33 +2875,36 @@ class Qwen3PrecomputedDataset(Dataset):
     def __getitem__(self, idx):
         item = self.data[idx]
 
-        # --- CLEANING FUNCTION ---
-        # Detects if the list is "dirty" (list inside list) and flattens it
+        # --- THE UNIVERSAL FLATTENER (FIX) ---
         def clean_tensor_data(data):
-            # If empty list, return as is
             if not data:
                 return []
 
-            # Case 1: Ragged Structure [[1,2], 3, 4] -> Flatten to [1,2,3,4]
-            # This happens if we add nested_list + flat_list
-            if isinstance(data[0], list):
-                flat = []
-                for element in data:
-                    if isinstance(element, list):
-                        flat.extend(element)
-                    else:
-                        flat.append(element)
-                return flat
+            flat = []
+            for element in data:
+                # If we find a "box" list, unpack its content
+                if isinstance(element, list):
+                    flat.extend(element)
+                # If it's a loose number, keep it
+                else:
+                    flat.append(element)
+            return flat
 
-            # Case 2: All good [1, 2, 3, 4]
-            return data
+        # 1. Flatten "dirty" data
+        # This converts [1, 2, [3,4]] into [1, 2, 3, 4]
+        input_ids = clean_tensor_data(item.get("input_ids", []))
+        labels = clean_tensor_data(item.get("labels", []))
+        attention_mask = clean_tensor_data(item.get("attention_mask", []))
 
-        # 1. Clean data before converting to Tensor
-        input_ids = clean_tensor_data(item["input_ids"])
-        labels = clean_tensor_data(item["labels"])
-        attention_mask = clean_tensor_data(item["attention_mask"])
+        # 2. SAFETY VALIDATION (Length Cut)
+        # Flattening sometimes creates too long sequences. Cut for safety.
+        max_len = 2048 # Or your model limit if larger
+        if len(input_ids) > max_len:
+            input_ids = input_ids[:max_len]
+            labels = labels[:max_len]
+            attention_mask = attention_mask[:max_len]
 
-        # 2. Convert to Tensor (Safe now)
+        # 3. Convert to Tensor
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
