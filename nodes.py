@@ -414,8 +414,8 @@ class Qwen3Loader:
             }
         }
 
-    RETURN_TYPES = ("QWEN3_MODEL",)
-    RETURN_NAMES = ("model",)
+    RETURN_TYPES = ("QWEN3_MODEL", "STRING")
+    RETURN_NAMES = ("model", "model_name")
     FUNCTION = "load_model"
     CATEGORY = "Qwen3-TTS/Loader"
 
@@ -429,6 +429,9 @@ class Qwen3Loader:
         elif model_name.startswith("Local: "):
             model_name = model_name[7:]
             is_local_selection = True
+
+        # Clean model name for output (remove path chars if any, though repo_id usually fine)
+        clean_model_name = model_name.replace("/", "_").replace("\\", "_")
 
         device = mm.get_torch_device()
 
@@ -579,7 +582,7 @@ class Qwen3Loader:
         except Exception as e:
             print(f"DEBUG: Error during deep speaker injection: {e}", flush=True)
         
-        return (model,)
+        return (model, clean_model_name)
 
 
 class Qwen3LoadFineTuned:
@@ -2866,6 +2869,9 @@ class Qwen3TrainLoRA:
                 "batch_size": ("INT", {"default": 1, "min": 1, "max": 16}),
                 "learning_rate": ("FLOAT", {"default": 2e-4, "min": 1e-6, "max": 1e-3, "step": 1e-5}),
                 "save_path": ("STRING", {"default": "loras/"}),
+            },
+            "optional": {
+                "model_name_prefix": ("STRING", {"default": "", "multiline": False, "forceInput": True}),
             }
         }
 
@@ -2874,7 +2880,7 @@ class Qwen3TrainLoRA:
     FUNCTION = "train"
     CATEGORY = "Qwen3-TTS/Training"
 
-    def train(self, model, dataset_path, lora_name, rank, alpha, epochs, batch_size, learning_rate, save_path, unique_id=None):
+    def train(self, model, dataset_path, lora_name, rank, alpha, epochs, batch_size, learning_rate, save_path, model_name_prefix="", unique_id=None):
         # Unwrap model
         hf_model = model.model if hasattr(model, 'model') else model
 
@@ -2909,7 +2915,13 @@ class Qwen3TrainLoRA:
             return ("Error: Dataset Empty",)
 
         # Configure Trainer
-        full_output_dir = os.path.join(save_path, lora_name)
+        # Construct folder name: {model_name}-{lora_name} if prefix exists
+        final_lora_name = lora_name
+        if model_name_prefix and model_name_prefix.strip():
+             final_lora_name = f"{model_name_prefix.strip()}-{lora_name}"
+
+        full_output_dir = os.path.join(save_path, final_lora_name)
+        print(f"[Qwen3-TTS] LoRA Training Output Directory: {full_output_dir}")
 
         args = TrainingArguments(
             output_dir=full_output_dir,
