@@ -1555,24 +1555,6 @@ class Qwen3AutoLabelEmotions:
 
         print(f"[Qwen3-TTS] Auto-Labeling Emotions for {len(dataset_items)} items...")
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Loading Qwen2-Audio on {device}...")
-
-        try:
-            processor = AutoProcessor.from_pretrained(model, trust_remote_code=True)
-            model_obj = Qwen2AudioForConditionalGeneration.from_pretrained(model, device_map="auto", trust_remote_code=True)
-        except Exception as e:
-            raise RuntimeError(f"Failed to load Qwen2-Audio model: {e}")
-
-        # Aggressive prompt to avoid "Neutral" bias
-        system_prompt = (
-            "You are a dataset tagger. Listen to the audio and output ONLY a short, comma-separated description of the voice style. "
-            "Format: [Gender], [Emotion], [Tone], [Speed], [Pitch]. "
-            "Use simple keywords like: Angry, Sad, Happy, Shouting, Whispering, Fast, Slow. "
-            "Example Output: Male voice, angry, shouting, high pitch, fast speed. "
-            "Do NOT explain your reasoning. Do NOT use full sentences."
-        )
-
         # Keyword mapping for absolute priority (skips inference)
         keyword_map = {
             "angry": "Male voice, very angry, shouting, aggressive tone, high pitch.",
@@ -1589,36 +1571,42 @@ class Qwen3AutoLabelEmotions:
             "sorpresa": "Male voice, surprised, shocked, high pitch.",
         }
 
+        items_to_infer = []
         total = len(dataset_items)
-        for idx, item in enumerate(tqdm(dataset_items, desc="Labeling Emotions", unit="item")):
-            # Skip if already labeled (in case of re-run or partial input)
+
+        # --- PHASE 1: Pre-Scan (Cache & Keywords) ---
+        print("[Qwen3-TTS] Scanning for cached labels and keywords...")
+        for idx, item in enumerate(dataset_items):
+            # Skip if already labeled in input
             if "instruction" in item and item["instruction"]:
                 continue
 
             file_path = item["audio_path"]
             filename = os.path.basename(file_path)
+
             # Check for existing label file (.emotion.txt)
             label_path = os.path.splitext(file_path)[0] + ".emotion.txt"
 
+            # 1. Try Cache
             if os.path.exists(label_path):
                 try:
                     with open(label_path, 'r', encoding='utf-8') as f:
                         cached_label = f.read().strip()
                     if cached_label:
                         item["instruction"] = cached_label
-                        print(f"[{idx+1}/{total}] Skipping {filename} (Loaded cache): {cached_label}")
+                        # print(f"[{idx+1}/{total}] Loaded cache: {filename}")
                         continue
-                except Exception as e:
-                    print(f"Error reading cache for {filename}: {e}")
+                except Exception:
+                    pass
 
             path_lower = file_path.lower()
 
-            # --- PHASE 1: Keyword Detection (Deterministic) ---
+            # 2. Try Keywords
             detected_instruction = None
             for kw, instruction in keyword_map.items():
                 if kw in path_lower:
                     detected_instruction = instruction
-                    print(f"[{idx+1}/{total}] Labeling: {filename} -> [Keyword '{kw}'] {detected_instruction}")
+                    print(f"[{idx+1}/{total}] Keyword match: {filename} -> {detected_instruction}")
                     break
 
             if detected_instruction:
@@ -1631,8 +1619,48 @@ class Qwen3AutoLabelEmotions:
                     pass
                 continue
 
-            # --- PHASE 2: AI Inference (If no keyword found) ---
-            print(f"[{idx+1}/{total}] Labeling: {filename} (Inference)")
+            # 3. Needs Inference
+            items_to_infer.append(item)
+
+        # --- PHASE 2: Inference (Conditional Loading) ---
+        if not items_to_infer:
+            print("[Qwen3-TTS] All items labeled via cache or keywords. Skipping model load.")
+            return (dataset_items,)
+
+        print(f"[Qwen3-TTS] {len(items_to_infer)} items require inference. Loading model...")
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Loading Qwen2-Audio on {device}...")
+
+        try:
+            # Try offline first to avoid timeout errors if model is cached
+            try:
+                print("Attempting to load Qwen2-Audio offline...")
+                processor = AutoProcessor.from_pretrained(model, trust_remote_code=True, local_files_only=True)
+                model_obj = Qwen2AudioForConditionalGeneration.from_pretrained(model, device_map="auto", trust_remote_code=True, local_files_only=True)
+            except Exception:
+                print("Offline load failed, retrying online...")
+                # Fallback to online if not found locally
+                processor = AutoProcessor.from_pretrained(model, trust_remote_code=True)
+                model_obj = Qwen2AudioForConditionalGeneration.from_pretrained(model, device_map="auto", trust_remote_code=True)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load Qwen2-Audio model: {e}")
+
+        # Aggressive prompt to avoid "Neutral" bias
+        system_prompt = (
+            "You are a dataset tagger. Listen to the audio and output ONLY a short, comma-separated description of the voice style. "
+            "Format: [Gender], [Emotion], [Tone], [Speed], [Pitch]. "
+            "Use simple keywords like: Angry, Sad, Happy, Shouting, Whispering, Fast, Slow. "
+            "Example Output: Male voice, angry, shouting, high pitch, fast speed. "
+            "Do NOT explain your reasoning. Do NOT use full sentences."
+        )
+
+        for idx, item in enumerate(tqdm(items_to_infer, desc="Labeling Emotions", unit="item")):
+            file_path = item["audio_path"]
+            filename = os.path.basename(file_path)
+            label_path = os.path.splitext(file_path)[0] + ".emotion.txt"
+
+            print(f"Labeling: {filename}")
             try:
                 # Load audio
                 audio, sr = librosa.load(file_path, sr=processor.feature_extractor.sampling_rate)
@@ -2942,45 +2970,46 @@ class Qwen3TrainLoRA:
         import types
 
         # ============================================================
-        # 🔍 FIX CRÍTICO V2: BUSCADOR DE CEREBROS (DEEP SEEKER)
+        # 🔍 FIX V3: AGRESSIVE DEEP SEEKER
         # ============================================================
 
         def find_base_model(obj):
             current_obj = obj
             print(f" 🕵️ Inspecting object type: {type(current_obj)}")
 
-            # Lista de nombres comunes donde los wrappers esconden el modelo real
-            # 'llm' es muy común en Qwen-Audio/TTS
-            candidates = ["model", "transformer", "llm", "language_model", "backbone"]
+            # Blacklist of wrapper classes that are NOT the base LLM even if they have 'config'
+            # These are inference wrappers unsuitable for training
+            blacklist = ["Qwen3TTSModel", "Qwen3TTSForConditionalGeneration", "PeftModel", "LoraModel"]
 
-            # Intentamos bajar hasta 5 niveles de profundidad
-            for i in range(5):
-                # 1. ¿Este objeto ya sabe entrenar? (Tiene forward implementado)
-                # Truco: Verificamos si forward NO es el por defecto de torch.nn.Module
-                if hasattr(current_obj, "forward"):
-                    # Verificamos si es el forward "falso" que da error
-                    try:
-                        # Un modelo real suele tener 'config'
-                        if hasattr(current_obj, "config"):
-                            print(f" ✅ Brain found at depth {i}: {type(current_obj)}")
-                            return current_obj
-                    except:
-                        pass
+            candidates = ["llm", "model", "transformer", "language_model", "backbone"]
 
-                # 2. Si no es el cerebro, buscamos dentro de los candidatos
+            for i in range(10): # Go deeper up to 10 levels
+                obj_type_str = str(type(current_obj))
+
+                # 1. Check blacklist
+                is_blacklisted = any(b in obj_type_str for b in blacklist)
+
+                # 2. If NOT blacklisted and looks like a valid HF model, verify
+                if not is_blacklisted and hasattr(current_obj, "forward") and hasattr(current_obj, "config"):
+                    print(f" ✅ Potential Brain found at depth {i}: {type(current_obj)}")
+                    return current_obj
+
+                # 3. Dig deeper
                 found_next = False
+                print(f"   ⬇️  Wrapper detected ({obj_type_str}), digging deeper...")
+
                 for name in candidates:
                     if hasattr(current_obj, name):
-                        print(f"   ⬇️  Found attribute '.{name}', going deeper...")
+                        print(f"      -> Found attribute '.{name}'")
                         current_obj = getattr(current_obj, name)
                         found_next = True
-                        break # Bajamos un nivel y reiniciamos búsqueda
+                        break
 
                 if not found_next:
-                    print("   ⚠️  No inner model attributes found here.")
+                    # If stuck, list attributes for debugging
+                    print(f"   ⚠️  Stuck! Available attributes: {dir(current_obj)[:10]}")
                     break
 
-            # Si llegamos aquí, devolvemos lo último que encontramos y rezamos
             return current_obj
 
         # Ejecutamos la búsqueda
