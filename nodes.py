@@ -1566,11 +1566,11 @@ class Qwen3AutoLabelEmotions:
 
         # Aggressive prompt to avoid "Neutral" bias
         system_prompt = (
-            "Analyze the emotional intensity of the speaker. "
-            "Focus on pitch, volume changes, and breathing. "
-            "Detect if the voice is Angry, Sad, Happy, Scared, or Surprised. "
-            "Only use 'Neutral' if the voice is completely flat. "
-            "Describe the gender and the specific emotion found."
+            "You are a dataset tagger. Listen to the audio and output ONLY a short, comma-separated description of the voice style. "
+            "Format: [Gender], [Emotion], [Tone], [Speed], [Pitch]. "
+            "Use simple keywords like: Angry, Sad, Happy, Shouting, Whispering, Fast, Slow. "
+            "Example Output: Male voice, angry, shouting, high pitch, fast speed. "
+            "Do NOT explain your reasoning. Do NOT use full sentences."
         )
 
         # Keyword mapping for absolute priority (skips inference)
@@ -1638,9 +1638,9 @@ class Qwen3AutoLabelEmotions:
                 with torch.no_grad():
                     generated_ids = model_obj.generate(
                         **inputs,
-                        max_new_tokens=60,
+                        max_new_tokens=40,
                         do_sample=True,      # Enable sampling for variety
-                        temperature=0.6,     # Higher temp to avoid "neutral" bias
+                        temperature=0.5,     # Lower temp for more deterministic tags
                         top_p=0.9
                     )
 
