@@ -2970,45 +2970,72 @@ class Qwen3TrainLoRA:
         import types
 
         # ============================================================
-        # 🔍 FIX V3: AGRESSIVE DEEP SEEKER
+        # 🔍 FIX V4: THE DRILL (Wrapper Piercer)
         # ============================================================
 
         def find_base_model(obj):
             current_obj = obj
             print(f" 🕵️ Inspecting object type: {type(current_obj)}")
 
-            # Blacklist of wrapper classes that are NOT the base LLM even if they have 'config'
-            # These are inference wrappers unsuitable for training
-            blacklist = ["Qwen3TTSModel", "Qwen3TTSForConditionalGeneration", "PeftModel", "LoraModel"]
+            # --- EXPANDED BLACKLIST ---
+            # Classes known to NOT implement training 'forward' (loss calculation)
+            blacklist_names = [
+                "Qwen3TTSModel",
+                "Qwen3TTSForConditionalGeneration", # <--- THE CULPRIT
+                "PeftModel",
+                "LoraModel",
+                "DistributedDataParallel"
+            ]
 
-            candidates = ["llm", "model", "transformer", "language_model", "backbone"]
+            # Attributes where the real model is usually hidden
+            candidates = ["model", "llm", "transformer", "language_model", "backbone", "base_model"]
 
-            for i in range(10): # Go deeper up to 10 levels
+            for i in range(10): # Max depth 10
                 obj_type_str = str(type(current_obj))
 
-                # 1. Check blacklist
-                is_blacklisted = any(b in obj_type_str for b in blacklist)
+                # 1. Blacklist Check
+                is_blacklisted = any(b in obj_type_str for b in blacklist_names)
 
-                # 2. If NOT blacklisted and looks like a valid HF model, verify
-                if not is_blacklisted and hasattr(current_obj, "forward") and hasattr(current_obj, "config"):
-                    print(f" ✅ Potential Brain found at depth {i}: {type(current_obj)}")
-                    return current_obj
+                if is_blacklisted:
+                    print(f"   🚫 Blacklisted wrapper detected: {obj_type_str}")
+
+                # 2. If NOT blacklisted and looks valid, return it
+                # The real model is usually 'Qwen2AudioForConditionalGeneration' or 'Qwen2ForCausalLM'
+                elif hasattr(current_obj, "forward") and hasattr(current_obj, "config"):
+                    # Double check: try to inspect forward signature
+                    import inspect
+                    try:
+                        sig = inspect.signature(current_obj.forward)
+                        if "input_ids" in sig.parameters:
+                            print(f" ✅ TRUE BRAIN FOUND at depth {i}: {type(current_obj)}")
+                            return current_obj
+                        else:
+                            print(f"   ⚠️ Object has forward() but no 'input_ids' arg. Digging deeper...")
+                    except:
+                        # If we can't inspect, assume it's good if it passed blacklist
+                        print(f" ✅ TRUE BRAIN FOUND (Signature check skipped) at depth {i}: {type(current_obj)}")
+                        return current_obj
 
                 # 3. Dig deeper
                 found_next = False
-                print(f"   ⬇️  Wrapper detected ({obj_type_str}), digging deeper...")
-
+                # Try candidates
                 for name in candidates:
                     if hasattr(current_obj, name):
-                        print(f"      -> Found attribute '.{name}'")
+                        print(f"      ⬇️  Found attribute '.{name}', unpacking...")
                         current_obj = getattr(current_obj, name)
                         found_next = True
                         break
 
+                # If no candidates, try brute force on _modules
                 if not found_next:
-                    # If stuck, list attributes for debugging
-                    print(f"   ⚠️  Stuck! Available attributes: {dir(current_obj)[:10]}")
-                    break
+                    if hasattr(current_obj, "_modules") and len(current_obj._modules) > 0:
+                        first_key = list(current_obj._modules.keys())[0]
+                        print(f"      ⬇️  Trying first module child '.{first_key}'...")
+                        current_obj = current_obj._modules[first_key]
+                        found_next = True
+                    else:
+                        print(f"   ❌ Stuck! No inner models found. Keys: {dir(current_obj)[:10]}")
+                        break
 
             return current_obj
 
