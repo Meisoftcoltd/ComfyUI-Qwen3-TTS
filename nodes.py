@@ -2424,34 +2424,6 @@ class Qwen3FineTune:
                 print(f"Fine-tuning complete. Model saved to {final_output_path}")
                 send_status("Training complete!")
                 return (final_output_path, speaker_name)
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "audio_path": ("STRING", {"default": "", "multiline": False}),
-            }
-        }
-
-    RETURN_TYPES = ("AUDIO",)
-    FUNCTION = "load_audio"
-    CATEGORY = "Qwen3-TTS/Utils"
-
-    def load_audio(self, audio_path):
-        print(f"[Qwen3-TTS DEBUG] LoadAudioFromPath [RAW]: {audio_path}")
-        audio_path = fix_wsl_path(audio_path)
-        print(f"[Qwen3-TTS DEBUG] LoadAudioFromPath [FIXED]: {audio_path}")
-
-        if not audio_path or not os.path.exists(audio_path):
-            raise ValueError(f"Audio file not found: {audio_path}")
-
-        # Use soundfile to load
-        wav, sr = sf.read(audio_path)
-
-        # Convert to float32 if needed
-        if wav.dtype != np.float32:
-            wav = wav.astype(np.float32)
-
-        return (convert_audio(wav, sr),)
 
 
 class Qwen3SaveAudio:
@@ -2530,7 +2502,7 @@ class Qwen3LoadAudioFromPath:
 
     RETURN_TYPES = ("AUDIO",)
     FUNCTION = "load_audio"
-    CATEGORY = "Qwen3-TTS"
+    CATEGORY = "Qwen3-TTS/Utils"
 
     def load_audio(self, audio_path):
         print(f"[Qwen3-TTS DEBUG] LoadAudioFromPath [RAW]: {audio_path}")
