@@ -10,3 +10,6 @@ tensorboard
 safetensors
 openai-whisper
 pydub
+peft>=0.7.0
+bitsandbytes>=0.41.0
+accelerate>=0.27.0

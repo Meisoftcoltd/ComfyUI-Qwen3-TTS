@@ -57,10 +57,15 @@ try:
     HAS_BNB = True
 except ImportError:
     HAS_BNB = False
-from torch.utils.data import DataLoader
-from transformers import AutoConfig, get_linear_schedule_with_warmup, AutoProcessor, Qwen2AudioForConditionalGeneration
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoConfig, get_linear_schedule_with_warmup, AutoProcessor, Qwen2AudioForConditionalGeneration, AutoTokenizer, TrainingArguments, Trainer, DataCollatorForSeq2Seq
 from transformers.utils import cached_file
 from safetensors.torch import save_file, load_file
+try:
+    from peft import LoraConfig, get_peft_model, TaskType, PeftModel
+    HAS_PEFT = True
+except ImportError:
+    HAS_PEFT = False
 
 # Register Qwen3-TTS models folder with ComfyUI
 # We support both 'models/tts' (new default) and 'models/Qwen3-TTS' (legacy)
@@ -1677,10 +1682,16 @@ class Qwen3ExportJSONL:
 class Qwen3DataPrep:
     @classmethod
     def INPUT_TYPES(s):
+        # We need the TEXT tokenizer repo too, which is part of the main model usually
+        # But Qwen3-TTS usually uses Qwen2.5-7B or similar as text base.
+        # The Qwen3TTSTokenizer is mainly for audio codes? No, it wraps both usually.
+        # Let's check imports. Qwen3TTSTokenizer in qwen-tts library handles audio.
+        # We need the standard HF AutoTokenizer for text.
         return {
             "required": {
                 "jsonl_path": ("STRING", {"default": "", "multiline": False}),
-                "tokenizer_repo": (list(QWEN3_TTS_TOKENIZERS.keys()), {"default": "Qwen/Qwen3-TTS-Tokenizer-12Hz"}),
+                "audio_tokenizer_repo": (list(QWEN3_TTS_TOKENIZERS.keys()), {"default": "Qwen/Qwen3-TTS-Tokenizer-12Hz"}),
+                "text_tokenizer_repo": ("STRING", {"default": "Qwen/Qwen2.5-7B-Instruct", "tooltip": "Repo for the text tokenizer (e.g. Qwen2.5-7B-Instruct)"}),
                 "source": (["HuggingFace", "ModelScope"], {"default": "HuggingFace"}),
                 "batch_size": ("INT", {"default": 16, "min": 1, "max": 32, "tooltip": "Number of audio files to process at once. Lower values use less VRAM."}),
             },
@@ -1695,9 +1706,9 @@ class Qwen3DataPrep:
     FUNCTION = "process"
     CATEGORY = "Qwen3-TTS/FineTuning"
 
-    def process(self, jsonl_path, tokenizer_repo, source, batch_size, unique_id=None):
+    def process(self, jsonl_path, audio_tokenizer_repo, text_tokenizer_repo, source, batch_size, unique_id=None):
         jsonl_path = fix_wsl_path(jsonl_path)
-        print(f"[Qwen3-TTS DEBUG] DataPrep process started. Input: {jsonl_path}, Tokenizer: {tokenizer_repo}")
+        print(f"[Qwen3-TTS DEBUG] DataPrep process started. Input: {jsonl_path}")
 
         # Helper to send progress text to UI
         def send_status(text):
@@ -1710,7 +1721,6 @@ class Qwen3DataPrep:
         output_path = jsonl_path.replace(".jsonl", "_codes.jsonl")
         meta_path = jsonl_path.replace(".jsonl", "_codes.meta.json")
 
-        send_status("Checking cache...")
         input_hash = compute_file_hash(jsonl_path)
         input_line_count = count_jsonl_lines(jsonl_path)
 
@@ -1719,33 +1729,42 @@ class Qwen3DataPrep:
             metadata = load_cache_metadata(meta_path)
             if metadata:
                 if (metadata.get('input_hash') == input_hash and
-                    metadata.get('tokenizer_repo') == tokenizer_repo and
+                    metadata.get('audio_tokenizer') == audio_tokenizer_repo and
                     metadata.get('output_line_count') == input_line_count):
                     # Verify output file integrity
                     if count_jsonl_lines(output_path) == metadata.get('output_line_count'):
                         print(f"[Qwen3DataPrep] Cache hit - using existing processed data")
                         send_status("Using cached data (no reprocessing needed)")
                         return (output_path,)
-                print(f"[Qwen3DataPrep] Cache invalid, reprocessing...")
-            else:
-                print(f"[Qwen3DataPrep] No valid cache metadata, reprocessing...")
-        else:
-            print(f"[Qwen3DataPrep] No cached output found, will process")
 
-        # Resolve tokenizer path - check ComfyUI folder first, download if needed
-        local_path = get_local_model_path(tokenizer_repo)
+        # 1. Load Audio Tokenizer (Qwen3 specific)
+        local_path = get_local_model_path(audio_tokenizer_repo)
         if os.path.exists(local_path) and os.listdir(local_path):
-            tokenizer_path = local_path
-            print(f"Loading Tokenizer from ComfyUI folder: {tokenizer_path}")
+            audio_tok_path = local_path
         else:
-            print(f"Tokenizer not found locally. Downloading {tokenizer_repo}...")
-            tokenizer_path = download_model_to_comfyui(tokenizer_repo, source)
+            print(f"Audio Tokenizer not found locally. Downloading {audio_tokenizer_repo}...")
+            audio_tok_path = download_model_to_comfyui(audio_tokenizer_repo, source)
 
-        send_status("Loading tokenizer...")
-        tokenizer = Qwen3TTSTokenizer.from_pretrained(
-            tokenizer_path,
+        send_status("Loading audio tokenizer...")
+        audio_tokenizer = Qwen3TTSTokenizer.from_pretrained(
+            audio_tok_path,
             device_map=device,
         )
+
+        # 2. Load Text Tokenizer (Standard HF)
+        # Note: We don't have a dedicated folder mapping for arbitrary text tokenizers,
+        # so we rely on HF cache or download to standard cache for now, or use download_model_to_comfyui generic logic
+        # Ideally, we check if it's already in the models folder.
+        text_tok_local = get_local_model_path(text_tokenizer_repo)
+        if os.path.exists(text_tok_local) and os.listdir(text_tok_local):
+             text_tok_path = text_tok_local
+        else:
+             print(f"Text Tokenizer not found locally. Downloading {text_tokenizer_repo}...")
+             # This uses the same logic (snapshot download), which is fine for tokenizers
+             text_tok_path = download_model_to_comfyui(text_tokenizer_repo, source)
+
+        send_status("Loading text tokenizer...")
+        text_tokenizer = AutoTokenizer.from_pretrained(text_tok_path, trust_remote_code=True)
 
         inputs = []
         with open(jsonl_path, 'r', encoding='utf-8') as f:
@@ -1754,9 +1773,8 @@ class Qwen3DataPrep:
 
         total_items = len(inputs)
         total_batches = (total_items + batch_size - 1) // batch_size
-        print(f"Processing {total_items} items in {total_batches} batches (batch_size={batch_size})...")
+        print(f"Processing {total_items} items in {total_batches} batches...")
 
-        # Write results incrementally to avoid memory accumulation
         with open(output_path, 'w', encoding='utf-8') as out_file:
             for batch_idx, i in enumerate(range(0, total_items, batch_size)):
                 batch = inputs[i:i+batch_size]
@@ -1766,17 +1784,46 @@ class Qwen3DataPrep:
                 print(status_msg)
                 send_status(status_msg)
 
-                # Encode audio files
-                enc_res = tokenizer.encode(audio_paths)
-                codes = enc_res.audio_codes
+                # A. Encode Audio
+                enc_res = audio_tokenizer.encode(audio_paths)
+                audio_codes_batch = enc_res.audio_codes # List of tensors
 
-                # Write batch results immediately to disk
-                for j, code in enumerate(codes):
+                # B. Process Text and Labels for each item
+                for j, code in enumerate(audio_codes_batch):
                     item = batch[j]
-                    item['audio_codes'] = code.cpu().tolist()
+                    audio_tokens = code.cpu().tolist() # List of ints
+
+                    # Prepare Prompt
+                    instruction = item.get("instruction", "Speak clearly.")
+                    text_content = item.get("text", "")
+
+                    # ChatML format roughly (adapt as needed for Qwen instruct)
+                    # For Qwen2.5 Audio/TTS, the prompt format usually involves <|audio_start|> tokens etc.
+                    # but for basic causal LM training we treat it as text continuation.
+                    # Simplified Prompt:
+                    prompt_text = f"Instruction: {instruction}\nText: {text_content}\nGenerate Audio:"
+
+                    # Tokenize Text
+                    text_ids = text_tokenizer.encode(prompt_text, add_special_tokens=True)
+
+                    # Combine: Text + Audio
+                    input_ids = text_ids + audio_tokens
+
+                    # Create Labels: -100 for text, audio_tokens for audio
+                    labels = ([-100] * len(text_ids)) + audio_tokens
+
+                    # Attention Mask
+                    attention_mask = [1] * len(input_ids)
+
+                    # Update item with training tensors
+                    item['input_ids'] = input_ids
+                    item['labels'] = labels
+                    item['attention_mask'] = attention_mask
+                    # Optional: keep audio_codes for reference
+                    item['audio_codes'] = audio_tokens
+
                     out_file.write(json.dumps(item, ensure_ascii=False) + "\n")
 
-                # Clear VRAM between batches to prevent accumulation
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
@@ -1784,8 +1831,7 @@ class Qwen3DataPrep:
         metadata = {
             "version": 1,
             "input_hash": input_hash,
-            "tokenizer_repo": tokenizer_repo,
-            "input_line_count": input_line_count,
+            "audio_tokenizer": audio_tokenizer_repo,
             "output_line_count": len(inputs),
             "created_at": datetime.now(timezone.utc).isoformat()
         }
@@ -2377,9 +2423,6 @@ class Qwen3FineTune:
                 print(f"Fine-tuning complete. Model saved to {final_output_path}")
                 send_status("Training complete!")
                 return (final_output_path, speaker_name)
-
-
-class Qwen3LoadAudioFromPath:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -2655,3 +2698,185 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Qwen3AudioCompare": "📊 Qwen3-TTS Audio Compare",
     "Qwen3AudioToDataset": "🔄 Qwen3-TTS Audio To Dataset (Whisper)",
 }
+# ==============================================================================
+#  APPENDED QWEN3 LORA TRAINING MODULES
+# ==============================================================================
+import torch
+import json
+import os
+from torch.utils.data import Dataset
+from transformers import TrainingArguments, Trainer, DataCollatorForSeq2Seq
+try:
+    from peft import LoraConfig, get_peft_model, TaskType, PeftModel
+    HAS_PEFT = True
+except ImportError:
+    HAS_PEFT = False
+
+# --- 1. Dataset Helper Class ---
+class Qwen3PrecomputedDataset(Dataset):
+    def __init__(self, jsonl_path):
+        self.data = []
+        if not os.path.exists(jsonl_path):
+            print(f"ERROR: Dataset not found at {jsonl_path}")
+        else:
+            with open(jsonl_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if line.strip():
+                        try:
+                            self.data.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        # Option A: Expects pre-computed tensors from Qwen3DataPrep
+        return {
+            "input_ids": torch.tensor(item["input_ids"], dtype=torch.long),
+            "labels": torch.tensor(item["labels"], dtype=torch.long),
+            "attention_mask": torch.tensor(item["attention_mask"], dtype=torch.long)
+        }
+
+# --- 2. Train LoRA Node ---
+class Qwen3TrainLoRA:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("QWEN3_MODEL",),
+                "dataset_path": ("STRING", {"default": "output/dataset_codes.jsonl"}),
+                "lora_name": ("STRING", {"default": "my_voice_lora"}),
+                "rank": ("INT", {"default": 32, "min": 8, "max": 128}),
+                "alpha": ("INT", {"default": 64, "min": 8, "max": 256}),
+                "epochs": ("INT", {"default": 3, "min": 1, "max": 100}),
+                "batch_size": ("INT", {"default": 1, "min": 1, "max": 16}),
+                "learning_rate": ("FLOAT", {"default": 2e-4, "min": 1e-6, "max": 1e-3, "step": 1e-5}),
+                "save_path": ("STRING", {"default": "loras/"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("lora_path",)
+    FUNCTION = "train"
+    CATEGORY = "Qwen3-TTS/Training"
+
+    def train(self, model, dataset_path, lora_name, rank, alpha, epochs, batch_size, learning_rate, save_path):
+        # Unwrap model
+        hf_model = model.model if hasattr(model, 'model') else model
+
+        # Enable Gradients
+        hf_model.train()
+        # Enable gradient checkpointing if available
+        if hasattr(hf_model, "gradient_checkpointing_enable"):
+            hf_model.gradient_checkpointing_enable()
+
+        # Configure LoRA
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=rank,
+            lora_alpha=alpha,
+            lora_dropout=0.05,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        )
+
+        # Prepare Model
+        try:
+            lora_model = get_peft_model(hf_model, peft_config)
+            lora_model.print_trainable_parameters()
+        except Exception as e:
+            # Handle case if model is already adapted
+            print(f"Warning attaching LoRA: {e}")
+            lora_model = hf_model
+
+        # Load Dataset
+        train_dataset = Qwen3PrecomputedDataset(dataset_path)
+        if len(train_dataset) == 0:
+            return ("Error: Dataset Empty",)
+
+        # Configure Trainer
+        full_output_dir = os.path.join(save_path, lora_name)
+
+        args = TrainingArguments(
+            output_dir=full_output_dir,
+            per_device_train_batch_size=batch_size,
+            gradient_accumulation_steps=4,
+            learning_rate=learning_rate,
+            num_train_epochs=epochs,
+            fp16=True,
+            logging_steps=5,
+            save_strategy="no", # Save only at end to save space
+            optim="adamw_torch",
+            remove_unused_columns=False
+        )
+
+        # Dynamic Padding Collator
+        collate_fn = DataCollatorForSeq2Seq(tokenizer=None, pad_to_multiple_of=8)
+
+        trainer = Trainer(
+            model=lora_model,
+            args=args,
+            train_dataset=train_dataset,
+            data_collator=collate_fn,
+        )
+
+        print(f"--- Starting LoRA Training for {epochs} epochs ---")
+        trainer.train()
+
+        # Save Final Adapter
+        final_save_path = os.path.join(full_output_dir, "final")
+        lora_model.save_pretrained(final_save_path)
+
+        # Cleanup
+        del trainer
+        torch.cuda.empty_cache()
+
+        return (final_save_path,)
+
+# --- 3. Apply LoRA Node ---
+class Qwen3ApplyLoRA:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("QWEN3_MODEL",),
+                "lora_path": ("STRING", {"default": "loras/my_voice_lora/final"}),
+            }
+        }
+
+    RETURN_TYPES = ("QWEN3_MODEL",)
+    RETURN_NAMES = ("model_with_lora",)
+    FUNCTION = "apply_lora"
+    CATEGORY = "Qwen3-TTS/Loaders"
+
+    def apply_lora(self, model, lora_path):
+        if not os.path.exists(lora_path):
+            print(f"WARNING: LoRA path invalid: {lora_path}")
+            return (model,)
+
+        print(f"Loading LoRA Adapter from: {lora_path}")
+        hf_model = model.model if hasattr(model, 'model') else model
+
+        # Load adapter (creates peft model wrapper)
+        model_with_lora = PeftModel.from_pretrained(hf_model, lora_path, is_trainable=False)
+
+        # Re-wrap for ComfyUI
+        if hasattr(model, 'model'):
+            model.model = model_with_lora
+            return (model,)
+        else:
+            return (model_with_lora,)
+
+# --- 4. REGISTER NEW NODES MANUALLY ---
+# This updates the mappings dictionary defined previously in the file
+try:
+    NODE_CLASS_MAPPINGS["Qwen3TrainLoRA"] = Qwen3TrainLoRA
+    NODE_CLASS_MAPPINGS["Qwen3ApplyLoRA"] = Qwen3ApplyLoRA
+
+    NODE_DISPLAY_NAME_MAPPINGS["Qwen3TrainLoRA"] = "🏋️ Qwen3-TTS Train LoRA"
+    NODE_DISPLAY_NAME_MAPPINGS["Qwen3ApplyLoRA"] = "🔗 Qwen3-TTS Apply LoRA"
+    print("Qwen3 LoRA Nodes Registered Successfully via Append.")
+except Exception as e:
+    print(f"Error registering LoRA nodes: {e}")
