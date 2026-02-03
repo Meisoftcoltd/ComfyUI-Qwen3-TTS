@@ -2874,11 +2874,38 @@ class Qwen3PrecomputedDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.data[idx]
-        # Option A: Expects pre-computed tensors from Qwen3DataPrep
+
+        # --- CLEANING FUNCTION ---
+        # Detects if the list is "dirty" (list inside list) and flattens it
+        def clean_tensor_data(data):
+            # If empty list, return as is
+            if not data:
+                return []
+
+            # Case 1: Ragged Structure [[1,2], 3, 4] -> Flatten to [1,2,3,4]
+            # This happens if we add nested_list + flat_list
+            if isinstance(data[0], list):
+                flat = []
+                for element in data:
+                    if isinstance(element, list):
+                        flat.extend(element)
+                    else:
+                        flat.append(element)
+                return flat
+
+            # Case 2: All good [1, 2, 3, 4]
+            return data
+
+        # 1. Clean data before converting to Tensor
+        input_ids = clean_tensor_data(item["input_ids"])
+        labels = clean_tensor_data(item["labels"])
+        attention_mask = clean_tensor_data(item["attention_mask"])
+
+        # 2. Convert to Tensor (Safe now)
         return {
-            "input_ids": torch.tensor(item["input_ids"], dtype=torch.long),
-            "labels": torch.tensor(item["labels"], dtype=torch.long),
-            "attention_mask": torch.tensor(item["attention_mask"], dtype=torch.long)
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long)
         }
 
 # --- 2. Train LoRA Node ---
