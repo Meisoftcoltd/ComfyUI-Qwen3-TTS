@@ -13,7 +13,8 @@ app.registerExtension({
             "Qwen3FineTune": [{ widget: "output_dir", type: "folder" }],
             "Qwen3TrainLoRA": [{ widget: "save_path", type: "folder" }],
             "Qwen3DataPrep": [{ widget: "jsonl_path", type: "file" }],
-            "Qwen3ApplyLoRA": [{ widget: "lora_path", type: "folder" }]
+            "Qwen3ApplyLoRA": [{ widget: "lora_path", type: "folder" }],
+            "Qwen3AudioToDataset": [{ widget: "audio_folder", type: "folder" }]
         };
 
         if (config[node.comfyClass]) {

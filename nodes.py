@@ -1561,20 +1561,55 @@ class Qwen3AutoLabelEmotions:
         except Exception as e:
             raise RuntimeError(f"Failed to load Qwen2-Audio model: {e}")
 
-        system_prompt = "Describe the voice gender, emotion, tone, and speed concisely. Output ONLY the description."
+        # Aggressive prompt to avoid "Neutral" bias
+        system_prompt = (
+            "Analyze the emotional intensity of the speaker. "
+            "Focus on pitch, volume changes, and breathing. "
+            "Detect if the voice is Angry, Sad, Happy, Scared, or Surprised. "
+            "Only use 'Neutral' if the voice is completely flat. "
+            "Describe the gender and the specific emotion found."
+        )
+
+        # Keyword mapping for absolute priority (skips inference)
+        keyword_map = {
+            "angry": "Male voice, very angry, shouting, aggressive tone, high pitch.",
+            "enfadado": "Male voice, very angry, shouting, aggressive tone, high pitch.",
+            "sad": "Male voice, very sad, crying, low pitch, melancholic tone.",
+            "triste": "Male voice, very sad, crying, low pitch, melancholic tone.",
+            "happy": "Male voice, happy, laughing, bright tone, excited.",
+            "feliz": "Male voice, happy, laughing, bright tone, excited.",
+            "whisper": "Male voice, whispering, quiet, soft tone.",
+            "susurro": "Male voice, whispering, quiet, soft tone.",
+            "scared": "Male voice, scared, trembling, high pitch, fearful.",
+            "miedo": "Male voice, scared, trembling, high pitch, fearful.",
+            "surprised": "Male voice, surprised, shocked, high pitch.",
+            "sorpresa": "Male voice, surprised, shocked, high pitch.",
+        }
 
         total = len(dataset_items)
         for idx, item in enumerate(tqdm(dataset_items, desc="Labeling Emotions", unit="item")):
-            # if unique_id:
-            #    PromptServer.instance.send_progress(idx, total, unique_id)
-
             # Skip if already labeled (in case of re-run or partial)
             if "instruction" in item and item["instruction"]:
                 continue
 
             file_path = item["audio_path"]
-            print(f"[{idx+1}/{total}] Labeling: {os.path.basename(file_path)}")
+            filename = os.path.basename(file_path)
+            path_lower = file_path.lower()
 
+            # --- PHASE 1: Keyword Detection (Deterministic) ---
+            detected_instruction = None
+            for kw, instruction in keyword_map.items():
+                if kw in path_lower:
+                    detected_instruction = instruction
+                    print(f"[{idx+1}/{total}] Labeling: {filename} -> [Keyword '{kw}'] {detected_instruction}")
+                    break
+
+            if detected_instruction:
+                item["instruction"] = detected_instruction
+                continue
+
+            # --- PHASE 2: AI Inference (If no keyword found) ---
+            print(f"[{idx+1}/{total}] Labeling: {filename} (Inference)")
             try:
                 # Load audio
                 audio, sr = librosa.load(file_path, sr=processor.feature_extractor.sampling_rate)
@@ -1598,7 +1633,13 @@ class Qwen3AutoLabelEmotions:
                 inputs = inputs.to(model_obj.device)
 
                 with torch.no_grad():
-                    generated_ids = model_obj.generate(**inputs, max_new_tokens=50)
+                    generated_ids = model_obj.generate(
+                        **inputs,
+                        max_new_tokens=60,
+                        do_sample=True,      # Enable sampling for variety
+                        temperature=0.6,     # Higher temp to avoid "neutral" bias
+                        top_p=0.9
+                    )
 
                 generated_ids = generated_ids[:, inputs.input_ids.size(1):]
                 response = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
