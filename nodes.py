@@ -3044,13 +3044,35 @@ class Qwen3TrainLoRA:
         )
 
         # Dynamic Padding Collator
-        collate_fn = DataCollatorForSeq2Seq(tokenizer=None, pad_to_multiple_of=8)
 
+        # 1. Define Custom Manual Collator (No Tokenizer needed)
+        def custom_collate_fn(batch):
+            from torch.nn.utils.rnn import pad_sequence
+
+            # Extract lists from batch
+            input_ids = [item['input_ids'] for item in batch]
+            labels = [item['labels'] for item in batch]
+            attention_mask = [item['attention_mask'] for item in batch]
+
+            # Dynamic Padding
+            # batch_first=True is vital for Transformers
+            # padding_value=0 for inputs, -100 for labels (ignore index)
+            padded_inputs = pad_sequence(input_ids, batch_first=True, padding_value=0)
+            padded_labels = pad_sequence(labels, batch_first=True, padding_value=-100)
+            padded_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+
+            return {
+                "input_ids": padded_inputs,
+                "labels": padded_labels,
+                "attention_mask": padded_mask
+            }
+
+        # 2. Configure Trainer with custom collator
         trainer = Trainer(
             model=lora_model,
             args=args,
             train_dataset=train_dataset,
-            data_collator=collate_fn,
+            data_collator=custom_collate_fn,
         )
 
         print(f"--- Starting LoRA Training for {epochs} epochs ---")
