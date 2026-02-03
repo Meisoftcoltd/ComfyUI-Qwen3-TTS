@@ -2908,26 +2908,65 @@ class Qwen3TrainLoRA:
     CATEGORY = "Qwen3-TTS/Training"
 
     def train(self, model, dataset_path, lora_name, rank, alpha, epochs, batch_size, learning_rate, save_path, model_name_prefix="", unique_id=None):
+        import json
+        import types
+
         # Unwrap model
         hf_model = model.model if hasattr(model, 'model') else model
 
+        # ============================================================
+        # 🛡️ THE NUCLEAR PATCH (FIXES DTYPE AND SERIALIZATION)
+        # ============================================================
+
+        # 1. Disable Cache (Mandatory for training)
+        hf_model.config.use_cache = False
+
+        # 2. Fix Dtype (Previous fix)
+        if not hasattr(hf_model.config, "dtype"):
+            hf_model.config.dtype = getattr(hf_model, "dtype", torch.float16)
+
+        # 3. CONFIG SANITIZER (Fixes TypeError: Object of type method is not JSON serializable)
+        # Scan config and DELETE any attribute that is a callable/method
+        keys_to_delete = []
+        for key, value in hf_model.config.__dict__.items():
+            if callable(value): # If it's a function, it kills JSON serialization
+                print(f"⚠️ [LoRA Fix] Removing non-serializable method from config: '{key}'")
+                keys_to_delete.append(key)
+
+        for k in keys_to_delete:
+            delattr(hf_model.config, k)
+
+        # 4. OVERRIDE JSON SAVE FUNCTION
+        # Force model to use a bulletproof save function.
+        # If it finds something it can't save, skip it instead of crashing.
+        def bulletproof_to_json_string(*args, **kwargs):
+            safe_config = {}
+            # Try to get raw dict
+            try:
+                raw_dict = hf_model.config.to_dict()
+            except:
+                raw_dict = hf_model.config.__dict__
+
+            # Filter for serializable items only
+            for k, v in raw_dict.items():
+                try:
+                    json.dumps({k: v}) # Litmus test
+                    safe_config[k] = v
+                except TypeError:
+                    # If fails, just skip logging it and continue
+                    pass
+            return json.dumps(safe_config, indent=2)
+
+        # Inject our safe function into model config
+        hf_model.config.to_json_string = bulletproof_to_json_string
+        hf_model.config.to_diff_dict = lambda: hf_model.config.to_dict() # Secondary patch
+
+        # ============================================================
+
         # Enable Gradients
         hf_model.train()
-        # Enable gradient checkpointing if available
         if hasattr(hf_model, "gradient_checkpointing_enable"):
             hf_model.gradient_checkpointing_enable()
-
-        # PATCH: Fix for transformers 'KeyError: dtype' during Trainer init
-        # The Qwen3TTSConfig might not match standard HF serialization expectations.
-        # We replace to_diff_dict with a safe version that skips the recursive diff comparison.
-        if hasattr(hf_model, "config"):
-            def safe_to_diff_dict(self):
-                # Return the full dict instead of trying to compute a diff against defaults
-                # which causes the KeyError if defaults are missing keys present in instance
-                return self.to_dict()
-            import types
-            hf_model.config.to_diff_dict = types.MethodType(safe_to_diff_dict, hf_model.config)
-            print("[Qwen3-TTS] Patched model.config.to_diff_dict to avoid Trainer serialization error.")
 
         # Configure LoRA
         peft_config = LoraConfig(
@@ -2939,13 +2978,11 @@ class Qwen3TrainLoRA:
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
         )
 
-        # Prepare Model
         try:
             lora_model = get_peft_model(hf_model, peft_config)
             lora_model.print_trainable_parameters()
         except Exception as e:
-            # Handle case if model is already adapted
-            print(f"Warning attaching LoRA: {e}")
+            print(f"Warning attaching LoRA (might be already attached): {e}")
             lora_model = hf_model
 
         # Load Dataset
@@ -2953,7 +2990,6 @@ class Qwen3TrainLoRA:
         if len(train_dataset) == 0:
             return ("Error: Dataset Empty",)
 
-        # Configure Trainer
         # Construct folder name: {model_name}-{lora_name} if prefix exists
         final_lora_name = lora_name
         if model_name_prefix and model_name_prefix.strip():
@@ -2972,7 +3008,9 @@ class Qwen3TrainLoRA:
             logging_steps=5,
             save_strategy="no", # Save only at end to save space
             optim="adamw_torch",
-            remove_unused_columns=False
+            remove_unused_columns=False,
+            report_to="none",
+            skip_memory_metrics=True # Avoid trainer trying to log memory with complex objects
         )
 
         # Dynamic Padding Collator
@@ -2990,7 +3028,13 @@ class Qwen3TrainLoRA:
 
         # Save Final Adapter
         final_save_path = os.path.join(full_output_dir, "final")
-        lora_model.save_pretrained(final_save_path)
+        try:
+            lora_model.save_pretrained(final_save_path)
+        except Exception as e:
+            print(f"Error saving pretrained: {e}")
+            # Manual fallback
+            os.makedirs(final_save_path, exist_ok=True)
+            torch.save(lora_model.state_dict(), os.path.join(final_save_path, "adapter_model.bin"))
 
         # Cleanup
         del trainer
