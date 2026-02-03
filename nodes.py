@@ -2941,8 +2941,35 @@ class Qwen3TrainLoRA:
         import json
         import types
 
-        # Unwrap model
-        hf_model = model.model if hasattr(model, 'model') else model
+        # ============================================================
+        # 🔍 CRITICAL FIX: DEEP UNWRAP
+        # ============================================================
+
+        def find_base_model(obj):
+            # Dig down until we find the real model with a 'forward' method
+            current_obj = obj
+            print(f" -> Inspecting: {type(current_obj)}")
+
+            # Attempt 1: Standard ComfyUI unwrapping
+            while hasattr(current_obj, "model"):
+                print("   -> Found '.model' attribute, unwrapping...")
+                current_obj = current_obj.model
+
+            # Attempt 2: Sometimes it's inside 'transformer' or 'llm'
+            if hasattr(current_obj, "transformer"):
+                 print("   -> Found '.transformer' attribute, unwrapping...")
+                 current_obj = current_obj.transformer
+
+            return current_obj
+
+        # Execute search for the real model
+        hf_model = find_base_model(model)
+
+        # FINAL VERIFICATION
+        if not hasattr(hf_model, "forward"):
+            raise AttributeError(f"CRITICAL ERROR: The extracted object {type(hf_model)} has no 'forward' method. We are trying to train the wrong object!")
+
+        print(f"✅ Target Model Found: {type(hf_model)}")
 
         # ============================================================
         # 🛡️ THE NUCLEAR PATCH (FIXES DTYPE AND SERIALIZATION)
