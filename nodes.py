@@ -14,6 +14,7 @@ import folder_paths
 import comfy.model_management as mm
 from server import PromptServer
 import platform
+from tqdm import tqdm
 
 def fix_wsl_path(path):
     """Helper to convert Windows paths to WSL paths if running on Linux."""
@@ -1446,10 +1447,10 @@ class Qwen3TranscribeWhisper:
                 except:
                     return audio_segment
 
-            for idx, filename in enumerate(files):
+            for idx, filename in enumerate(tqdm(files, desc="Processing Audio", unit="file")):
                 # Update progress
-                if unique_id:
-                    PromptServer.instance.send_progress(idx, total_files, unique_id)
+                # if unique_id:
+                #    PromptServer.instance.send_progress(idx, total_files, unique_id)
 
                 filepath = os.path.join(folder_path, filename)
                 base_name = os.path.splitext(filename)[0]
@@ -1563,9 +1564,9 @@ class Qwen3AutoLabelEmotions:
         system_prompt = "Describe the voice gender, emotion, tone, and speed concisely. Output ONLY the description."
 
         total = len(dataset_items)
-        for idx, item in enumerate(dataset_items):
-            if unique_id:
-                PromptServer.instance.send_progress(idx, total, unique_id)
+        for idx, item in enumerate(tqdm(dataset_items, desc="Labeling Emotions", unit="item")):
+            # if unique_id:
+            #    PromptServer.instance.send_progress(idx, total, unique_id)
 
             # Skip if already labeled (in case of re-run or partial)
             if "instruction" in item and item["instruction"]:
