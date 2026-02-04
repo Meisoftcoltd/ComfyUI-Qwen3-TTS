@@ -2959,6 +2959,7 @@ class Qwen3TrainLoRA:
                 "rank": ("INT", {"default": 32, "min": 8, "max": 128}),
                 "alpha": ("INT", {"default": 64, "min": 8, "max": 256}),
                 "epochs": ("INT", {"default": 3, "min": 1, "max": 100}),
+                "precision": (["bf16", "fp16", "fp32", "fp8"], {"default": "bf16"}),
                 "batch_size": ("INT", {"default": 1, "min": 1, "max": 16}),
                 "learning_rate": ("FLOAT", {"default": 2e-4, "min": 1e-6, "max": 1e-3, "step": 1e-5}),
                 "save_path": ("STRING", {"default": "loras/"}),
@@ -2970,27 +2971,60 @@ class Qwen3TrainLoRA:
     FUNCTION = "train"
     CATEGORY = "Qwen3-TTS/Training"
 
-    def train(self, model_version, dataset_path, lora_name, rank, alpha, epochs, batch_size, learning_rate, save_path):
-        from transformers import AutoModelForCausalLM, TrainingArguments, Trainer
+    def train(self, model_version, dataset_path, lora_name, rank, alpha, epochs, precision, batch_size, learning_rate, save_path):
+        from transformers import AutoModelForCausalLM, TrainingArguments, Trainer, AutoConfig
         from torch.nn.utils.rnn import pad_sequence
         import torch
         import json
         import types
 
-        print(f"🔄 [Qwen3-TTS] Clean Model Load Init: {model_version}")
-        print("   -> Bypassing inference wrappers. Loading clean base model...")
+        print(f"🔄 [Qwen3-TTS] Clean Model Load Init: {model_version} (Precision: {precision})")
 
         # ============================================================
-        # 1. CLEAN MODEL LOAD (AutoModelForCausalLM)
+        # 0. REGISTRO MANUAL DE CONFIGURACIÓN (FIX CRÍTICO)
         # ============================================================
-        # This solves "_forward_unimplemented" by loading the standard HF class directly
+        # Soluciona "Unrecognized configuration class" registrando la config manualmente
+        try:
+            from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
+            from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
+
+            AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
+            # Nota: Si Qwen3TTSForConditionalGeneration no soporta entrenamiento,
+            # esto podría causar _forward_unimplemented más adelante.
+            # Pero es necesario para que AutoModel cargue algo.
+            AutoModelForCausalLM.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
+            print("✅ Configuración Qwen3TTS registrada manualmente.")
+        except ImportError:
+            print("⚠️ No se pudo importar Qwen3TTSConfig localmente. Confiando en trust_remote_code=True.")
+
+        # ============================================================
+        # 1. SETUP PRECISION & QUANTIZATION
+        # ============================================================
+        torch_dtype = torch.bfloat16 if precision == "bf16" else (torch.float16 if precision == "fp16" else torch.float32)
+        quantization_config = None
+
+        if precision == "fp8":
+            if HAS_BNB:
+                from transformers import BitsAndBytesConfig
+                print("🎱 Using FP8 (8-bit) quantization via BitsAndBytes")
+                quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+                torch_dtype = torch.bfloat16 # Compute type
+            else:
+                print("⚠️ FP8 requested but bitsandbytes not installed. Falling back to bf16.")
+                precision = "bf16"
+                torch_dtype = torch.bfloat16
+
+        # ============================================================
+        # 2. CLEAN MODEL LOAD (AutoModelForCausalLM)
+        # ============================================================
         try:
             hf_model = AutoModelForCausalLM.from_pretrained(
                 model_version,
                 device_map="auto",
-                torch_dtype=torch.bfloat16, # Optimized for RTX 3090
+                torch_dtype=torch_dtype,
+                quantization_config=quantization_config,
                 trust_remote_code=True,
-                attn_implementation="flash_attention_2" # Max speed
+                attn_implementation="flash_attention_2"
             )
             print("⚡ [Qwen3-TTS] Flash Attention 2 enabled.")
         except Exception as e:
@@ -2998,7 +3032,8 @@ class Qwen3TrainLoRA:
             hf_model = AutoModelForCausalLM.from_pretrained(
                 model_version,
                 device_map="auto",
-                torch_dtype=torch.bfloat16,
+                torch_dtype=torch_dtype,
+                quantization_config=quantization_config,
                 trust_remote_code=True
             )
 
@@ -3006,10 +3041,20 @@ class Qwen3TrainLoRA:
         hf_model.config.use_cache = False
         # Ensure model knows its dtype (avoids 'dtype' error)
         if not hasattr(hf_model.config, "dtype"):
-            hf_model.config.dtype = torch.bfloat16
+            hf_model.config.dtype = torch_dtype
+
+        # Prepare for k-bit training if needed
+        if precision == "fp8":
+            from peft import prepare_model_for_kbit_training
+            hf_model = prepare_model_for_kbit_training(hf_model)
 
         # Enable Gradients
-        hf_model.train()
+        # For kbit, gradients are handled by prepare_model_for_kbit_training usually, but let's ensure.
+        if precision != "fp8":
+            hf_model.train()
+
+        if hasattr(hf_model, "gradient_checkpointing_enable"):
+            hf_model.gradient_checkpointing_enable()
         if hasattr(hf_model, "gradient_checkpointing_enable"):
             hf_model.gradient_checkpointing_enable()
 
@@ -3086,14 +3131,17 @@ class Qwen3TrainLoRA:
         # ============================================================
         full_output_dir = os.path.join(save_path, lora_name)
 
+        use_bf16 = (precision == "bf16" or precision == "fp8") # FP8 uses bf16/fp16 for compute
+        use_fp16 = (precision == "fp16")
+
         args = TrainingArguments(
             output_dir=full_output_dir,
             per_device_train_batch_size=batch_size,
             gradient_accumulation_steps=4,
             learning_rate=learning_rate,
             num_train_epochs=epochs,
-            bf16=True,       # RTX 3090: SÍ soporta bf16 (mejor estabilidad)
-            fp16=False,      # Desactivamos fp16
+            bf16=use_bf16,
+            fp16=use_fp16,
             logging_steps=5,
             save_strategy="no", # Solo guardamos al final para ahorrar disco
             optim="adamw_torch",
