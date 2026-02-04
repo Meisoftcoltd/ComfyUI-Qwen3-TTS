@@ -2951,6 +2951,7 @@ class Qwen3TrainLoRA:
                 "rank": ("INT", {"default": 32, "min": 8, "max": 128}),
                 "alpha": ("INT", {"default": 64, "min": 8, "max": 256}),
                 "epochs": ("INT", {"default": 3, "min": 1, "max": 100}),
+                "precision": (["bf16", "fp16", "fp32"], {"default": "bf16"}),
                 "batch_size": ("INT", {"default": 1, "min": 1, "max": 16}),
                 "learning_rate": ("FLOAT", {"default": 2e-4, "min": 1e-6, "max": 1e-3, "step": 1e-5}),
                 "save_path": ("STRING", {"default": "loras/"}),
@@ -2965,7 +2966,7 @@ class Qwen3TrainLoRA:
     FUNCTION = "train"
     CATEGORY = "Qwen3-TTS/Training"
 
-    def train(self, model, dataset_path, lora_name, rank, alpha, epochs, batch_size, learning_rate, save_path, model_name_prefix="", unique_id=None):
+    def train(self, model, dataset_path, lora_name, rank, alpha, epochs, precision, batch_size, learning_rate, save_path, model_name_prefix="", unique_id=None):
         import json
         import types
 
@@ -3131,13 +3132,19 @@ class Qwen3TrainLoRA:
         full_output_dir = os.path.join(save_path, final_lora_name)
         print(f"[Qwen3-TTS] LoRA Training Output Directory: {full_output_dir}")
 
+        # Determine precision flags
+        use_bf16 = (precision == "bf16")
+        use_fp16 = (precision == "fp16")
+        # fp32 is default if both are False
+
         args = TrainingArguments(
             output_dir=full_output_dir,
             per_device_train_batch_size=batch_size,
             gradient_accumulation_steps=4,
             learning_rate=learning_rate,
             num_train_epochs=epochs,
-            fp16=True,
+            bf16=use_bf16,
+            fp16=use_fp16,
             logging_steps=5,
             save_strategy="no", # Save only at end to save space
             optim="adamw_torch",
