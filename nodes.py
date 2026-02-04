@@ -3077,94 +3077,66 @@ class Qwen3TrainLoRA:
             lora_base_model = base_model
 
         # ============================================================
-        # 🔥 FIX DEFINITIVO V3: RECURSIVE SMART WRAPPER
+        # 🔥 FIX DEFINITIVO V4: MANUAL FORWARD INJECTION
         # ============================================================
 
         class Qwen3TrainWrapper(nn.Module):
             def __init__(self, model):
                 super().__init__()
-                self.model_original = model # Guardamos ref original para save_pretrained
-                self.backbone = self._find_true_backbone(model)
+                self.model = model
                 self.config = model.config
 
-            def _find_true_backbone(self, current_module, depth=0):
-                print(f"🔍 [Depth {depth}] Inspecting: {type(current_module).__name__}")
-
-                # 1. Si es un modelo estándar de HuggingFace (Qwen2Model, LlamaModel, etc.)
-                # y NO es una de las clases custom de TTS, ¡BINGO!
-                class_name = type(current_module).__name__
-                if "Qwen2Model" in class_name or "LlamaModel" in class_name:
-                    print(f"   ✅ FOUND PURE LLM: {class_name}")
-                    return current_module
-
-                # 2. Lista de atributos donde suele esconderse el modelo interno
-                candidates = ["model", "transformer", "llm", "base_model"]
-
-                for name in candidates:
-                    if hasattr(current_module, name):
-                        child = getattr(current_module, name)
-                        # Verificamos que sea un módulo de PyTorch
-                        if isinstance(child, nn.Module):
-                            print(f"   ⬇️  Found '{name}', digging deeper...")
-                            return self._find_true_backbone(child, depth+1)
-
-                # 3. Si no hay candidatos obvios, buscamos al hijo más grande (Heurística)
-                # PERO solo si estamos en los niveles superiores (wrappers)
-                if depth < 3:
-                    print("   ⚠️ No attributes found. Scanning children by size...")
-                    max_params = 0
-                    fat_child = None
-
-                    for name, child in current_module.named_children():
-                        try:
-                            params = sum(p.numel() for p in child.parameters())
-                            if params > max_params:
-                                max_params = params
-                                fat_child = child
-                        except: pass
-
-                    if fat_child:
-                        print(f"   ⬇️  Biggest child is '{type(fat_child).__name__}' ({max_params/1e6:.0f}M params). Digging...")
-                        return self._find_true_backbone(fat_child, depth+1)
-
-                # 4. Si llegamos aquí y no podemos bajar más, devolvemos lo que tenemos
-                print(f"   🛑 Stopped at {class_name}. Using as backbone.")
-                return current_module
+                # Intentamos encontrar el backbone directamente
+                # En Qwen2/3, suele ser self.model.model
+                if hasattr(model, "model"):
+                    self.backbone = model.model
+                elif hasattr(model, "transformer"):
+                    self.backbone = model.transformer
+                else:
+                    # Si no lo encontramos, usamos el modelo entero pero
+                    # forzamos los argumentos en el forward
+                    self.backbone = model
 
             def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
-                # INTENTO DE BYPASS (Si el backbone sigue siendo el Talker):
+                # 1. Ejecutar el modelo
+                # Los modelos de HF suelen devolver CausalLMOutputWithPast
                 try:
                     outputs = self.backbone(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        output_hidden_states=False,
                         return_dict=True,
-                        use_cache=False, # Importante desactivar caché
-                        **kwargs
+                        output_hidden_states=False,
+                        # Truco: Si es el wrapper de inferencia, a veces falla si no le das estos
+                        # pasamos dummy args si es necesario, pero probamos limpio primero
                     )
-                except TypeError as e:
-                    # Si falla, es posible que sea el error de 'past_hidden'.
-                    # Muchos modelos custom fallan si no les das inputs_embeds o past_key_values.
-                    print(f"⚠️ Forward Error: {e}. Trying fallback mode...")
-                    # Fallback: A veces pasar dummy past_key_values ayuda
-                    outputs = self.backbone(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        use_cache=False
-                    )
+                except TypeError:
+                    # Si falla, probamos llamando al 'model' interno si existe
+                    if hasattr(self.model, "model"):
+                        outputs = self.model.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask
+                        )
+                    else:
+                        raise
 
-                # Extracción de Logits
+                # 2. Obtener Logits
                 if hasattr(outputs, "logits"):
                     logits = outputs.logits
                 elif isinstance(outputs, tuple):
                     logits = outputs[0]
                 else:
+                    # Si el backbone devuelve hidden_states (sin lm_head)
+                    # Necesitamos proyectar. Esto es un problema si no tenemos la head.
+                    # Asumimos que backbone TIENE la head.
                     logits = outputs
 
+                # 3. Calcular Pérdida (Loss)
                 loss = None
                 if labels is not None:
+                    # Shift para predicción next-token
                     shift_logits = logits[..., :-1, :].contiguous()
                     shift_labels = labels[..., 1:].contiguous()
+
                     loss_fct = nn.CrossEntropyLoss()
                     loss = loss_fct(
                         shift_logits.view(-1, shift_logits.size(-1)),
@@ -3173,16 +3145,15 @@ class Qwen3TrainLoRA:
 
                 return {"loss": loss, "logits": logits} if loss is not None else {"logits": logits}
 
+            # Passthrough vital para guardado
             def save_pretrained(self, path):
-                self.model_original.save_pretrained(path)
+                self.model.save_pretrained(path)
 
             def __getattr__(self, name):
-                try:
-                    return super().__getattr__(name)
-                except AttributeError:
-                    return getattr(self.backbone, name)
+                try: return super().__getattr__(name)
+                except AttributeError: return getattr(self.model, name)
 
-        # Envolvemos el modelo YA con LoRA
+        # Envolvemos el modelo YA con LoRA (variable 'lora_base_model' viene de arriba)
         trainable_model = Qwen3TrainWrapper(lora_base_model)
 
         # ============================================================
