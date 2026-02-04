@@ -2987,7 +2987,6 @@ class Qwen3TrainLoRA:
             print("⚠️ No se pudo importar la config localmente. Confiando en remote_code.")
 
         # 2. CARGA DEL MODELO BASE (CLEAN LOAD)
-        # Usamos bf16 para RTX 3090 -> Máxima estabilidad y eficiencia
         try:
             hf_model = AutoModelForCausalLM.from_pretrained(
                 model_version,
@@ -3007,24 +3006,53 @@ class Qwen3TrainLoRA:
             )
 
         hf_model.config.use_cache = False
+
+        # ============================================================
+        # 💉 FIX CRÍTICO: INYECCIÓN DE GET_INPUT_EMBEDDINGS
+        # ============================================================
+        # PEFT necesita esta función para 'gradient_checkpointing'.
+        # Qwen3-TTS no la tiene, así que se la inyectamos manualmente.
+
+        def get_input_embeddings_patch(self):
+            # Buscamos dónde están los embeddings reales
+            if hasattr(self, "model") and hasattr(self.model, "embed_tokens"):
+                return self.model.embed_tokens
+            elif hasattr(self, "transformer") and hasattr(self.transformer, "wte"):
+                return self.transformer.wte
+            # Fallback para Qwen2/3 estándar
+            return self.model.embed_tokens
+
+        # Inyectamos el método en la instancia del modelo cargado
+        # Usamos __get__ para vincular la función al objeto (hacerla un método)
+        import types
+        hf_model.get_input_embeddings = types.MethodType(get_input_embeddings_patch, hf_model)
+
+        # También desactivamos gradient checkpointing temporalmente si sigue fallando,
+        # pero con el parche debería funcionar.
         if hasattr(hf_model, "gradient_checkpointing_enable"):
             hf_model.gradient_checkpointing_enable()
 
+        # Esto testea si el parche funciona (lanzará error si no)
+        try:
+            if hasattr(hf_model, "enable_input_require_grads"):
+                hf_model.enable_input_require_grads()
+        except Exception as e:
+            print(f"Warning on enable_input_require_grads: {e}")
+
+        print("✅ Parche 'get_input_embeddings' aplicado con éxito.")
+        # ============================================================
+
         # 3. WRAPPER MANUAL (La clave del éxito)
-        # Este wrapper envuelve al modelo y le OBLIGA a calcular la pérdida (loss)
-        # solucionando el error "_forward_unimplemented".
         class Qwen3TrainWrapper(nn.Module):
             def __init__(self, model):
                 super().__init__()
                 self.model = model
                 self.config = model.config
-                # Intentamos conectar directamente al cerebro (transformer/model)
                 if hasattr(model, "model"): self.backbone = model.model
                 elif hasattr(model, "transformer"): self.backbone = model.transformer
                 else: self.backbone = model
 
             def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
-                # Llamada al modelo real
                 outputs = self.backbone(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -3032,13 +3060,10 @@ class Qwen3TrainLoRA:
                     output_hidden_states=False,
                     use_cache=False
                 )
-
-                # Gestión robusta de Logits
                 if hasattr(outputs, "logits"): logits = outputs.logits
                 elif isinstance(outputs, tuple): logits = outputs[0]
                 else: logits = outputs
 
-                # Cálculo manual de Loss (CrossEntropy)
                 loss = None
                 if labels is not None:
                     shift_logits = logits[..., :-1, :].contiguous()
