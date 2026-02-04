@@ -2959,6 +2959,7 @@ class Qwen3TrainLoRA:
                 "batch_size": ("INT", {"default": 1, "min": 1, "max": 16}),
                 "learning_rate": ("FLOAT", {"default": 2e-4, "min": 1e-6, "max": 1e-3, "step": 1e-5}),
                 "save_path": ("STRING", {"default": "loras/"}),
+                "precision": (["bf16", "fp16", "fp32", "fp8"], {"default": "bf16"}),
             }
         }
 
@@ -2967,31 +2968,33 @@ class Qwen3TrainLoRA:
     FUNCTION = "train"
     CATEGORY = "Qwen3-TTS/Training"
 
-    def train(self, model_version, dataset_path, lora_name, rank, alpha, epochs, batch_size, learning_rate, save_path):
+    def train(self, model_version, dataset_path, lora_name, rank, alpha, epochs, batch_size, learning_rate, save_path, precision):
         from transformers import AutoModelForCausalLM, TrainingArguments, Trainer, AutoConfig
         from peft import LoraConfig, get_peft_model, TaskType
         from torch.nn.utils.rnn import pad_sequence
         import torch.nn as nn
         import torch
+        import types
 
-        print(f"🔄 [Qwen3-TTS] Iniciando Entrenamiento Definitivo: {model_version}")
+        print(f"🔄 [Qwen3-TTS] Iniciando Entrenamiento (Intento Definitivo v2): {model_version}")
 
-        # 1. FIX DE CONFIGURACIÓN: Registrar manualmente para evitar errores de carga
+        # 1. FIX DE CONFIGURACIÓN
         try:
             from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
             from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
             AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
             AutoModelForCausalLM.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
-            print("✅ Configuración Qwen3TTS registrada manualmente.")
         except ImportError:
-            print("⚠️ No se pudo importar la config localmente. Confiando en remote_code.")
+            pass
 
-        # 2. CARGA DEL MODELO BASE (CLEAN LOAD)
+        # 2. CARGA DEL MODELO BASE
+        torch_dtype = torch.bfloat16 if precision == "bf16" else (torch.float16 if precision == "fp16" else torch.float32)
+
         try:
             hf_model = AutoModelForCausalLM.from_pretrained(
                 model_version,
                 device_map="auto",
-                torch_dtype=torch.bfloat16,
+                torch_dtype=torch_dtype,
                 trust_remote_code=True,
                 attn_implementation="flash_attention_2"
             )
@@ -3001,45 +3004,60 @@ class Qwen3TrainLoRA:
             hf_model = AutoModelForCausalLM.from_pretrained(
                 model_version,
                 device_map="auto",
-                torch_dtype=torch.bfloat16,
+                torch_dtype=torch_dtype,
                 trust_remote_code=True
             )
 
         hf_model.config.use_cache = False
 
         # ============================================================
-        # 💉 FIX CRÍTICO: INYECCIÓN DE GET_INPUT_EMBEDDINGS
+        # 💉 FIX ROBUSTO: PARCHE RASTREADOR DE EMBEDDINGS
         # ============================================================
-        # PEFT necesita esta función para 'gradient_checkpointing'.
-        # Qwen3-TTS no la tiene, así que se la inyectamos manualmente.
 
         def get_input_embeddings_patch(self):
-            # Buscamos dónde están los embeddings reales
+            # Estrategia 1: Buscar en sub-módulos conocidos de Qwen3-TTS
+            if hasattr(self, "talker"):
+                # La arquitectura Qwen3 suele tener el LLM dentro de 'talker'
+                if hasattr(self.talker, "model") and hasattr(self.talker.model, "embed_tokens"):
+                    return self.talker.model.embed_tokens
+                if hasattr(self.talker, "embed_tokens"):
+                    return self.talker.embed_tokens
+
+            # Estrategia 2: Estructura estándar Qwen/Llama
             if hasattr(self, "model") and hasattr(self.model, "embed_tokens"):
                 return self.model.embed_tokens
             elif hasattr(self, "transformer") and hasattr(self.transformer, "wte"):
                 return self.transformer.wte
-            # Fallback para Qwen2/3 estándar
-            return self.model.embed_tokens
 
-        # Inyectamos el método en la instancia del modelo cargado
-        # Usamos __get__ para vincular la función al objeto (hacerla un método)
-        import types
+            # Estrategia 3: Búsqueda Recursiva (Fuerza Bruta Inteligente)
+            print("⚠️ Buscando capa de embeddings por fuerza bruta...")
+            for name, module in self.named_modules():
+                if isinstance(module, nn.Embedding):
+                    # Verificamos que sea la capa grande (vocabulario > 100k típicamente para LLMs modernos)
+                    if hasattr(module, "num_embeddings") and module.num_embeddings > 10000:
+                        print(f"✅ Embeddings encontrados en: {name}")
+                        return module
+
+            # Fallback final: devolver el primer embedding que encontremos
+            for module in self.modules():
+                if isinstance(module, nn.Embedding):
+                    return module
+
+            raise AttributeError("CRITICAL: No se pudo encontrar la capa de Input Embeddings.")
+
+        # Inyectamos el parche
         hf_model.get_input_embeddings = types.MethodType(get_input_embeddings_patch, hf_model)
 
-        # También desactivamos gradient checkpointing temporalmente si sigue fallando,
-        # pero con el parche debería funcionar.
-        if hasattr(hf_model, "gradient_checkpointing_enable"):
-            hf_model.gradient_checkpointing_enable()
-
-        # Esto testea si el parche funciona (lanzará error si no)
+        # Activamos gradientes (esto disparará el parche y verificará si funciona)
         try:
+            if hasattr(hf_model, "gradient_checkpointing_enable"):
+                hf_model.gradient_checkpointing_enable()
             if hasattr(hf_model, "enable_input_require_grads"):
                 hf_model.enable_input_require_grads()
+            print("✅ Parche de embeddings verificado y funcionando.")
         except Exception as e:
-            print(f"Warning on enable_input_require_grads: {e}")
+            print(f"⚠️ Advertencia al activar gradientes: {e}")
 
-        print("✅ Parche 'get_input_embeddings' aplicado con éxito.")
         # ============================================================
 
         # 3. WRAPPER MANUAL (La clave del éxito)
@@ -3048,18 +3066,33 @@ class Qwen3TrainLoRA:
                 super().__init__()
                 self.model = model
                 self.config = model.config
-                if hasattr(model, "model"): self.backbone = model.model
+
+                # Búsqueda del backbone (cerebro)
+                if hasattr(model, "talker"): self.backbone = model.talker
+                elif hasattr(model, "model"): self.backbone = model.model
                 elif hasattr(model, "transformer"): self.backbone = model.transformer
                 else: self.backbone = model
 
             def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
-                outputs = self.backbone(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    return_dict=True,
-                    output_hidden_states=False,
-                    use_cache=False
-                )
+                # Intentamos pasar los argumentos estándar
+                try:
+                    outputs = self.backbone(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        return_dict=True,
+                        output_hidden_states=False,
+                        use_cache=False
+                    )
+                except TypeError:
+                    # Fallback para wrappers raros o si backbone es el modelo interno crudo
+                    if hasattr(self.backbone, "model"): # Qwen2AudioForConditionalGeneration case
+                         outputs = self.backbone.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask
+                        )
+                    else:
+                        outputs = self.backbone(input_ids=input_ids)
+
                 if hasattr(outputs, "logits"): logits = outputs.logits
                 elif isinstance(outputs, tuple): logits = outputs[0]
                 else: logits = outputs
@@ -3098,22 +3131,16 @@ class Qwen3TrainLoRA:
         trainable_model = Qwen3TrainWrapper(lora_model_raw)
 
         # 5. CARGA DE DATOS (Collator Manual)
-        # Importamos la clase dataset que ya tienes en el mismo archivo (o deberías tener)
-        # Asumimos que Qwen3PrecomputedDataset existe en lora_nodes.py
         try:
-            # Try to get it from global scope first (since it is defined in nodes.py)
+            # Try to get it from global scope first
             dataset_cls = globals().get("Qwen3PrecomputedDataset")
             if not dataset_cls:
-                 # Local fallback if not visible
                  dataset_cls = Qwen3PrecomputedDataset
-
             train_dataset = dataset_cls(dataset_path)
         except Exception:
-             # Last resort fallback assuming class is available in scope
              train_dataset = Qwen3PrecomputedDataset(dataset_path)
 
         def custom_collate_fn(batch):
-            # Aplanador de listas
             def flatten(x): return [item for sublist in x for item in (sublist if isinstance(sublist, list) else [sublist])] if isinstance(x[0], list) else x
 
             input_ids = [torch.tensor(flatten(item['input_ids']), dtype=torch.long) for item in batch]
@@ -3128,14 +3155,17 @@ class Qwen3TrainLoRA:
         # 6. EJECUCIÓN
         full_output_dir = os.path.join(save_path, lora_name)
 
+        use_bf16 = (precision == "bf16" or precision == "fp8")
+        use_fp16 = (precision == "fp16")
+
         args = TrainingArguments(
             output_dir=full_output_dir,
             per_device_train_batch_size=batch_size,
             gradient_accumulation_steps=4,
             learning_rate=learning_rate,
             num_train_epochs=epochs,
-            bf16=True, # RTX 3090 / Ampere
-            fp16=False,
+            bf16=use_bf16,
+            fp16=use_fp16,
             logging_steps=10,
             save_strategy="no",
             optim="adamw_torch",
