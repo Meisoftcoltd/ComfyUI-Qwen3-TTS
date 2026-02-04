@@ -2978,16 +2978,17 @@ class Qwen3TrainLoRA:
 
         print(f"🔄 [Qwen3-TTS] Iniciando Entrenamiento (Intento Definitivo v2): {model_version}")
 
-        # 1. FIX DE CONFIGURACIÓN
+        # 1. FIX DE CONFIGURACIÓN: Registrar manualmente para evitar errores de carga
         try:
             from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
             from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
             AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
             AutoModelForCausalLM.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
+            print("✅ Configuración Qwen3TTS registrada manualmente.")
         except ImportError:
-            pass
+            print("⚠️ No se pudo importar la config localmente. Confiando en remote_code.")
 
-        # 2. CARGA DEL MODELO BASE
+        # 2. CARGA DEL MODELO BASE (CLEAN LOAD)
         torch_dtype = torch.bfloat16 if precision == "bf16" else (torch.float16 if precision == "fp16" else torch.float32)
 
         try:
@@ -3132,15 +3133,19 @@ class Qwen3TrainLoRA:
 
         # 5. CARGA DE DATOS (Collator Manual)
         try:
-            # Try to get it from global scope first
+            # Try to get it from global scope first (since it is defined in nodes.py)
             dataset_cls = globals().get("Qwen3PrecomputedDataset")
             if not dataset_cls:
+                 # Local fallback if not visible
                  dataset_cls = Qwen3PrecomputedDataset
+
             train_dataset = dataset_cls(dataset_path)
         except Exception:
+             # Last resort fallback assuming class is available in scope
              train_dataset = Qwen3PrecomputedDataset(dataset_path)
 
         def custom_collate_fn(batch):
+            # Aplanador de listas
             def flatten(x): return [item for sublist in x for item in (sublist if isinstance(sublist, list) else [sublist])] if isinstance(x[0], list) else x
 
             input_ids = [torch.tensor(flatten(item['input_ids']), dtype=torch.long) for item in batch]
