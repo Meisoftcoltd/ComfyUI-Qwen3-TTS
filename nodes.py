@@ -2866,7 +2866,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Qwen3SaveAudio": "📁 Qwen3-TTS Save Audio",
     "Qwen3LoadAudioFromPath": "📁 Qwen3-TTS Load Audio (Path)",
     "Qwen3AudioCompare": "📊 Qwen3-TTS Audio Compare",
-    "Qwen3AudioToDataset": "🔄 Qwen3-TTS Audio To Dataset (Whisper)",
+    "Qwen3AudioToDataset": "📁 Qwen3-TTS Dataset Maker",
 }
 # ==============================================================================
 #  APPENDED QWEN3 LORA TRAINING MODULES
@@ -2945,15 +2945,12 @@ class Qwen3TrainLoRA:
     def INPUT_TYPES(s):
         return {
             "required": {
-                # 1. MODEL SELECTOR (Independent of Loader)
+                # Selector de modelo: 1.7B (Calidad) o 0.6B (Velocidad)
                 "model_version": (
-                    [
-                        "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-                        "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
-                    ],
+                    ["Qwen/Qwen3-TTS-12Hz-1.7B-Base", "Qwen/Qwen3-TTS-12Hz-0.6B-Base"],
                     {"default": "Qwen/Qwen3-TTS-12Hz-1.7B-Base"}
                 ),
-
+                # Ruta al dataset generado en el paso anterior
                 "dataset_path": ("STRING", {"default": "output/dataset_codes.jsonl"}),
                 "lora_name": ("STRING", {"default": "my_voice_lora"}),
                 "rank": ("INT", {"default": 32, "min": 8, "max": 128}),
@@ -2962,7 +2959,6 @@ class Qwen3TrainLoRA:
                 "batch_size": ("INT", {"default": 1, "min": 1, "max": 16}),
                 "learning_rate": ("FLOAT", {"default": 2e-4, "min": 1e-6, "max": 1e-3, "step": 1e-5}),
                 "save_path": ("STRING", {"default": "loras/"}),
-                "precision": (["bf16", "fp16", "fp32", "fp8"], {"default": "bf16"}),
             }
         }
 
@@ -2971,181 +2967,87 @@ class Qwen3TrainLoRA:
     FUNCTION = "train"
     CATEGORY = "Qwen3-TTS/Training"
 
-    def train(self, model_version, dataset_path, lora_name, rank, alpha, epochs, batch_size, learning_rate, save_path, precision):
+    def train(self, model_version, dataset_path, lora_name, rank, alpha, epochs, batch_size, learning_rate, save_path):
         from transformers import AutoModelForCausalLM, TrainingArguments, Trainer, AutoConfig
+        from peft import LoraConfig, get_peft_model, TaskType
         from torch.nn.utils.rnn import pad_sequence
-        import torch
         import torch.nn as nn
-        import json
-        import types
+        import torch
 
-        print(f"🔄 [Qwen3-TTS] Clean Model Load Init: {model_version} (Precision: {precision})")
+        print(f"🔄 [Qwen3-TTS] Iniciando Entrenamiento Definitivo: {model_version}")
 
-        # ============================================================
-        # 0. REGISTRO MANUAL DE CONFIGURACIÓN (FIX CRÍTICO)
-        # ============================================================
-        # Soluciona "Unrecognized configuration class" registrando la config manualmente
+        # 1. FIX DE CONFIGURACIÓN: Registrar manualmente para evitar errores de carga
         try:
             from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
             from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
-
             AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
             AutoModelForCausalLM.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
             print("✅ Configuración Qwen3TTS registrada manualmente.")
         except ImportError:
-            print("⚠️ No se pudo importar Qwen3TTSConfig localmente. Confiando en trust_remote_code=True.")
+            print("⚠️ No se pudo importar la config localmente. Confiando en remote_code.")
 
-        # ============================================================
-        # 1. SETUP PRECISION & QUANTIZATION
-        # ============================================================
-        torch_dtype = torch.bfloat16 if precision == "bf16" else (torch.float16 if precision == "fp16" else torch.float32)
-        quantization_config = None
-
-        if precision == "fp8":
-            if HAS_BNB:
-                from transformers import BitsAndBytesConfig
-                print("🎱 Using FP8 (8-bit) quantization via BitsAndBytes")
-                quantization_config = BitsAndBytesConfig(load_in_8bit=True)
-                torch_dtype = torch.bfloat16 # Compute type
-            else:
-                print("⚠️ FP8 requested but bitsandbytes not installed. Falling back to bf16.")
-                precision = "bf16"
-                torch_dtype = torch.bfloat16
-
-        # ============================================================
-        # 2. CLEAN MODEL LOAD (AutoModelForCausalLM)
-        # ============================================================
+        # 2. CARGA DEL MODELO BASE (CLEAN LOAD)
+        # Usamos bf16 para RTX 3090 -> Máxima estabilidad y eficiencia
         try:
-            base_model = AutoModelForCausalLM.from_pretrained(
+            hf_model = AutoModelForCausalLM.from_pretrained(
                 model_version,
                 device_map="auto",
-                torch_dtype=torch_dtype,
-                quantization_config=quantization_config,
+                torch_dtype=torch.bfloat16,
                 trust_remote_code=True,
                 attn_implementation="flash_attention_2"
             )
-            print("⚡ [Qwen3-TTS] Flash Attention 2 enabled.")
+            print("⚡ Flash Attention 2 activado.")
         except Exception as e:
-            print(f"⚠️ [Qwen3-TTS] Flash Attention not available ({e}). Using standard attention.")
-            base_model = AutoModelForCausalLM.from_pretrained(
+            print(f"⚠️ Fallo Flash Attention ({e}). Usando modo estándar.")
+            hf_model = AutoModelForCausalLM.from_pretrained(
                 model_version,
                 device_map="auto",
-                torch_dtype=torch_dtype,
-                quantization_config=quantization_config,
+                torch_dtype=torch.bfloat16,
                 trust_remote_code=True
             )
 
-        # Vital Training Config
-        base_model.config.use_cache = False
-        # Ensure model knows its dtype (avoids 'dtype' error)
-        if not hasattr(base_model.config, "dtype"):
-            base_model.config.dtype = torch_dtype
+        hf_model.config.use_cache = False
+        if hasattr(hf_model, "gradient_checkpointing_enable"):
+            hf_model.gradient_checkpointing_enable()
 
-        # Prepare for k-bit training if needed
-        if precision == "fp8":
-            from peft import prepare_model_for_kbit_training
-            base_model = prepare_model_for_kbit_training(base_model)
-
-        # Enable Gradients (if not fp8 which handles it inside prepare_model)
-        if precision != "fp8":
-            base_model.train()
-
-        if hasattr(base_model, "gradient_checkpointing_enable"):
-            base_model.gradient_checkpointing_enable()
-
-        # ============================================================
-        # 3. LORA CONFIGURATION & WRAPPER
-        # ============================================================
-        peft_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            inference_mode=False,
-            r=rank,
-            lora_alpha=alpha,
-            lora_dropout=0.05,
-            target_modules=[
-                "q_proj", "k_proj", "v_proj", "o_proj",
-                "gate_proj", "up_proj", "down_proj"
-            ]
-        )
-
-        # Inject LoRA on Base Model
-        try:
-            lora_base_model = get_peft_model(base_model, peft_config)
-            lora_base_model.print_trainable_parameters()
-        except Exception as e:
-            print(f"Warning attaching LoRA: {e}")
-            lora_base_model = base_model
-
-        # ============================================================
-        # 🔥 FIX DEFINITIVO V4: MANUAL FORWARD INJECTION
-        # ============================================================
-
+        # 3. WRAPPER MANUAL (La clave del éxito)
+        # Este wrapper envuelve al modelo y le OBLIGA a calcular la pérdida (loss)
+        # solucionando el error "_forward_unimplemented".
         class Qwen3TrainWrapper(nn.Module):
             def __init__(self, model):
                 super().__init__()
                 self.model = model
                 self.config = model.config
-
-                # Intentamos encontrar el backbone directamente
-                # En Qwen2/3, suele ser self.model.model
-                if hasattr(model, "model"):
-                    self.backbone = model.model
-                elif hasattr(model, "transformer"):
-                    self.backbone = model.transformer
-                else:
-                    # Si no lo encontramos, usamos el modelo entero pero
-                    # forzamos los argumentos en el forward
-                    self.backbone = model
+                # Intentamos conectar directamente al cerebro (transformer/model)
+                if hasattr(model, "model"): self.backbone = model.model
+                elif hasattr(model, "transformer"): self.backbone = model.transformer
+                else: self.backbone = model
 
             def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
-                # 1. Ejecutar el modelo
-                # Los modelos de HF suelen devolver CausalLMOutputWithPast
-                try:
-                    outputs = self.backbone(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        return_dict=True,
-                        output_hidden_states=False,
-                        # Truco: Si es el wrapper de inferencia, a veces falla si no le das estos
-                        # pasamos dummy args si es necesario, pero probamos limpio primero
-                    )
-                except TypeError:
-                    # Si falla, probamos llamando al 'model' interno si existe
-                    if hasattr(self.model, "model"):
-                        outputs = self.model.model(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask
-                        )
-                    else:
-                        raise
+                # Llamada al modelo real
+                outputs = self.backbone(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    return_dict=True,
+                    output_hidden_states=False,
+                    use_cache=False
+                )
 
-                # 2. Obtener Logits
-                if hasattr(outputs, "logits"):
-                    logits = outputs.logits
-                elif isinstance(outputs, tuple):
-                    logits = outputs[0]
-                else:
-                    # Si el backbone devuelve hidden_states (sin lm_head)
-                    # Necesitamos proyectar. Esto es un problema si no tenemos la head.
-                    # Asumimos que backbone TIENE la head.
-                    logits = outputs
+                # Gestión robusta de Logits
+                if hasattr(outputs, "logits"): logits = outputs.logits
+                elif isinstance(outputs, tuple): logits = outputs[0]
+                else: logits = outputs
 
-                # 3. Calcular Pérdida (Loss)
+                # Cálculo manual de Loss (CrossEntropy)
                 loss = None
                 if labels is not None:
-                    # Shift para predicción next-token
                     shift_logits = logits[..., :-1, :].contiguous()
                     shift_labels = labels[..., 1:].contiguous()
-
                     loss_fct = nn.CrossEntropyLoss()
-                    loss = loss_fct(
-                        shift_logits.view(-1, shift_logits.size(-1)),
-                        shift_labels.view(-1)
-                    )
+                    loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
                 return {"loss": loss, "logits": logits} if loss is not None else {"logits": logits}
 
-            # Passthrough vital para guardado
             def save_pretrained(self, path):
                 self.model.save_pretrained(path)
 
@@ -3153,61 +3055,53 @@ class Qwen3TrainLoRA:
                 try: return super().__getattr__(name)
                 except AttributeError: return getattr(self.model, name)
 
-        # Envolvemos el modelo YA con LoRA (variable 'lora_base_model' viene de arriba)
-        trainable_model = Qwen3TrainWrapper(lora_base_model)
+        # 4. CONFIGURAR LORA
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=rank,
+            lora_alpha=alpha,
+            lora_dropout=0.05,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        )
 
-        # ============================================================
-        # 3. DATA PREPARATION (Manual Collator)
-        # ============================================================
-        # Load dataset
-        train_dataset = Qwen3PrecomputedDataset(dataset_path)
+        # Aplicar LoRA al modelo base
+        lora_model_raw = get_peft_model(hf_model, peft_config)
+        lora_model_raw.print_trainable_parameters()
 
-        # Custom collator to pack data (Fixes nested lists and padding)
+        # Envolver el modelo LoRA con nuestro wrapper reparador
+        trainable_model = Qwen3TrainWrapper(lora_model_raw)
+
+        # 5. CARGA DE DATOS (Collator Manual)
+        # Importamos la clase dataset que ya tienes en el mismo archivo (o deberías tener)
+        # Asumimos que Qwen3PrecomputedDataset existe en lora_nodes.py
+        try:
+            # Try to get it from global scope first (since it is defined in nodes.py)
+            dataset_cls = globals().get("Qwen3PrecomputedDataset")
+            if not dataset_cls:
+                 # Local fallback if not visible
+                 dataset_cls = Qwen3PrecomputedDataset
+
+            train_dataset = dataset_cls(dataset_path)
+        except Exception:
+             # Last resort fallback assuming class is available in scope
+             train_dataset = Qwen3PrecomputedDataset(dataset_path)
+
         def custom_collate_fn(batch):
-            # Helper to flatten dirty lists (e.g. [[1,2], 3] -> [1,2,3])
-            def flatten_list(x):
-                flat = []
-                for item in x:
-                    if isinstance(item, list):
-                        flat.extend(item)
-                    else:
-                        flat.append(item)
-                return flat
+            # Aplanador de listas
+            def flatten(x): return [item for sublist in x for item in (sublist if isinstance(sublist, list) else [sublist])] if isinstance(x[0], list) else x
 
-            input_ids_list = []
-            labels_list = []
-            mask_list = []
+            input_ids = [torch.tensor(flatten(item['input_ids']), dtype=torch.long) for item in batch]
+            labels = [torch.tensor(flatten(item['labels']), dtype=torch.long) for item in batch]
+            attention_mask = [torch.tensor(flatten(item['attention_mask']), dtype=torch.long) for item in batch]
 
-            for item in batch:
-                # 1. Flatten any weird structure in JSON
-                flat_input = flatten_list(item['input_ids'])
-                flat_label = flatten_list(item['labels'])
-                flat_mask = flatten_list(item['attention_mask'])
+            padded_inputs = pad_sequence(input_ids, batch_first=True, padding_value=0)
+            padded_labels = pad_sequence(labels, batch_first=True, padding_value=-100)
+            padded_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+            return {"input_ids": padded_inputs, "labels": padded_labels, "attention_mask": padded_mask}
 
-                # 2. Convert to clean tensors
-                input_ids_list.append(torch.tensor(flat_input, dtype=torch.long))
-                labels_list.append(torch.tensor(flat_label, dtype=torch.long))
-                mask_list.append(torch.tensor(flat_mask, dtype=torch.long))
-
-            # 3. Dynamic Padding
-            padded_inputs = pad_sequence(input_ids_list, batch_first=True, padding_value=0)
-            # Use -100 for labels so model ignores padding during loss calc
-            padded_labels = pad_sequence(labels_list, batch_first=True, padding_value=-100)
-            padded_mask = pad_sequence(mask_list, batch_first=True, padding_value=0)
-
-            return {
-                "input_ids": padded_inputs,
-                "labels": padded_labels,
-                "attention_mask": padded_mask
-            }
-
-        # ============================================================
-        # 4. TRAINING
-        # ============================================================
+        # 6. EJECUCIÓN
         full_output_dir = os.path.join(save_path, lora_name)
-
-        use_bf16 = (precision == "bf16" or precision == "fp8") # FP8 uses bf16/fp16 for compute
-        use_fp16 = (precision == "fp16")
 
         args = TrainingArguments(
             output_dir=full_output_dir,
@@ -3215,36 +3109,31 @@ class Qwen3TrainLoRA:
             gradient_accumulation_steps=4,
             learning_rate=learning_rate,
             num_train_epochs=epochs,
-            bf16=use_bf16,
-            fp16=use_fp16,
-            logging_steps=5,
-            save_strategy="no", # Solo guardamos al final para ahorrar disco
+            bf16=True, # RTX 3090 / Ampere
+            fp16=False,
+            logging_steps=10,
+            save_strategy="no",
             optim="adamw_torch",
-            remove_unused_columns=False, # Importante para datasets custom
-            report_to="none" # Evita errores de WandB
+            remove_unused_columns=False,
+            report_to="none"
         )
 
         trainer = Trainer(
-            model=trainable_model, # <--- Usamos el wrapper
+            model=trainable_model,
             args=args,
             train_dataset=train_dataset,
-            data_collator=custom_collate_fn, # Usamos nuestro collator manual
+            data_collator=custom_collate_fn,
         )
 
-        print(f"--- 🚀 Starting LoRA Training on {model_version} ---")
+        print(f"--- 🚀 Starting Clean LoRA Training ---")
         trainer.train()
 
-        # Guardar resultado final
         final_save_path = os.path.join(full_output_dir, "final")
-        # Guardamos el modelo interno (LoRA) no el wrapper
-        lora_base_model.save_pretrained(final_save_path)
-        print(f"✅ LoRA saved to: {final_save_path}")
+        lora_model_raw.save_pretrained(final_save_path)
+        print(f"✅ LoRA guardado exitosamente en: {final_save_path}")
 
-        # Limpieza de memoria VRAM
-        del trainer
-        del trainable_model
-        del lora_base_model
-        del base_model
+        # Limpieza
+        del trainer, lora_model_raw, hf_model, trainable_model
         torch.cuda.empty_cache()
 
         return (final_save_path,)
