@@ -2959,10 +2959,10 @@ class Qwen3TrainLoRA:
                 "rank": ("INT", {"default": 32, "min": 8, "max": 128}),
                 "alpha": ("INT", {"default": 64, "min": 8, "max": 256}),
                 "epochs": ("INT", {"default": 3, "min": 1, "max": 100}),
-                "precision": (["bf16", "fp16", "fp32", "fp8"], {"default": "bf16"}),
                 "batch_size": ("INT", {"default": 1, "min": 1, "max": 16}),
                 "learning_rate": ("FLOAT", {"default": 2e-4, "min": 1e-6, "max": 1e-3, "step": 1e-5}),
                 "save_path": ("STRING", {"default": "loras/"}),
+                "precision": (["bf16", "fp16", "fp32", "fp8"], {"default": "bf16"}),
             }
         }
 
@@ -2971,7 +2971,7 @@ class Qwen3TrainLoRA:
     FUNCTION = "train"
     CATEGORY = "Qwen3-TTS/Training"
 
-    def train(self, model_version, dataset_path, lora_name, rank, alpha, epochs, precision, batch_size, learning_rate, save_path):
+    def train(self, model_version, dataset_path, lora_name, rank, alpha, epochs, batch_size, learning_rate, save_path, precision):
         from transformers import AutoModelForCausalLM, TrainingArguments, Trainer, AutoConfig
         from torch.nn.utils.rnn import pad_sequence
         import torch
