@@ -2945,19 +2945,23 @@ class Qwen3TrainLoRA:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "model": ("QWEN3_MODEL",),
+                # 1. MODEL SELECTOR (Independent of Loader)
+                "model_version": (
+                    [
+                        "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+                        "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+                    ],
+                    {"default": "Qwen/Qwen3-TTS-12Hz-1.7B-Base"}
+                ),
+
                 "dataset_path": ("STRING", {"default": "output/dataset_codes.jsonl"}),
                 "lora_name": ("STRING", {"default": "my_voice_lora"}),
                 "rank": ("INT", {"default": 32, "min": 8, "max": 128}),
                 "alpha": ("INT", {"default": 64, "min": 8, "max": 256}),
                 "epochs": ("INT", {"default": 3, "min": 1, "max": 100}),
-                "precision": (["bf16", "fp16", "fp32"], {"default": "bf16"}),
                 "batch_size": ("INT", {"default": 1, "min": 1, "max": 16}),
                 "learning_rate": ("FLOAT", {"default": 2e-4, "min": 1e-6, "max": 1e-3, "step": 1e-5}),
                 "save_path": ("STRING", {"default": "loras/"}),
-            },
-            "optional": {
-                "model_name_prefix": ("STRING", {"default": "", "multiline": False, "forceInput": True}),
             }
         }
 
@@ -2966,210 +2970,110 @@ class Qwen3TrainLoRA:
     FUNCTION = "train"
     CATEGORY = "Qwen3-TTS/Training"
 
-    def train(self, model, dataset_path, lora_name, rank, alpha, epochs, precision, batch_size, learning_rate, save_path, model_name_prefix="", unique_id=None):
+    def train(self, model_version, dataset_path, lora_name, rank, alpha, epochs, batch_size, learning_rate, save_path):
+        from transformers import AutoModelForCausalLM, TrainingArguments, Trainer
+        from torch.nn.utils.rnn import pad_sequence
+        import torch
         import json
         import types
 
-        # ============================================================
-        # 🔍 FIX V4: THE DRILL (Wrapper Piercer)
-        # ============================================================
-
-        def find_base_model(obj):
-            current_obj = obj
-            print(f" 🕵️ Inspecting object type: {type(current_obj)}")
-
-            # --- EXPANDED BLACKLIST ---
-            # Classes known to NOT implement training 'forward' (loss calculation)
-            blacklist_names = [
-                "Qwen3TTSModel",
-                "Qwen3TTSForConditionalGeneration", # <--- THE CULPRIT
-                "PeftModel",
-                "LoraModel",
-                "DistributedDataParallel"
-            ]
-
-            # Attributes where the real model is usually hidden
-            candidates = ["model", "llm", "transformer", "language_model", "backbone", "base_model"]
-
-            for i in range(10): # Max depth 10
-                obj_type_str = str(type(current_obj))
-
-                # 1. Blacklist Check
-                is_blacklisted = any(b in obj_type_str for b in blacklist_names)
-
-                if is_blacklisted:
-                    print(f"   🚫 Blacklisted wrapper detected: {obj_type_str}")
-
-                # 2. If NOT blacklisted and looks valid, return it
-                # The real model is usually 'Qwen2AudioForConditionalGeneration' or 'Qwen2ForCausalLM'
-                elif hasattr(current_obj, "forward") and hasattr(current_obj, "config"):
-                    # Double check: try to inspect forward signature
-                    import inspect
-                    try:
-                        sig = inspect.signature(current_obj.forward)
-                        if "input_ids" in sig.parameters:
-                            print(f" ✅ TRUE BRAIN FOUND at depth {i}: {type(current_obj)}")
-                            return current_obj
-                        else:
-                            print(f"   ⚠️ Object has forward() but no 'input_ids' arg. Digging deeper...")
-                    except:
-                        # If we can't inspect, assume it's good if it passed blacklist
-                        print(f" ✅ TRUE BRAIN FOUND (Signature check skipped) at depth {i}: {type(current_obj)}")
-                        return current_obj
-
-                # 3. Dig deeper
-                found_next = False
-                # Try candidates
-                for name in candidates:
-                    if hasattr(current_obj, name):
-                        print(f"      ⬇️  Found attribute '.{name}', unpacking...")
-                        current_obj = getattr(current_obj, name)
-                        found_next = True
-                        break
-
-                # If no candidates, try brute force on _modules
-                if not found_next:
-                    if hasattr(current_obj, "_modules") and len(current_obj._modules) > 0:
-                        first_key = list(current_obj._modules.keys())[0]
-                        print(f"      ⬇️  Trying first module child '.{first_key}'...")
-                        current_obj = current_obj._modules[first_key]
-                        found_next = True
-                    else:
-                        print(f"   ❌ Stuck! No inner models found. Keys: {dir(current_obj)[:10]}")
-                        break
-
-            return current_obj
-
-        # Ejecutamos la búsqueda
-        hf_model = find_base_model(model)
-
-        # DIAGNÓSTICO DE ÚLTIMO RECURSO
-        print(f" 🎯 Target locked on: {type(hf_model)}")
-        if not hasattr(hf_model, "config"):
-             print(f" ❌ CRITICAL: The target object {type(hf_model)} allows no config access. Keys: {dir(hf_model)[:20]}...")
+        print(f"🔄 [Qwen3-TTS] Clean Model Load Init: {model_version}")
+        print("   -> Bypassing inference wrappers. Loading clean base model...")
 
         # ============================================================
-        # 🛡️ THE NUCLEAR PATCH (FIXES DTYPE AND SERIALIZATION)
+        # 1. CLEAN MODEL LOAD (AutoModelForCausalLM)
         # ============================================================
+        # This solves "_forward_unimplemented" by loading the standard HF class directly
+        try:
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                model_version,
+                device_map="auto",
+                torch_dtype=torch.bfloat16, # Optimized for RTX 3090
+                trust_remote_code=True,
+                attn_implementation="flash_attention_2" # Max speed
+            )
+            print("⚡ [Qwen3-TTS] Flash Attention 2 enabled.")
+        except Exception as e:
+            print(f"⚠️ [Qwen3-TTS] Flash Attention not available ({e}). Using standard attention.")
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                model_version,
+                device_map="auto",
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True
+            )
 
-        # 1. Disable Cache (Mandatory for training)
+        # Vital Training Config
         hf_model.config.use_cache = False
-
-        # 2. Fix Dtype (Previous fix)
+        # Ensure model knows its dtype (avoids 'dtype' error)
         if not hasattr(hf_model.config, "dtype"):
-            hf_model.config.dtype = getattr(hf_model, "dtype", torch.float16)
-
-        # 3. CONFIG SANITIZER (Fixes TypeError: Object of type method is not JSON serializable)
-        # Scan config and DELETE any attribute that is a callable/method
-        keys_to_delete = []
-        for key, value in hf_model.config.__dict__.items():
-            if callable(value): # If it's a function, it kills JSON serialization
-                print(f"⚠️ [LoRA Fix] Removing non-serializable method from config: '{key}'")
-                keys_to_delete.append(key)
-
-        for k in keys_to_delete:
-            delattr(hf_model.config, k)
-
-        # 4. OVERRIDE JSON SAVE FUNCTION
-        # Force model to use a bulletproof save function.
-        # If it finds something it can't save, skip it instead of crashing.
-        def bulletproof_to_json_string(*args, **kwargs):
-            safe_config = {}
-            # Try to get raw dict
-            try:
-                raw_dict = hf_model.config.to_dict()
-            except:
-                raw_dict = hf_model.config.__dict__
-
-            # Filter for serializable items only
-            for k, v in raw_dict.items():
-                try:
-                    json.dumps({k: v}) # Litmus test
-                    safe_config[k] = v
-                except TypeError:
-                    # If fails, just skip logging it and continue
-                    pass
-            return json.dumps(safe_config, indent=2)
-
-        # Inject our safe function into model config
-        hf_model.config.to_json_string = bulletproof_to_json_string
-        hf_model.config.to_diff_dict = lambda: hf_model.config.to_dict() # Secondary patch
-
-        # ============================================================
+            hf_model.config.dtype = torch.bfloat16
 
         # Enable Gradients
         hf_model.train()
         if hasattr(hf_model, "gradient_checkpointing_enable"):
             hf_model.gradient_checkpointing_enable()
 
-        # Configure LoRA
+        # ============================================================
+        # 2. LORA CONFIGURATION
+        # ============================================================
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False,
             r=rank,
             lora_alpha=alpha,
             lora_dropout=0.05,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+            target_modules=[
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj"
+            ]
         )
 
+        # Inject LoRA
         try:
             lora_model = get_peft_model(hf_model, peft_config)
             lora_model.print_trainable_parameters()
         except Exception as e:
-            print(f"Warning attaching LoRA (might be already attached): {e}")
+            print(f"Warning attaching LoRA: {e}")
             lora_model = hf_model
 
-        # Load Dataset
+        # ============================================================
+        # 3. DATA PREPARATION (Manual Collator)
+        # ============================================================
+        # Load dataset
         train_dataset = Qwen3PrecomputedDataset(dataset_path)
-        if len(train_dataset) == 0:
-            return ("Error: Dataset Empty",)
 
-        # Construct folder name: {model_name}-{lora_name} if prefix exists
-        final_lora_name = lora_name
-        if model_name_prefix and model_name_prefix.strip():
-             final_lora_name = f"{model_name_prefix.strip()}-{lora_name}"
-
-        full_output_dir = os.path.join(save_path, final_lora_name)
-        print(f"[Qwen3-TTS] LoRA Training Output Directory: {full_output_dir}")
-
-        # Determine precision flags
-        use_bf16 = (precision == "bf16")
-        use_fp16 = (precision == "fp16")
-        # fp32 is default if both are False
-
-        args = TrainingArguments(
-            output_dir=full_output_dir,
-            per_device_train_batch_size=batch_size,
-            gradient_accumulation_steps=4,
-            learning_rate=learning_rate,
-            num_train_epochs=epochs,
-            bf16=use_bf16,
-            fp16=use_fp16,
-            logging_steps=5,
-            save_strategy="no", # Save only at end to save space
-            optim="adamw_torch",
-            remove_unused_columns=False,
-            report_to="none",
-            skip_memory_metrics=True # Avoid trainer trying to log memory with complex objects
-        )
-
-        # Dynamic Padding Collator
-
-        # 1. Define Custom Manual Collator (No Tokenizer needed)
+        # Custom collator to pack data (Fixes nested lists and padding)
         def custom_collate_fn(batch):
-            from torch.nn.utils.rnn import pad_sequence
+            # Helper to flatten dirty lists (e.g. [[1,2], 3] -> [1,2,3])
+            def flatten_list(x):
+                flat = []
+                for item in x:
+                    if isinstance(item, list):
+                        flat.extend(item)
+                    else:
+                        flat.append(item)
+                return flat
 
-            # Extract lists from batch
-            input_ids = [item['input_ids'] for item in batch]
-            labels = [item['labels'] for item in batch]
-            attention_mask = [item['attention_mask'] for item in batch]
+            input_ids_list = []
+            labels_list = []
+            mask_list = []
 
-            # Dynamic Padding
-            # batch_first=True is vital for Transformers
-            # padding_value=0 for inputs, -100 for labels (ignore index)
-            padded_inputs = pad_sequence(input_ids, batch_first=True, padding_value=0)
-            padded_labels = pad_sequence(labels, batch_first=True, padding_value=-100)
-            padded_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+            for item in batch:
+                # 1. Flatten any weird structure in JSON
+                flat_input = flatten_list(item['input_ids'])
+                flat_label = flatten_list(item['labels'])
+                flat_mask = flatten_list(item['attention_mask'])
+
+                # 2. Convert to clean tensors
+                input_ids_list.append(torch.tensor(flat_input, dtype=torch.long))
+                labels_list.append(torch.tensor(flat_label, dtype=torch.long))
+                mask_list.append(torch.tensor(flat_mask, dtype=torch.long))
+
+            # 3. Dynamic Padding
+            padded_inputs = pad_sequence(input_ids_list, batch_first=True, padding_value=0)
+            # Use -100 for labels so model ignores padding during loss calc
+            padded_labels = pad_sequence(labels_list, batch_first=True, padding_value=-100)
+            padded_mask = pad_sequence(mask_list, batch_first=True, padding_value=0)
 
             return {
                 "input_ids": padded_inputs,
@@ -3177,29 +3081,45 @@ class Qwen3TrainLoRA:
                 "attention_mask": padded_mask
             }
 
-        # 2. Configure Trainer with custom collator
+        # ============================================================
+        # 4. TRAINING
+        # ============================================================
+        full_output_dir = os.path.join(save_path, lora_name)
+
+        args = TrainingArguments(
+            output_dir=full_output_dir,
+            per_device_train_batch_size=batch_size,
+            gradient_accumulation_steps=4,
+            learning_rate=learning_rate,
+            num_train_epochs=epochs,
+            bf16=True,       # RTX 3090: SÍ soporta bf16 (mejor estabilidad)
+            fp16=False,      # Desactivamos fp16
+            logging_steps=5,
+            save_strategy="no", # Solo guardamos al final para ahorrar disco
+            optim="adamw_torch",
+            remove_unused_columns=False, # Importante para datasets custom
+            report_to="none" # Evita errores de WandB
+        )
+
         trainer = Trainer(
             model=lora_model,
             args=args,
             train_dataset=train_dataset,
-            data_collator=custom_collate_fn,
+            data_collator=custom_collate_fn, # Usamos nuestro collator manual
         )
 
-        print(f"--- Starting LoRA Training for {epochs} epochs ---")
+        print(f"--- 🚀 Starting LoRA Training on {model_version} ---")
         trainer.train()
 
-        # Save Final Adapter
+        # Guardar resultado final
         final_save_path = os.path.join(full_output_dir, "final")
-        try:
-            lora_model.save_pretrained(final_save_path)
-        except Exception as e:
-            print(f"Error saving pretrained: {e}")
-            # Manual fallback
-            os.makedirs(final_save_path, exist_ok=True)
-            torch.save(lora_model.state_dict(), os.path.join(final_save_path, "adapter_model.bin"))
+        lora_model.save_pretrained(final_save_path)
+        print(f"✅ LoRA saved to: {final_save_path}")
 
-        # Cleanup
+        # Limpieza de memoria VRAM
         del trainer
+        del lora_model
+        del hf_model
         torch.cuda.empty_cache()
 
         return (final_save_path,)
