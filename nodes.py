@@ -2975,6 +2975,7 @@ class Qwen3TrainLoRA:
         from transformers import AutoModelForCausalLM, TrainingArguments, Trainer, AutoConfig
         from torch.nn.utils.rnn import pad_sequence
         import torch
+        import torch.nn as nn
         import json
         import types
 
@@ -2989,9 +2990,6 @@ class Qwen3TrainLoRA:
             from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
 
             AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
-            # Nota: Si Qwen3TTSForConditionalGeneration no soporta entrenamiento,
-            # esto podría causar _forward_unimplemented más adelante.
-            # Pero es necesario para que AutoModel cargue algo.
             AutoModelForCausalLM.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
             print("✅ Configuración Qwen3TTS registrada manualmente.")
         except ImportError:
@@ -3018,7 +3016,7 @@ class Qwen3TrainLoRA:
         # 2. CLEAN MODEL LOAD (AutoModelForCausalLM)
         # ============================================================
         try:
-            hf_model = AutoModelForCausalLM.from_pretrained(
+            base_model = AutoModelForCausalLM.from_pretrained(
                 model_version,
                 device_map="auto",
                 torch_dtype=torch_dtype,
@@ -3029,7 +3027,7 @@ class Qwen3TrainLoRA:
             print("⚡ [Qwen3-TTS] Flash Attention 2 enabled.")
         except Exception as e:
             print(f"⚠️ [Qwen3-TTS] Flash Attention not available ({e}). Using standard attention.")
-            hf_model = AutoModelForCausalLM.from_pretrained(
+            base_model = AutoModelForCausalLM.from_pretrained(
                 model_version,
                 device_map="auto",
                 torch_dtype=torch_dtype,
@@ -3038,28 +3036,25 @@ class Qwen3TrainLoRA:
             )
 
         # Vital Training Config
-        hf_model.config.use_cache = False
+        base_model.config.use_cache = False
         # Ensure model knows its dtype (avoids 'dtype' error)
-        if not hasattr(hf_model.config, "dtype"):
-            hf_model.config.dtype = torch_dtype
+        if not hasattr(base_model.config, "dtype"):
+            base_model.config.dtype = torch_dtype
 
         # Prepare for k-bit training if needed
         if precision == "fp8":
             from peft import prepare_model_for_kbit_training
-            hf_model = prepare_model_for_kbit_training(hf_model)
+            base_model = prepare_model_for_kbit_training(base_model)
 
-        # Enable Gradients
-        # For kbit, gradients are handled by prepare_model_for_kbit_training usually, but let's ensure.
+        # Enable Gradients (if not fp8 which handles it inside prepare_model)
         if precision != "fp8":
-            hf_model.train()
+            base_model.train()
 
-        if hasattr(hf_model, "gradient_checkpointing_enable"):
-            hf_model.gradient_checkpointing_enable()
-        if hasattr(hf_model, "gradient_checkpointing_enable"):
-            hf_model.gradient_checkpointing_enable()
+        if hasattr(base_model, "gradient_checkpointing_enable"):
+            base_model.gradient_checkpointing_enable()
 
         # ============================================================
-        # 2. LORA CONFIGURATION
+        # 3. LORA CONFIGURATION & WRAPPER
         # ============================================================
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
@@ -3073,13 +3068,64 @@ class Qwen3TrainLoRA:
             ]
         )
 
-        # Inject LoRA
+        # Inject LoRA on Base Model
         try:
-            lora_model = get_peft_model(hf_model, peft_config)
-            lora_model.print_trainable_parameters()
+            lora_base_model = get_peft_model(base_model, peft_config)
+            lora_base_model.print_trainable_parameters()
         except Exception as e:
             print(f"Warning attaching LoRA: {e}")
-            lora_model = hf_model
+            lora_base_model = base_model
+
+        # 🔥 FIX DEFINITIVO: Wrapper de Entrenamiento
+        # Esto soluciona el error "_forward_unimplemented" calculando la loss manualmente.
+        class Qwen3TrainWrapper(nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
+                self.config = model.config # Engañamos al Trainer para que crea que es un modelo HF
+
+            def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
+                # 1. Pasamos los datos al modelo interno (que es un LLM)
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=False,
+                    return_dict=True
+                )
+
+                logits = outputs.logits
+                loss = None
+
+                # 2. CALCULAR PÉRDIDA MANUALMENTE (Si hay etiquetas)
+                if labels is not None:
+                    # Desplazar logits y labels para predicción next-token
+                    # Logits: [B, T, V] -> predecimos t+1 desde t
+                    # Labels: [B, T] -> target real en t+1
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()
+
+                    # Calcular CrossEntropy
+                    loss_fct = nn.CrossEntropyLoss()
+                    loss = loss_fct(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1)
+                    )
+
+                # Devolver formato dict-like que espera HuggingFace Trainer
+                return {"loss": loss, "logits": logits} if loss is not None else {"logits": logits}
+
+            # Passthrough para métodos de guardado
+            def save_pretrained(self, path):
+                self.model.save_pretrained(path)
+
+            def __getattr__(self, name):
+                try:
+                    return super().__getattr__(name)
+                except AttributeError:
+                    return getattr(self.model, name)
+
+        # Envolvemos el modelo YA con LoRA
+        trainable_model = Qwen3TrainWrapper(lora_base_model)
 
         # ============================================================
         # 3. DATA PREPARATION (Manual Collator)
@@ -3150,7 +3196,7 @@ class Qwen3TrainLoRA:
         )
 
         trainer = Trainer(
-            model=lora_model,
+            model=trainable_model, # <--- Usamos el wrapper
             args=args,
             train_dataset=train_dataset,
             data_collator=custom_collate_fn, # Usamos nuestro collator manual
@@ -3161,13 +3207,15 @@ class Qwen3TrainLoRA:
 
         # Guardar resultado final
         final_save_path = os.path.join(full_output_dir, "final")
-        lora_model.save_pretrained(final_save_path)
+        # Guardamos el modelo interno (LoRA) no el wrapper
+        lora_base_model.save_pretrained(final_save_path)
         print(f"✅ LoRA saved to: {final_save_path}")
 
         # Limpieza de memoria VRAM
         del trainer
-        del lora_model
-        del hf_model
+        del trainable_model
+        del lora_base_model
+        del base_model
         torch.cuda.empty_cache()
 
         return (final_save_path,)
