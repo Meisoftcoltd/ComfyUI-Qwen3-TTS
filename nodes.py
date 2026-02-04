@@ -1234,7 +1234,7 @@ class Qwen3AudioToDataset:
         }
 
     RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("dataset_path",)
+    RETURN_NAMES = ("jsonl_path",)
     OUTPUT_NODE = True
     FUNCTION = "process"
     CATEGORY = "Qwen3-TTS/Dataset"
@@ -1348,12 +1348,35 @@ class Qwen3AudioToDataset:
 
         print(f"[Qwen3-TTS] Process finished. Generated {total_clips} clips in {output_folder}")
 
+        # Generate dataset.jsonl for training
+        jsonl_path = os.path.join(output_folder, "dataset.jsonl")
+        print(f"[Qwen3-TTS] Generating training index: {jsonl_path}")
+
+        with open(jsonl_path, 'w', encoding='utf-8') as f:
+            for filename in os.listdir(output_folder):
+                if filename.endswith(".wav"):
+                    wav_path = os.path.abspath(os.path.join(output_folder, filename))
+                    txt_path = os.path.splitext(wav_path)[0] + ".txt"
+
+                    if os.path.exists(txt_path):
+                        with open(txt_path, 'r', encoding='utf-8') as tf:
+                            text_content = tf.read().strip()
+
+                        if text_content:
+                            entry = {
+                                "audio": wav_path,
+                                "text": text_content
+                            }
+                            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        print(f"[Qwen3-TTS] Dataset JSONL created successfully.")
+
         # Clean up VRAM
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        return (output_folder,)
+        return (jsonl_path,)
 
 
 class Qwen3LoadDatasetAudio:
@@ -2978,17 +3001,16 @@ class Qwen3TrainLoRA:
 
         print(f"🔄 [Qwen3-TTS] Iniciando Entrenamiento (Intento Definitivo v2): {model_version}")
 
-        # 1. FIX DE CONFIGURACIÓN: Registrar manualmente para evitar errores de carga
+        # 1. FIX DE CONFIGURACIÓN
         try:
             from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
             from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
             AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
             AutoModelForCausalLM.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
-            print("✅ Configuración Qwen3TTS registrada manualmente.")
         except ImportError:
-            print("⚠️ No se pudo importar la config localmente. Confiando en remote_code.")
+            pass
 
-        # 2. CARGA DEL MODELO BASE (CLEAN LOAD)
+        # 2. CARGA DEL MODELO BASE
         torch_dtype = torch.bfloat16 if precision == "bf16" else (torch.float16 if precision == "fp16" else torch.float32)
 
         try:
@@ -3202,10 +3224,37 @@ class Qwen3TrainLoRA:
 class Qwen3ApplyLoRA:
     @classmethod
     def INPUT_TYPES(s):
+        # Scan for LoRAs
+        loras = []
+        scan_paths = [
+            os.path.abspath("loras"),
+            os.path.join(folder_paths.models_dir, "loras"),
+            os.path.join(folder_paths.models_dir, "loras", "qwen3-tts")
+        ]
+
+        for base_path in scan_paths:
+            if os.path.exists(base_path):
+                for item in os.listdir(base_path):
+                    item_path = os.path.join(base_path, item)
+                    if os.path.isdir(item_path):
+                        # Check for adapter config or model
+                        if os.path.exists(os.path.join(item_path, "adapter_config.json")) or \
+                           os.path.exists(os.path.join(item_path, "adapter_model.safetensors")) or \
+                           os.path.exists(os.path.join(item_path, "final")):
+                             loras.append(item)
+
+                        # Also check inside "final" subfolder if present (common in our training script)
+                        if os.path.exists(os.path.join(item_path, "final", "adapter_config.json")):
+                            loras.append(f"{item}/final")
+
+        loras = sorted(list(set(loras)))
+        if not loras:
+            loras = ["No LoRAs found in loras/ folder"]
+
         return {
             "required": {
                 "model": ("QWEN3_MODEL",),
-                "lora_path": ("STRING", {"default": "loras/my_voice_lora/final"}),
+                "lora_name": (loras,),
             }
         }
 
@@ -3214,16 +3263,43 @@ class Qwen3ApplyLoRA:
     FUNCTION = "apply_lora"
     CATEGORY = "Qwen3-TTS/Inference"
 
-    def apply_lora(self, model, lora_path):
-        if not os.path.exists(lora_path):
-            print(f"WARNING: LoRA path invalid: {lora_path}")
+    def apply_lora(self, model, lora_name):
+        if lora_name == "No LoRAs found in loras/ folder":
+            print("WARNING: No LoRA selected.")
             return (model,)
+
+        # Resolve path
+        lora_path = None
+        scan_paths = [
+            os.path.abspath("loras"),
+            os.path.join(folder_paths.models_dir, "loras"),
+            os.path.join(folder_paths.models_dir, "loras", "qwen3-tts")
+        ]
+
+        for base_path in scan_paths:
+            candidate = os.path.join(base_path, lora_name)
+            if os.path.exists(candidate):
+                lora_path = candidate
+                break
+
+        if not lora_path or not os.path.exists(lora_path):
+            print(f"WARNING: LoRA path not found: {lora_name}")
+            return (model,)
+
+        # Auto-resolve 'final' subfolder if selected root doesn't have config
+        if not os.path.exists(os.path.join(lora_path, "adapter_config.json")) and \
+           os.path.exists(os.path.join(lora_path, "final", "adapter_config.json")):
+            lora_path = os.path.join(lora_path, "final")
+            print(f"Auto-resolved LoRA path to: {lora_path}")
 
         print(f"Loading LoRA Adapter from: {lora_path}")
         hf_model = model.model if hasattr(model, 'model') else model
 
         # Load adapter (creates peft model wrapper)
-        model_with_lora = PeftModel.from_pretrained(hf_model, lora_path, is_trainable=False)
+        try:
+            model_with_lora = PeftModel.from_pretrained(hf_model, lora_path, is_trainable=False)
+        except Exception as e:
+             raise ValueError(f"Failed to load LoRA from {lora_path}: {e}")
 
         # Re-wrap for ComfyUI
         if hasattr(model, 'model'):
