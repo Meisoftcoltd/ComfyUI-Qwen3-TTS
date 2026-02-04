@@ -3076,53 +3076,102 @@ class Qwen3TrainLoRA:
             print(f"Warning attaching LoRA: {e}")
             lora_base_model = base_model
 
-        # 🔥 FIX DEFINITIVO: Wrapper de Entrenamiento
-        # Esto soluciona el error "_forward_unimplemented" calculando la loss manualmente.
+        # ============================================================
+        # 🔥 FIX DEFINITIVO V2: SMART WRAPPER (Auto-Discovery)
+        # ============================================================
+
         class Qwen3TrainWrapper(nn.Module):
             def __init__(self, model):
                 super().__init__()
-                self.model = model
-                self.config = model.config # Engañamos al Trainer para que crea que es un modelo HF
+                # En lugar de guardar el modelo tal cual, buscamos el "cerebro"
+                self.model_original = model # Guardamos ref original para save_pretrained
+                self.backbone = None
+
+                print("🔍 [Smart Wrapper] Buscando el LLM interno...")
+
+                # 1. Intentos por nombre conocido
+                # OJO: PeftModel envuelve al modelo en base_model.model
+                if hasattr(model, "base_model") and hasattr(model.base_model, "model"):
+                     # Caso LoRA
+                     root = model.base_model.model
+                else:
+                     root = model
+
+                if hasattr(root, "model"):
+                    print("   -> Encontrado atributo '.model'")
+                    self.backbone = root.model
+                elif hasattr(root, "transformer"):
+                    print("   -> Encontrado atributo '.transformer'")
+                    self.backbone = root.transformer
+                elif hasattr(root, "llm"):
+                    print("   -> Encontrado atributo '.llm'")
+                    self.backbone = root.llm
+                else:
+                    # 2. Búsqueda por fuerza bruta (el hijo más gordo)
+                    print("   ⚠️ No se encontraron atributos estándar. Buscando por tamaño...")
+                    max_params = 0
+                    for name, child in root.named_children():
+                        try:
+                            params = sum(p.numel() for p in child.parameters())
+                            print(f"      - Candidato '{name}': {params/1e6:.1f}M parámetros")
+                            if params > max_params:
+                                max_params = params
+                                self.backbone = child
+                        except:
+                            pass
+
+                if self.backbone is None:
+                    # Si falla todo, usamos el modelo original y rezamos
+                    print("   ❌ No se pudo aislar el backbone. Usando modelo original.")
+                    self.backbone = model
+                else:
+                    print(f"   ✅ Backbone identificado: {type(self.backbone)}")
+
+                # Guardamos la config para engañar al Trainer
+                self.config = model.config
 
             def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
-                # 1. Pasamos los datos al modelo interno (que es un LLM)
-                outputs = self.model(
+                # IMPORTANTE: Llamamos a self.backbone, NO a self.model
+                # El backbone (Qwen2Model) sí sabe qué hacer con input_ids
+                outputs = self.backbone(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     output_hidden_states=False,
-                    return_dict=True
+                    return_dict=True,
+                    **kwargs # Pasamos args extra por si acaso
                 )
 
-                logits = outputs.logits
+                # En modelos CausalLM, los logits suelen estar en outputs[0] o outputs.logits
+                if hasattr(outputs, "logits"):
+                    logits = outputs.logits
+                else:
+                    logits = outputs[0] # Fallback para tuplas
+
                 loss = None
 
-                # 2. CALCULAR PÉRDIDA MANUALMENTE (Si hay etiquetas)
+                # Cálculo de pérdida manual (CrossEntropy)
                 if labels is not None:
-                    # Desplazar logits y labels para predicción next-token
-                    # Logits: [B, T, V] -> predecimos t+1 desde t
-                    # Labels: [B, T] -> target real en t+1
+                    # Desplazamos los tokens para predecir el siguiente
                     shift_logits = logits[..., :-1, :].contiguous()
                     shift_labels = labels[..., 1:].contiguous()
 
-                    # Calcular CrossEntropy
                     loss_fct = nn.CrossEntropyLoss()
                     loss = loss_fct(
                         shift_logits.view(-1, shift_logits.size(-1)),
                         shift_labels.view(-1)
                     )
 
-                # Devolver formato dict-like que espera HuggingFace Trainer
                 return {"loss": loss, "logits": logits} if loss is not None else {"logits": logits}
 
-            # Passthrough para métodos de guardado
             def save_pretrained(self, path):
-                self.model.save_pretrained(path)
+                # Al guardar, usamos el modelo original (LoRA wrapper)
+                self.model_original.save_pretrained(path)
 
             def __getattr__(self, name):
                 try:
                     return super().__getattr__(name)
                 except AttributeError:
-                    return getattr(self.model, name)
+                    return getattr(self.backbone, name)
 
         # Envolvemos el modelo YA con LoRA
         trainable_model = Qwen3TrainWrapper(lora_base_model)
