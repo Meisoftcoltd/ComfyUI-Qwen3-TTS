@@ -4,23 +4,33 @@ import { api } from "../../scripts/api.js";
 app.registerExtension({
     name: "Qwen3.DatasetPicker",
     async nodeCreated(node, app) {
-        if (node.comfyClass === "Qwen3DatasetFromFolder") {
-            // Find widgets
-            const folderWidget = node.widgets.find(w => w.name === "folder_path");
-            const refAudioWidget = node.widgets.find(w => w.name === "ref_audio_path");
+        // Definitions of which nodes and widgets get pickers
+        // Format: NodeClass: [{ widget: "widget_name", type: "folder" | "file" }]
+        const config = {
+            "Qwen3LoadDatasetAudio": [{ widget: "folder_path", type: "folder" }],
+            "Qwen3LoadAudioFromPath": [{ widget: "audio_path", type: "file" }],
+            "Qwen3SaveAudio": [{ widget: "output_subfolder", type: "folder" }],
+            "Qwen3FineTune": [{ widget: "output_dir", type: "folder" }],
+            "Qwen3TrainLoRA": [{ widget: "save_path", type: "folder" }],
+            "Qwen3DataPrep": [{ widget: "jsonl_path", type: "file" }],
+            "Qwen3ApplyLoRA": [{ widget: "lora_path", type: "folder" }],
+            "Qwen3AudioToDataset": [{ widget: "audio_folder", type: "folder" }]
+        };
 
-            // Add "Select Folder" button
-            node.addWidget("button", "📁 Select Folder", null, () => {
-                showFilePicker(folderWidget, true); // true = directories only
+        if (config[node.comfyClass]) {
+            const targets = config[node.comfyClass];
+
+            targets.forEach(target => {
+                const widget = node.widgets.find(w => w.name === target.widget);
+                if (widget) {
+                    const isFolder = target.type === "folder";
+                    const btnLabel = isFolder ? "📁 Select Folder" : "🎵 Select File";
+
+                    node.addWidget("button", btnLabel, null, () => {
+                        showFilePicker(widget, isFolder);
+                    });
+                }
             });
-
-            // Add "Select Audio" button
-            node.addWidget("button", "🎵 Select Ref Audio", null, () => {
-                showFilePicker(refAudioWidget, false); // false = files allowed
-            });
-
-            // Adjust size to fit new buttons (optional, LiteGraph usually auto-resizes but sometimes needs help)
-            // node.setSize([node.size[0], node.size[1] + 60]);
         }
     }
 });
