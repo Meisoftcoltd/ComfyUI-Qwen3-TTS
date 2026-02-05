@@ -431,41 +431,52 @@ class Qwen3Loader:
         checkpoint_path = None
         local_path_stripped = local_model_path.strip() if local_model_path else ""
 
+        # Robust Path Logic:
+        # 1. Determine the primary target path (either repo download or local path)
+        target_path = None
         if local_path_stripped:
-            speech_tokenizer_path = os.path.join(local_path_stripped, "speech_tokenizer")
-            if os.path.exists(speech_tokenizer_path):
-                model_path = local_path_stripped
-                print(f"Loading full model from: {model_path}")
-            else:
-                # Loading checkpoint over base model
-                checkpoint_path = local_path_stripped
-
-                # If we selected a local model, use that as base
-                if is_local_selection:
-                     model_path = os.path.join(QWEN3_TTS_MODELS_DIR, model_name)
-                else:
-                    # Use repo_id logic
-                    local_path = get_local_model_path(model_name)
-                    if os.path.exists(local_path) and os.listdir(local_path):
-                        model_path = local_path
-                    else:
-                        print(f"Base model not found locally. Downloading {model_name}...")
-                        model_path = download_model_to_comfyui(model_name, source)
-
-                print(f"Loading base model from: {model_path}")
-                print(f"Will apply checkpoint from: {checkpoint_path}")
+            target_path = local_path_stripped
+        elif is_local_selection:
+            # Check both new and old dirs for local model
+            p1 = os.path.join(QWEN3_TTS_MODELS_DIR, model_name)
+            p2 = os.path.join(OLD_QWEN3_TTS_MODELS_DIR, model_name)
+            if os.path.exists(p1): target_path = p1
+            elif os.path.exists(p2): target_path = p2
+            else: target_path = p1 # Default fallback
         else:
-            if is_local_selection:
-                model_path = os.path.join(QWEN3_TTS_MODELS_DIR, model_name)
-                print(f"Loading local model from ComfyUI models folder: {model_path}")
-            else:
-                local_path = get_local_model_path(model_name)
-                if os.path.exists(local_path) and os.listdir(local_path):
-                    model_path = local_path
-                    print(f"Loading from ComfyUI models folder: {model_path}")
-                else:
-                    print(f"Model not found locally. Downloading {model_name}...")
-                    model_path = download_model_to_comfyui(model_name, source)
+             # Repo ID logic
+             local_path = get_local_model_path(model_name)
+             if os.path.exists(local_path) and os.listdir(local_path):
+                 target_path = local_path
+             else:
+                 print(f"Model not found locally. Downloading {model_name}...")
+                 target_path = download_model_to_comfyui(model_name, source)
+
+        # 2. Check if target_path is a full model (has speech_tokenizer) or just a checkpoint
+        speech_tokenizer_path = os.path.join(target_path, "speech_tokenizer")
+
+        if os.path.exists(speech_tokenizer_path) and os.path.exists(os.path.join(speech_tokenizer_path, "config.json")):
+             # It's a full model
+             model_path = target_path
+             checkpoint_path = None
+             print(f"Loading full model from: {model_path}")
+        else:
+             # It's likely a fine-tune checkpoint (missing tokenizer), treat as checkpoint
+             print(f"Target path '{target_path}' appears to be a checkpoint (missing speech_tokenizer).")
+             checkpoint_path = target_path
+
+             # Fallback to a default base model (1.7B Base)
+             default_base = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+             local_base = get_local_model_path(default_base)
+
+             if os.path.exists(local_base) and os.path.exists(os.path.join(local_base, "speech_tokenizer")):
+                 model_path = local_base
+             else:
+                 print(f"Downloading default base model {default_base} for checkpoint overlay...")
+                 model_path = download_model_to_comfyui(default_base, source)
+
+             print(f"Loading Base Model: {model_path}")
+             print(f"Will apply checkpoint: {checkpoint_path}")
 
         print(f"Loading Qwen3-TTS model on {device} as {dtype}")
 
@@ -647,24 +658,43 @@ class Qwen3LoadFineTuned:
         print(f"[Qwen3-TTS] Using Base Model: {base_model}")
 
         # Resolve Base Model Path
-        if base_model in QWEN3_TTS_MODELS:
-            local_path = get_local_model_path(base_model)
-            if os.path.exists(local_path) and os.listdir(local_path):
-                base_model_path = local_path
-            else:
-                base_model_path = download_model_to_comfyui(base_model, "HuggingFace")
-        else:
-            # Handle "✓ " or "Local: " prefix if present from get_available_models
-            clean_base = base_model.replace("✓ ", "").replace("Local: ", "")
-            # Check if it's a known repo
-            local_path = get_local_model_path(clean_base)
-            if os.path.exists(local_path):
+        # CRITICAL: Ensure we rely on a valid BASE model with tokenizer, NOT the checkpoint folder
+        clean_base = base_model.replace("✓ ", "").replace("Local: ", "")
+
+        # 1. Is it a known repo ID?
+        if clean_base in QWEN3_TTS_MODELS or clean_base in QWEN3_TTS_MODELS.values():
+             local_path = get_local_model_path(clean_base)
+             if os.path.exists(local_path) and os.path.exists(os.path.join(local_path, "config.json")):
                  base_model_path = local_path
-            else:
-                 # Try full path if it's a relative path provided
-                 base_model_path = os.path.join(TTS_MODELS_DIR, clean_base)
-                 if not os.path.exists(base_model_path):
-                     base_model_path = os.path.join(OLD_QWEN3_TTS_MODELS_DIR, clean_base)
+             else:
+                 print(f"[Qwen3-TTS] Downloading missing base model: {clean_base}")
+                 base_model_path = download_model_to_comfyui(clean_base, "HuggingFace")
+        else:
+             # 2. Is it a local folder?
+             # Check if it has "speech_tokenizer" to confirm it's a valid base
+             potential_paths = [
+                 os.path.join(TTS_MODELS_DIR, clean_base),
+                 os.path.join(OLD_QWEN3_TTS_MODELS_DIR, clean_base),
+                 get_local_model_path(clean_base)
+             ]
+
+             base_model_path = None
+             for p in potential_paths:
+                 if os.path.exists(p) and os.path.exists(os.path.join(p, "speech_tokenizer")):
+                     base_model_path = p
+                     break
+
+             if not base_model_path:
+                 # Fallback: Default to 1.7B Base if the user selected a checkpoint by mistake as base
+                 print(f"[Qwen3-TTS] Warning: '{clean_base}' does not appear to be a valid base model (missing speech_tokenizer). Falling back to default Base.")
+                 default_repo = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+                 local_default = get_local_model_path(default_repo)
+                 if os.path.exists(local_default):
+                     base_model_path = local_default
+                 else:
+                     base_model_path = download_model_to_comfyui(default_repo, "HuggingFace")
+
+        print(f"[Qwen3-TTS] Final Base Model Path: {base_model_path}")
 
         if not os.path.exists(base_model_path):
             raise FileNotFoundError(f"Base model path not found: {base_model_path}")
