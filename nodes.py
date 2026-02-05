@@ -2962,7 +2962,9 @@ class Qwen3PrecomputedDataset(Dataset):
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long)
         }
 
-# --- 2. Train LoRA Node ---
+# ==============================================================================
+# CLASE Qwen3TrainLoRA (VERSIÓN v11 - EAGER MODE FORCE)
+# ==============================================================================
 class Qwen3TrainLoRA:
     @classmethod
     def INPUT_TYPES(s):
@@ -2986,44 +2988,81 @@ class Qwen3TrainLoRA:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("lora_path",)
     FUNCTION = "train"
-    CATEGORY = "Qwen3-TTS/Training"
+    CATEGORY = "Qwen3TTS/Training"
 
     def train(self, model_version, dataset_path, lora_name, rank, alpha, epochs, batch_size, learning_rate, save_path):
-        # --- IMPORTACIONES EXPLÍCITAS (FIX NAME ERROR) ---
         import torch
         import torch.nn as nn
         import os
         import json
         import types
+        import sys
         from transformers import AutoModelForCausalLM, TrainingArguments, Trainer, AutoConfig
         from peft import LoraConfig, get_peft_model, TaskType
         from torch.nn.utils.rnn import pad_sequence
 
-        print(f"🔄 [Qwen3-TTS] Starting Training Protocol v4.1 (Hardcoded Patch): {model_version}")
+        # 0. Dataset Class
+        try:
+            from .nodes import Qwen3PrecomputedDataset
+            dataset_cls = Qwen3PrecomputedDataset
+        except ImportError:
+            class Qwen3PrecomputedDataset(torch.utils.data.Dataset):
+                def __init__(self, path):
+                    self.data = []
+                    with open(path, 'r') as f:
+                        for line in f: self.data.append(json.loads(line))
+                def __len__(self): return len(self.data)
+                def __getitem__(self, idx): return self.data[idx]
+            dataset_cls = Qwen3PrecomputedDataset
 
-        # 1. Config
+        print(f"🔄 [Qwen3-TTS] Iniciando Protocolo v11 (Eager Force): {model_version}")
+
+        # 1. FORZAR DESACTIVACIÓN DE FLASH ATTENTION
+        # Mentimos a transformers para que crea que no existe FA2
+        import transformers.utils
+        transformers.utils.is_flash_attn_2_available = lambda: False
+        print("🚫 Flash Attention 2 forzado a OFF (Monkey Patch).")
+
+        # 2. Config & Register
         try:
             from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
             from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
+            # RoPE Patch (Mantenemos esto por seguridad)
+            import qwen_tts.core.models.modeling_qwen3_tts as qwen_module
+
+            def patched_apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+                seq_len = q.shape[2]
+                if cos.shape[2] < seq_len:
+                    repeats = (seq_len // cos.shape[2]) + 1
+                    cos = cos.repeat(1, 1, repeats, 1)[..., :seq_len, :]
+                    sin = sin.repeat(1, 1, repeats, 1)[..., :seq_len, :]
+                elif cos.shape[2] > seq_len:
+                    cos = cos[..., :seq_len, :]
+                    sin = sin[..., :seq_len, :]
+
+                from qwen_tts.core.models.modeling_qwen3_tts import rotate_half
+                q_embed = (q * cos) + (rotate_half(q) * sin)
+                k_embed = (k * cos) + (rotate_half(k) * sin)
+                return q_embed, k_embed
+
+            qwen_module.apply_multimodal_rotary_pos_emb = patched_apply_rotary_pos_emb
+
             AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
             AutoModelForCausalLM.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
-            print("✅ Configuración Qwen3TTS registrada.")
-        except ImportError:
-            print("⚠️ No se pudo importar config local. Se confiará en remote code.")
-            pass
+        except ImportError: pass
 
-        # 2. Load Model
+        # 3. Load Model (EAGER MODE)
         try:
             hf_model = AutoModelForCausalLM.from_pretrained(
                 model_version,
                 device_map="auto",
                 torch_dtype=torch.bfloat16,
                 trust_remote_code=True,
-                attn_implementation="flash_attention_2"
+                attn_implementation="eager" # <--- MODO COMPATIBILIDAD MÁXIMA
             )
-            print("⚡ Flash Attention 2: ENABLED")
+            print("⚡ Attention Mode: EAGER (Standard PyTorch)")
         except:
-            print("⚠️ Flash Attention 2: DISABLED")
+            print("⚠️ Fallback a carga estándar.")
             hf_model = AutoModelForCausalLM.from_pretrained(
                 model_version,
                 device_map="auto",
@@ -3033,97 +3072,88 @@ class Qwen3TrainLoRA:
 
         hf_model.config.use_cache = False
 
+        # 4. Component Extraction & Patching
+        talker = getattr(hf_model, "talker", None)
+        if not talker: raise ValueError("CRITICAL: Talker not found.")
+
+        # Inner backbone
+        backbone = getattr(talker, "model", None)
+        if not backbone: raise ValueError("CRITICAL: Backbone not found.")
+
+        # Embeddings
+        embedding_layer = None
+        for m in backbone.modules():
+            if isinstance(m, nn.Embedding) and m.num_embeddings > 50000:
+                embedding_layer = m; break
+
+        if not embedding_layer: raise ValueError("CRITICAL: Embeddings not found.")
+
+        # Inject Embedding Patch (Fixes initialization crashes)
+        def get_input_embeddings_patch(self): return embedding_layer
+        hf_model.get_input_embeddings = types.MethodType(get_input_embeddings_patch, hf_model)
+        if hasattr(hf_model, "talker"):
+            hf_model.talker.get_input_embeddings = types.MethodType(get_input_embeddings_patch, hf_model.talker)
+
+        # Habilitar gradientes en embeddings MANUALMENTE
+        embedding_layer.weight.requires_grad_(True)
+
+        print("✅ Modelo preparado y parcheado.")
+
         # ============================================================
-        # 💉 THE PATCHING FUNCTION
+        # 🧬 Qwen3Proxy v11: Eager & Safe
         # ============================================================
-        def apply_patches(model_root):
-            print(f"🏥 Applying patch to root object: {type(model_root).__name__}")
-
-            # 1. Find the TALKER (The component throwing the error)
-            talker = None
-            if hasattr(model_root, "talker"):
-                talker = model_root.talker
-            elif hasattr(model_root, "model") and hasattr(model_root.model, "talker"):
-                talker = model_root.model.talker
-
-            if talker is None:
-                print("   ⚠️ Could not find 'talker' attribute. Scanning children...")
-                for name, module in model_root.named_modules():
-                    if "Talker" in type(module).__name__:
-                        talker = module
-                        print(f"   ✅ Found talker in modules: {name}")
-                        break
-
-            if talker is None:
-                print("   ❌ CRITICAL: Talker component not found. Patch cannot be applied.")
-                return
-
-            # 2. Find the EMBEDDINGS (The donor organ)
-            embeddings = None
-            # Check standard path: talker.model.text_embedding
-            if hasattr(talker, "model") and hasattr(talker.model, "text_embedding"):
-                embeddings = talker.model.text_embedding
-                print("   ✅ Found embeddings at: talker.model.text_embedding")
-            else:
-                # Brute force scan inside talker
-                for name, module in talker.named_modules():
-                    if isinstance(module, nn.Embedding) and module.num_embeddings > 50000:
-                        embeddings = module
-                        print(f"   ✅ Found embeddings via scan: {name}")
-                        break
-
-            if embeddings is None:
-                print("   ❌ CRITICAL: Embeddings not found inside talker.")
-                return
-
-            # 3. APPLY THE FIX
-            if not hasattr(talker, "embed_tokens"):
-                talker.embed_tokens = embeddings
-                print("   💉 SUCCESS: Injected 'embed_tokens' into Talker.")
-            else:
-                print("   ℹ️ Talker already has 'embed_tokens'.")
-
-            # 4. Patch get_input_embeddings for PEFT
-            def get_input_embeddings_patch(self):
-                return embeddings
-
-            # Bind to root
-            model_root.get_input_embeddings = types.MethodType(get_input_embeddings_patch, model_root)
-            # Also bind to talker just in case
-            talker.get_input_embeddings = types.MethodType(get_input_embeddings_patch, talker)
-
-        # APPLY PATCH #1 (Before LoRA)
-        apply_patches(hf_model)
-
-        # Force gradients to verify
-        if hasattr(hf_model, "gradient_checkpointing_enable"):
-            hf_model.gradient_checkpointing_enable()
-        if hasattr(hf_model, "enable_input_require_grads"):
-            hf_model.enable_input_require_grads()
-
-        # 3. Wrapper
-        class Qwen3TrainWrapper(nn.Module):
-            def __init__(self, model):
+        class Qwen3Proxy(nn.Module):
+            def __init__(self, backbone_module, embed_module, original_config):
                 super().__init__()
-                self.model = model
-                self.config = model.config
-                if hasattr(model, "talker"): self.backbone = model.talker
-                elif hasattr(model, "model"): self.backbone = model.model
-                else: self.backbone = model
+                self.backbone = backbone_module
+                self.embed = embed_module
+                self.config = original_config
+                if not hasattr(self.backbone, "config"):
+                    self.backbone.config = original_config
+
+            # DIPLOMACIA PARA PEFT
+            def prepare_inputs_for_generation(self, *args, **kwargs): return {}
+            def _validate_model_class(self): pass
+            def _validate_model_kwargs(self, model_kwargs): pass
 
             def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
+                # 1. Embeddings
+                inputs_embeds = self.embed(input_ids)
+
+                # 2. Position IDs
+                batch_size, seq_length = input_ids.shape
+                position_ids = torch.arange(0, seq_length, dtype=torch.long, device=input_ids.device)
+                position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+
+                # 3. Backbone Forward (Qwen2Model)
+                # Al usar Eager mode, esperamos que output sea normal
                 outputs = self.backbone(
-                    input_ids=input_ids,
+                    inputs_embeds=inputs_embeds,
                     attention_mask=attention_mask,
+                    position_ids=position_ids,
                     return_dict=True,
-                    output_hidden_states=False,
                     use_cache=False
                 )
 
-                if hasattr(outputs, "logits"): logits = outputs.logits
-                elif isinstance(outputs, tuple): logits = outputs[0]
-                else: logits = outputs
+                # Qwen2Model devuelve (hidden_states, ...)
+                hidden_states = outputs.last_hidden_state
 
+                # 4. LM Head Projection (Manual)
+                # Buscamos la head dinámicamente en el padre (talker)
+                # Esto es más seguro que guardarla en init
+                logits = hidden_states
+                if hasattr(self.backbone, "lm_head"):
+                    logits = self.backbone.lm_head(hidden_states)
+                elif hasattr(talker, "lm_head"):
+                    logits = talker.lm_head(hidden_states)
+                else:
+                    # Fallback de emergencia: búsqueda global
+                    for m in talker.modules():
+                        if isinstance(m, nn.Linear) and m.out_features == 151936: # Vocab size aprox
+                            logits = m(hidden_states)
+                            break
+
+                # 5. Loss
                 loss = None
                 if labels is not None:
                     shift_logits = logits[..., :-1, :].contiguous()
@@ -3133,14 +3163,21 @@ class Qwen3TrainLoRA:
 
                 return {"loss": loss, "logits": logits} if loss is not None else {"logits": logits}
 
-            def save_pretrained(self, path):
-                self.model.save_pretrained(path)
-
             def __getattr__(self, name):
                 try: return super().__getattr__(name)
-                except AttributeError: return getattr(self.model, name)
+                except AttributeError: return getattr(self.backbone, name)
 
-        # 4. Setup LoRA
+            def get_input_embeddings(self): return self.embed
+            def save_pretrained(self, path): pass
+
+        # 5. Setup Proxy
+        proxy_model = Qwen3Proxy(backbone, embedding_layer, hf_model.config)
+
+        # NOTA: Desactivamos gradient checkpointing para evitar errores de autograd complejos
+        # Con 24GB VRAM y batch=1, debería entrar sin problemas.
+        # proxy_model.gradient_checkpointing_enable()
+
+        # 6. LoRA
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False,
@@ -3150,37 +3187,14 @@ class Qwen3TrainLoRA:
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
         )
 
-        lora_model_raw = get_peft_model(hf_model, peft_config)
-        lora_model_raw.print_trainable_parameters()
+        lora_model = get_peft_model(proxy_model, peft_config)
+        lora_model.print_trainable_parameters()
 
-        # APPLY PATCH #2 (After LoRA - Just to be safe)
-        print("🔄 Re-applying patch after LoRA initialization...")
-        # Often LoRA wraps the base model in .model or .base_model
-        if hasattr(lora_model_raw, "model"):
-            apply_patches(lora_model_raw.model)
-        else:
-            apply_patches(lora_model_raw)
-
-        trainable_model = Qwen3TrainWrapper(lora_model_raw)
-
-        # 5. Dataset
-        try:
-            # Look up Qwen3PrecomputedDataset in globals, fallback to import if needed, or assume it's defined in the file
-            if "Qwen3PrecomputedDataset" in globals():
-                train_dataset = globals()["Qwen3PrecomputedDataset"](dataset_path)
-            else:
-                 # Fallback if class is not in current scope (should not happen if defined above)
-                 print("Warning: Qwen3PrecomputedDataset not in scope, attempting to redefine or fail.")
-                 # If it was defined in the same file previously, it should be available.
-                 train_dataset = Qwen3PrecomputedDataset(dataset_path)
-        except Exception:
-             # Last ditch effort: simple definition if missing (though it should be there from previous code blocks)
-             print("Critical: Qwen3PrecomputedDataset missing. Aborting.")
-             raise
+        # 7. Train
+        train_dataset = dataset_cls(dataset_path)
 
         def custom_collate_fn(batch):
             def flatten(x): return [item for sublist in x for item in (sublist if isinstance(sublist, list) else [sublist])] if isinstance(x[0], list) else x
-
             input_ids = [torch.tensor(flatten(item['input_ids']), dtype=torch.long) for item in batch]
             labels = [torch.tensor(flatten(item['labels']), dtype=torch.long) for item in batch]
             attention_mask = [torch.tensor(flatten(item['attention_mask']), dtype=torch.long) for item in batch]
@@ -3190,7 +3204,6 @@ class Qwen3TrainLoRA:
             padded_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
             return {"input_ids": padded_inputs, "labels": padded_labels, "attention_mask": padded_mask}
 
-        # 6. Train
         full_output_dir = os.path.join(save_path, lora_name)
 
         args = TrainingArguments(
@@ -3209,25 +3222,25 @@ class Qwen3TrainLoRA:
         )
 
         trainer = Trainer(
-            model=trainable_model,
+            model=lora_model,
             args=args,
             train_dataset=train_dataset,
             data_collator=custom_collate_fn,
         )
 
-        print(f"--- 🚀 LAUNCHING TRAINING ---")
+        print(f"--- 🚀 LANZANDO ENTRENAMIENTO (V11 EAGER) ---")
         trainer.train()
 
         final_save_path = os.path.join(full_output_dir, "final")
-        lora_model_raw.save_pretrained(final_save_path)
-        print(f"✅ LoRA Saved: {final_save_path}")
+        lora_model.save_pretrained(final_save_path)
+        print(f"✅ LoRA Guardado: {final_save_path}")
 
-        del trainer, lora_model_raw, hf_model, trainable_model
+        del trainer, lora_model, hf_model, proxy_model
         torch.cuda.empty_cache()
 
         return (final_save_path,)
 
-# --- 3. Apply LoRA Node ---
+
 class Qwen3ApplyLoRA:
     @classmethod
     def INPUT_TYPES(s):
@@ -3244,13 +3257,10 @@ class Qwen3ApplyLoRA:
                 for item in os.listdir(base_path):
                     item_path = os.path.join(base_path, item)
                     if os.path.isdir(item_path):
-                        # Check for adapter config or model
                         if os.path.exists(os.path.join(item_path, "adapter_config.json")) or \
                            os.path.exists(os.path.join(item_path, "adapter_model.safetensors")) or \
                            os.path.exists(os.path.join(item_path, "final")):
                              loras.append(item)
-
-                        # Also check inside "final" subfolder if present (common in our training script)
                         if os.path.exists(os.path.join(item_path, "final", "adapter_config.json")):
                             loras.append(f"{item}/final")
 
@@ -3271,11 +3281,11 @@ class Qwen3ApplyLoRA:
     CATEGORY = "Qwen3-TTS/Inference"
 
     def apply_lora(self, model, lora_name):
+        from peft import PeftModel
         if lora_name == "No LoRAs found in loras/ folder":
             print("WARNING: No LoRA selected.")
             return (model,)
 
-        # Resolve path
         lora_path = None
         scan_paths = [
             os.path.abspath("loras"),
@@ -3289,40 +3299,31 @@ class Qwen3ApplyLoRA:
                 lora_path = candidate
                 break
 
-        if not lora_path or not os.path.exists(lora_path):
-            print(f"WARNING: LoRA path not found: {lora_name}")
+        if not lora_path:
             return (model,)
 
-        # Auto-resolve 'final' subfolder if selected root doesn't have config
         if not os.path.exists(os.path.join(lora_path, "adapter_config.json")) and \
            os.path.exists(os.path.join(lora_path, "final", "adapter_config.json")):
             lora_path = os.path.join(lora_path, "final")
-            print(f"Auto-resolved LoRA path to: {lora_path}")
 
         print(f"Loading LoRA Adapter from: {lora_path}")
         hf_model = model.model if hasattr(model, 'model') else model
 
-        # Load adapter (creates peft model wrapper)
         try:
             model_with_lora = PeftModel.from_pretrained(hf_model, lora_path, is_trainable=False)
         except Exception as e:
              raise ValueError(f"Failed to load LoRA from {lora_path}: {e}")
 
-        # Re-wrap for ComfyUI
         if hasattr(model, 'model'):
             model.model = model_with_lora
             return (model,)
         else:
             return (model_with_lora,)
 
-# --- 4. REGISTER NEW NODES MANUALLY ---
-# This updates the mappings dictionary defined previously in the file
 try:
     NODE_CLASS_MAPPINGS["Qwen3TrainLoRA"] = Qwen3TrainLoRA
     NODE_CLASS_MAPPINGS["Qwen3ApplyLoRA"] = Qwen3ApplyLoRA
-
     NODE_DISPLAY_NAME_MAPPINGS["Qwen3TrainLoRA"] = "🏋️ Qwen3-TTS Train LoRA"
     NODE_DISPLAY_NAME_MAPPINGS["Qwen3ApplyLoRA"] = "🔗 Qwen3-TTS Apply LoRA"
-    print("Qwen3 LoRA Nodes Registered Successfully via Append.")
-except Exception as e:
-    print(f"Error registering LoRA nodes: {e}")
+except Exception:
+    pass
