@@ -2963,7 +2963,7 @@ class Qwen3PrecomputedDataset(Dataset):
         }
 
 # ==============================================================================
-# CLASE Qwen3TrainLoRA (VERSIÓN v6.2 - ROBUST FLATTEN & LM HEAD FIX)
+# CLASE Qwen3TrainLoRA (VERSIÓN v7 - DEEP CORE DRILL)
 # ==============================================================================
 class Qwen3TrainLoRA:
     @classmethod
@@ -2991,6 +2991,7 @@ class Qwen3TrainLoRA:
     CATEGORY = "Qwen3TTS/Training"
 
     def train(self, model_version, dataset_path, lora_name, rank, alpha, epochs, batch_size, learning_rate, save_path):
+        # 1. IMPORTACIONES COMPLETAS
         import torch
         import torch.nn as nn
         import os
@@ -3000,18 +3001,23 @@ class Qwen3TrainLoRA:
         from peft import LoraConfig, get_peft_model, TaskType
         from torch.nn.utils.rnn import pad_sequence
 
-        # Dataset Class Definition (Safety Net)
-        class Qwen3PrecomputedDataset(torch.utils.data.Dataset):
-            def __init__(self, path):
-                self.data = []
-                with open(path, 'r') as f:
-                    for line in f: self.data.append(json.loads(line))
-            def __len__(self): return len(self.data)
-            def __getitem__(self, idx): return self.data[idx]
+        # Dataset Class
+        try:
+            from .nodes import Qwen3PrecomputedDataset
+            dataset_cls = Qwen3PrecomputedDataset
+        except ImportError:
+            class Qwen3PrecomputedDataset(torch.utils.data.Dataset):
+                def __init__(self, path):
+                    self.data = []
+                    with open(path, 'r') as f:
+                        for line in f: self.data.append(json.loads(line))
+                def __len__(self): return len(self.data)
+                def __getitem__(self, idx): return self.data[idx]
+            dataset_cls = Qwen3PrecomputedDataset
 
-        print(f"🔄 [Qwen3-TTS] Iniciando Protocolo v6.2 (Flatten Fix): {model_version}")
+        print(f"🔄 [Qwen3-TTS] Iniciando Protocolo v7 (Deep Core Drill): {model_version}")
 
-        # 1. Config Registration
+        # 2. Config Registration
         try:
             from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
             from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
@@ -3019,7 +3025,7 @@ class Qwen3TrainLoRA:
             AutoModelForCausalLM.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
         except ImportError: pass
 
-        # 2. Load Model
+        # 3. Load Model
         try:
             hf_model = AutoModelForCausalLM.from_pretrained(
                 model_version,
@@ -3041,90 +3047,96 @@ class Qwen3TrainLoRA:
         hf_model.config.use_cache = False
 
         # ============================================================
-        # 💉 FIX PEFT: Inject get_input_embeddings (PRE-GRADIENT)
+        # 💉 FIX PEFT: Inject get_input_embeddings (Global Patch)
         # ============================================================
-        def locate_embeddings(model):
-            # Look inside talker
-            if hasattr(model, "talker"):
-                if hasattr(model.talker, "model") and hasattr(model.talker.model, "text_embedding"):
-                    return model.talker.model.text_embedding
-            # Brute force
-            for module in model.modules():
-                if isinstance(module, nn.Embedding) and module.num_embeddings > 50000:
-                    return module
-            return None
+        # Necesitamos encontrar los embeddings reales para que PEFT no falle al iniciar
+        real_embeddings = None
+        for name, module in hf_model.named_modules():
+            if isinstance(module, nn.Embedding) and module.num_embeddings > 50000:
+                real_embeddings = module
+                break
 
-        donor_embeddings = locate_embeddings(hf_model)
-        if donor_embeddings:
-            def get_input_embeddings_patch(self): return donor_embeddings
+        if real_embeddings:
+            def get_input_embeddings_patch(self): return real_embeddings
+            # Parcheamos la raíz y cualquier submódulo que pueda quejarse
             hf_model.get_input_embeddings = types.MethodType(get_input_embeddings_patch, hf_model)
-            if hasattr(hf_model, "talker"):
-                hf_model.talker.get_input_embeddings = types.MethodType(get_input_embeddings_patch, hf_model.talker)
-            print("✅ PEFT Patch aplicado correctamente.")
-        else:
-            print("⚠️ WARNING: Embeddings not found for PEFT patch.")
+            for module in hf_model.modules():
+                if "Talker" in type(module).__name__ or "Qwen" in type(module).__name__:
+                    module.get_input_embeddings = types.MethodType(get_input_embeddings_patch, module)
+                    # También inyectamos el atributo embed_tokens por si acaso
+                    if not hasattr(module, "embed_tokens"):
+                        module.embed_tokens = real_embeddings
+            print("✅ Parche de Embeddings aplicado masivamente.")
 
-        # Enable Gradients
+        # Ahora activamos gradientes
         hf_model.gradient_checkpointing_enable()
-        try:
-            hf_model.enable_input_require_grads()
-        except Exception as e:
-            print(f"⚠️ Nota: enable_input_require_grads falló ({e}), pero seguimos.")
+        try: hf_model.enable_input_require_grads()
+        except: pass
 
         # ============================================================
-        # 🧠 BYPASS WRAPPER (Robust LM Head Search)
+        # 🧬 WRAPPER DEEP CORE (El que busca el Qwen2Model real)
         # ============================================================
-        class Qwen3BypassWrapper(nn.Module):
+        class Qwen3DeepWrapper(nn.Module):
             def __init__(self, full_model):
                 super().__init__()
                 self.full_model = full_model
                 self.config = full_model.config
 
-                # 1. Extract the Talker
-                self.talker = getattr(full_model, "talker", None)
-                if not self.talker:
-                    for m in full_model.modules():
-                        if "Talker" in type(m).__name__:
-                            self.talker = m
-                            break
+                print("🕵️ Buscando el núcleo LLM (Qwen2Model/Transformer)...")
+                self.backbone = None
+                self.lm_head = None
 
-                if not self.talker:
-                    print("⚠️ Talker no encontrado, usando modelo base como fallback.")
-                    self.transformer = getattr(full_model, "model", full_model)
-                    self.lm_head = getattr(full_model, "lm_head", None)
-                else:
-                    self.transformer = getattr(self.talker, "model", None)
-                    self.lm_head = getattr(self.talker, "lm_head", None)
+                # 1. Búsqueda del Backbone (El cerebro)
+                # Buscamos una clase que sea 'Qwen2Model' o similar, pero NO 'Talker'
+                for name, module in full_model.named_modules():
+                    class_name = type(module).__name__
+                    # Queremos el modelo base, no los wrappers
+                    if "Qwen2Model" in class_name or "LlamaModel" in class_name:
+                        self.backbone = module
+                        print(f"   ✅ Núcleo encontrado: {class_name} en '{name}'")
+                        break
 
-                # Search Global LM Head if missing in talker
+                # Fallback: Si no encontramos por clase, buscamos por estructura
+                if not self.backbone:
+                    # Qwen3-TTS suele tener: talker.model (donde model es el Qwen2Model)
+                    if hasattr(full_model, "talker") and hasattr(full_model.talker, "model"):
+                        self.backbone = full_model.talker.model
+                        print("   ✅ Núcleo encontrado por ruta: talker.model")
+
+                if not self.backbone:
+                    raise ValueError("❌ ERROR CRÍTICO: No se pudo aislar el Qwen2Model interno.")
+
+                # 2. Búsqueda del LM Head (La boca)
+                # Suele estar en 'talker.lm_head'
+                for name, module in full_model.named_modules():
+                    if isinstance(module, nn.Linear) and module.out_features == self.config.vocab_size:
+                        self.lm_head = module
+                        print(f"   ✅ LM Head encontrada en: '{name}'")
+                        break
+
                 if not self.lm_head:
-                    print("⚠️ LM Head no encontrado en Talker, buscando en root...")
-                    self.lm_head = getattr(full_model, "lm_head", None)
-
-                if not self.lm_head:
-                    print("❌ CRITICAL WARNING: LM Head no encontrado. El entrenamiento fallará si no se encuentra.")
-
-                print("✅ Bypass Wrapper Configurado.")
+                    print("⚠️ LM Head no encontrada. Se intentará usar output directo.")
 
             def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
-                if self.transformer:
-                    outputs = self.transformer(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        return_dict=True,
-                        use_cache=False
-                    )
-                    hidden_states = outputs.last_hidden_state
-                else:
-                    outputs = self.full_model(input_ids=input_ids)
-                    hidden_states = outputs[0]
+                # 1. Pasada por el LLM Puro (Backbone)
+                # Esto devuelve (hidden_states, ...)
+                outputs = self.backbone(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    return_dict=True,
+                    use_cache=False
+                )
 
+                hidden_states = outputs.last_hidden_state
+
+                # 2. Pasada por el Cabezal (Si existe)
                 if self.lm_head:
                     logits = self.lm_head(hidden_states)
                 else:
-                    # Last ditch attempt to find output layer (weights=vocab size)
+                    # Si no hay head (raro), asumimos que el backbone ya dio logits (no suele pasar en bases)
                     logits = hidden_states
 
+                # 3. Cálculo de Pérdida
                 loss = None
                 if labels is not None:
                     shift_logits = logits[..., :-1, :].contiguous()
@@ -3154,25 +3166,18 @@ class Qwen3TrainLoRA:
         lora_model_raw = get_peft_model(hf_model, peft_config)
         lora_model_raw.print_trainable_parameters()
 
-        if donor_embeddings:
+        # Re-aplicar parches tras LoRA por seguridad
+        if real_embeddings:
              lora_model_raw.get_input_embeddings = types.MethodType(get_input_embeddings_patch, lora_model_raw)
 
-        trainable_model = Qwen3BypassWrapper(lora_model_raw)
+        # Usar el Wrapper de Profundidad
+        trainable_model = Qwen3DeepWrapper(lora_model_raw)
 
-        # 5. Dataset & Collator
-        train_dataset = Qwen3PrecomputedDataset(dataset_path)
+        # 5. Dataset
+        train_dataset = dataset_cls(dataset_path)
 
         def custom_collate_fn(batch):
-            # Robust Recursive Flattener
-            def flatten(x):
-                out = []
-                for item in x:
-                    if isinstance(item, list):
-                        out.extend(flatten(item))
-                    else:
-                        out.append(item)
-                return out
-
+            def flatten(x): return [item for sublist in x for item in (sublist if isinstance(sublist, list) else [sublist])] if isinstance(x[0], list) else x
             input_ids = [torch.tensor(flatten(item['input_ids']), dtype=torch.long) for item in batch]
             labels = [torch.tensor(flatten(item['labels']), dtype=torch.long) for item in batch]
             attention_mask = [torch.tensor(flatten(item['attention_mask']), dtype=torch.long) for item in batch]
@@ -3207,7 +3212,7 @@ class Qwen3TrainLoRA:
             data_collator=custom_collate_fn,
         )
 
-        print(f"--- 🚀 LAUNCHING BYPASS TRAINING ---")
+        print(f"--- 🚀 LAUNCHING DEEP CORE TRAINING ---")
         trainer.train()
 
         final_save_path = os.path.join(full_output_dir, "final")
