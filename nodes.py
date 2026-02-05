@@ -2963,7 +2963,7 @@ class Qwen3PrecomputedDataset(Dataset):
         }
 
 # ==============================================================================
-# CLASE Qwen3TrainLoRA (VERSIÓN BLINDADA v5)
+# CLASE Qwen3TrainLoRA (VERSIÓN V6 - BYPASS WRAPPER)
 # ==============================================================================
 class Qwen3TrainLoRA:
     @classmethod
@@ -2991,7 +2991,6 @@ class Qwen3TrainLoRA:
     CATEGORY = "Qwen3TTS/Training"
 
     def train(self, model_version, dataset_path, lora_name, rank, alpha, epochs, batch_size, learning_rate, save_path):
-        # --- IMPORTACIONES LOCALES (A PRUEBA DE FALLOS) ---
         import torch
         import torch.nn as nn
         import os
@@ -3001,39 +3000,26 @@ class Qwen3TrainLoRA:
         from peft import LoraConfig, get_peft_model, TaskType
         from torch.nn.utils.rnn import pad_sequence
 
-        # Intentamos importar Qwen3PrecomputedDataset de forma segura
-        try:
-            # Si está en el mismo archivo o accesible globalmente
-            dataset_cls = Qwen3PrecomputedDataset
-        except NameError:
-            try:
-                # Si es necesario importarlo del módulo actual
-                from .nodes import Qwen3PrecomputedDataset
-                dataset_cls = Qwen3PrecomputedDataset
-            except ImportError:
-                # Definición de emergencia si no se encuentra (Safety Net)
-                class Qwen3PrecomputedDataset(torch.utils.data.Dataset):
-                    def __init__(self, path):
-                        self.data = []
-                        with open(path, 'r') as f:
-                            for line in f:
-                                self.data.append(json.loads(line))
-                    def __len__(self): return len(self.data)
-                    def __getitem__(self, idx): return self.data[idx]
-                dataset_cls = Qwen3PrecomputedDataset
+        # Dataset Class Definition (Safety Net)
+        class Qwen3PrecomputedDataset(torch.utils.data.Dataset):
+            def __init__(self, path):
+                self.data = []
+                with open(path, 'r') as f:
+                    for line in f: self.data.append(json.loads(line))
+            def __len__(self): return len(self.data)
+            def __getitem__(self, idx): return self.data[idx]
 
-        print(f"🔄 [Qwen3-TTS] Iniciando Protocolo de Entrenamiento v5: {model_version}")
+        print(f"🔄 [Qwen3-TTS] Iniciando Protocolo v6 (Bypass Wrapper): {model_version}")
 
-        # 1. Registro de Configuración
+        # 1. Config Registration
         try:
             from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
             from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
             AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
             AutoModelForCausalLM.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
-        except ImportError:
-            pass
+        except ImportError: pass
 
-        # 2. Carga del Modelo
+        # 2. Load Model
         try:
             hf_model = AutoModelForCausalLM.from_pretrained(
                 model_version,
@@ -3053,89 +3039,87 @@ class Qwen3TrainLoRA:
             )
 
         hf_model.config.use_cache = False
-
-        # ============================================================
-        # 💉 LA FUNCIÓN DE PARCHEO (Hardcoded)
-        # ============================================================
-        def apply_patches(model_root):
-            print(f"🏥 Aplicando parche a: {type(model_root).__name__}")
-
-            # 1. Encontrar el TALKER
-            talker = None
-            if hasattr(model_root, "talker"):
-                talker = model_root.talker
-            elif hasattr(model_root, "model") and hasattr(model_root.model, "talker"):
-                talker = model_root.model.talker
-
-            if talker is None:
-                # Búsqueda profunda
-                for name, module in model_root.named_modules():
-                    if "Talker" in type(module).__name__:
-                        talker = module
-                        print(f"   ✅ Talker encontrado en: {name}")
-                        break
-
-            if talker is None:
-                print("   ❌ CRITICAL: Talker no encontrado.")
-                return
-
-            # 2. Encontrar EMBEDDINGS
-            embeddings = None
-            if hasattr(talker, "model") and hasattr(talker.model, "text_embedding"):
-                embeddings = talker.model.text_embedding
-            else:
-                for name, module in talker.named_modules():
-                    if isinstance(module, nn.Embedding) and module.num_embeddings > 50000:
-                        embeddings = module
-                        break
-
-            if embeddings is None:
-                print("   ❌ CRITICAL: Embeddings no encontrados.")
-                return
-
-            # 3. APLICAR FIX
-            if not hasattr(talker, "embed_tokens"):
-                talker.embed_tokens = embeddings
-                print("   💉 ÉXITO: Inyectado 'embed_tokens' en Talker.")
-
-            # 4. Parche para PEFT
-            def get_input_embeddings_patch(self):
-                return embeddings
-
-            model_root.get_input_embeddings = types.MethodType(get_input_embeddings_patch, model_root)
-            talker.get_input_embeddings = types.MethodType(get_input_embeddings_patch, talker)
-
-        # APLICAR PARCHE #1 (Antes de LoRA)
-        apply_patches(hf_model)
-
         hf_model.gradient_checkpointing_enable()
         hf_model.enable_input_require_grads()
 
-        # 3. Wrapper
-        class Qwen3TrainWrapper(nn.Module):
-            def __init__(self, model):
+        # ============================================================
+        # 💉 FIX PEFT: Inject get_input_embeddings (Global Patch)
+        # ============================================================
+        # PEFT needs this to identify trainable params even if we bypass the forward
+        def locate_embeddings(model):
+            # Look inside talker
+            if hasattr(model, "talker"):
+                if hasattr(model.talker, "model") and hasattr(model.talker.model, "text_embedding"):
+                    return model.talker.model.text_embedding
+            # Brute force
+            for module in model.modules():
+                if isinstance(module, nn.Embedding) and module.num_embeddings > 50000:
+                    return module
+            return None
+
+        donor_embeddings = locate_embeddings(hf_model)
+        if donor_embeddings:
+            def get_input_embeddings_patch(self): return donor_embeddings
+            hf_model.get_input_embeddings = types.MethodType(get_input_embeddings_patch, hf_model)
+            if hasattr(hf_model, "talker"):
+                hf_model.talker.get_input_embeddings = types.MethodType(get_input_embeddings_patch, hf_model.talker)
+            print("✅ PEFT Patch applied.")
+        else:
+            print("⚠️ WARNING: Embeddings not found for PEFT patch.")
+
+        # ============================================================
+        # 🧠 BYPASS WRAPPER (The Solution)
+        # ============================================================
+        class Qwen3BypassWrapper(nn.Module):
+            def __init__(self, full_model):
                 super().__init__()
-                self.model = model
-                self.config = model.config
-                if hasattr(model, "talker"): self.backbone = model.talker
-                elif hasattr(model, "model"): self.backbone = model.model
-                else: self.backbone = model
+                self.full_model = full_model
+                self.config = full_model.config
+
+                # 1. Extract the Talker
+                self.talker = getattr(full_model, "talker", None)
+                if not self.talker:
+                    # Try to find it via scan
+                    for m in full_model.modules():
+                        if "Talker" in type(m).__name__:
+                            self.talker = m
+                            break
+
+                if not self.talker:
+                    raise ValueError("CRITICAL: Could not locate Talker component.")
+
+                # 2. Extract Key Sub-Components (Bypassing the middle-man)
+                # The Transformer (handles inputs -> hidden states)
+                self.transformer = getattr(self.talker, "model", None)
+                # The Head (handles hidden states -> logits)
+                self.lm_head = getattr(self.talker, "lm_head", None)
+
+                if not self.transformer or not self.lm_head:
+                    raise ValueError("CRITICAL: Could not locate Transformer or LM Head inside Talker.")
+
+                print("✅ Bypass Wrapper Configured: Direct connection established to Transformer + LM Head.")
 
             def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
-                outputs = self.backbone(
+                # DIRECT CALL to the internal Transformer
+                # This skips Qwen3TTSTalkerModel.forward() entirely!
+
+                # Qwen2Model forward returns (last_hidden_state, past_key_values, ...)
+                outputs = self.transformer(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     return_dict=True,
-                    output_hidden_states=False,
                     use_cache=False
                 )
 
-                if hasattr(outputs, "logits"): logits = outputs.logits
-                elif isinstance(outputs, tuple): logits = outputs[0]
-                else: logits = outputs
+                hidden_states = outputs.last_hidden_state
 
+                # DIRECT CALL to the LM Head
+                logits = self.lm_head(hidden_states)
+
+                # Calculate Loss manually
                 loss = None
                 if labels is not None:
+                    # Standard Causal LM Loss
                     shift_logits = logits[..., :-1, :].contiguous()
                     shift_labels = labels[..., 1:].contiguous()
                     loss_fct = nn.CrossEntropyLoss()
@@ -3144,11 +3128,11 @@ class Qwen3TrainLoRA:
                 return {"loss": loss, "logits": logits} if loss is not None else {"logits": logits}
 
             def save_pretrained(self, path):
-                self.model.save_pretrained(path)
+                self.full_model.save_pretrained(path)
 
             def __getattr__(self, name):
                 try: return super().__getattr__(name)
-                except AttributeError: return getattr(self.model, name)
+                except AttributeError: return getattr(self.full_model, name)
 
         # 4. LoRA Setup
         peft_config = LoraConfig(
@@ -3163,21 +3147,14 @@ class Qwen3TrainLoRA:
         lora_model_raw = get_peft_model(hf_model, peft_config)
         lora_model_raw.print_trainable_parameters()
 
-        # APLICAR PARCHE #2 (Después de LoRA)
-        print("🔄 Re-aplicando parche tras LoRA...")
-        if hasattr(lora_model_raw, "model"):
-            apply_patches(lora_model_raw.model)
-        else:
-            apply_patches(lora_model_raw)
-
-        trainable_model = Qwen3TrainWrapper(lora_model_raw)
+        # Wrap the LoRA model in our Bypass
+        trainable_model = Qwen3BypassWrapper(lora_model_raw)
 
         # 5. Dataset
-        train_dataset = dataset_cls(dataset_path)
+        train_dataset = Qwen3PrecomputedDataset(dataset_path)
 
         def custom_collate_fn(batch):
             def flatten(x): return [item for sublist in x for item in (sublist if isinstance(sublist, list) else [sublist])] if isinstance(x[0], list) else x
-
             input_ids = [torch.tensor(flatten(item['input_ids']), dtype=torch.long) for item in batch]
             labels = [torch.tensor(flatten(item['labels']), dtype=torch.long) for item in batch]
             attention_mask = [torch.tensor(flatten(item['attention_mask']), dtype=torch.long) for item in batch]
@@ -3212,12 +3189,12 @@ class Qwen3TrainLoRA:
             data_collator=custom_collate_fn,
         )
 
-        print(f"--- 🚀 LAUNCHING TRAINING ---")
+        print(f"--- 🚀 LAUNCHING BYPASS TRAINING ---")
         trainer.train()
 
         final_save_path = os.path.join(full_output_dir, "final")
         lora_model_raw.save_pretrained(final_save_path)
-        print(f"✅ LoRA Guardado: {final_save_path}")
+        print(f"✅ LoRA Saved: {final_save_path}")
 
         del trainer, lora_model_raw, hf_model, trainable_model
         torch.cuda.empty_cache()
