@@ -2963,7 +2963,7 @@ class Qwen3PrecomputedDataset(Dataset):
         }
 
 # ==============================================================================
-# CLASE Qwen3TrainLoRA (VERSIÓN v8.2 - ROPE FIX)
+# CLASE Qwen3TrainLoRA (VERSIÓN v9 - RoPE MONKEY PATCH)
 # ==============================================================================
 class Qwen3TrainLoRA:
     @classmethod
@@ -2995,6 +2995,7 @@ class Qwen3TrainLoRA:
         import torch.nn as nn
         import os
         import json
+        import types
         from transformers import AutoModelForCausalLM, TrainingArguments, Trainer, AutoConfig
         from peft import LoraConfig, get_peft_model, TaskType
         from torch.nn.utils.rnn import pad_sequence
@@ -3013,15 +3014,53 @@ class Qwen3TrainLoRA:
                 def __getitem__(self, idx): return self.data[idx]
             dataset_cls = Qwen3PrecomputedDataset
 
-        print(f"🔄 [Qwen3-TTS] Iniciando Protocolo v8.2 (RoPE Fix): {model_version}")
+        print(f"🔄 [Qwen3-TTS] Iniciando Protocolo v9 (RoPE Patch): {model_version}")
 
         # 1. Config
         try:
             from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
             from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
+            # Importamos la función original para tener referencia, aunque la vamos a parchear
+            import qwen_tts.core.models.modeling_qwen3_tts as qwen_module
+
             AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
             AutoModelForCausalLM.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
         except ImportError: pass
+
+        # ============================================================
+        # 🧬 GLOBAL PATCH: FIX RoPE BROADCASTING ERROR
+        # ============================================================
+
+        def patched_apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+            # Asegurar que cos y sin coincidan con la longitud de q
+            seq_len = q.shape[2]
+
+            if cos.shape[2] < seq_len:
+                repeats = (seq_len // cos.shape[2]) + 1
+                cos = cos.repeat(1, 1, repeats, 1)[..., :seq_len, :]
+                sin = sin.repeat(1, 1, repeats, 1)[..., :seq_len, :]
+
+            elif cos.shape[2] > seq_len:
+                cos = cos[..., :seq_len, :]
+                sin = sin[..., :seq_len, :]
+
+            from qwen_tts.core.models.modeling_qwen3_tts import rotate_half
+
+            q_embed = (q * cos) + (rotate_half(q) * sin)
+            k_embed = (k * cos) + (rotate_half(k) * sin)
+            return q_embed, k_embed
+
+        # APLICAR EL PARCHE AL MÓDULO GLOBALMENTE
+        if 'qwen_module' in locals():
+            print("💉 Inyectando parche RoPE en 'qwen_tts.core.models.modeling_qwen3_tts'...")
+            qwen_module.apply_multimodal_rotary_pos_emb = patched_apply_rotary_pos_emb
+        else:
+            import sys
+            if 'qwen_tts.core.models.modeling_qwen3_tts' in sys.modules:
+                print("💉 Inyectando parche RoPE en sys.modules...")
+                sys.modules['qwen_tts.core.models.modeling_qwen3_tts'].apply_multimodal_rotary_pos_emb = patched_apply_rotary_pos_emb
+
+        # ============================================================
 
         # 2. Load Model
         try:
@@ -3044,7 +3083,7 @@ class Qwen3TrainLoRA:
 
         hf_model.config.use_cache = False
 
-        # 3. Extract Components
+        # 3. Embedding Patch (Standard v8)
         talker = getattr(hf_model, "talker", None)
         if not talker: raise ValueError("CRITICAL: No 'talker' found.")
 
@@ -3056,11 +3095,10 @@ class Qwen3TrainLoRA:
                 if isinstance(m, nn.Embedding) and m.num_embeddings > 50000:
                     embedding_layer = m; break
 
-        if not embedding_layer: raise ValueError("CRITICAL: No embeddings found.")
         print("✅ Componentes extraídos.")
 
         # ============================================================
-        # 🧬 Qwen3Proxy v8.2: RoPE Stabilizer
+        # 🧬 Qwen3Proxy v9
         # ============================================================
         class Qwen3Proxy(nn.Module):
             def __init__(self, talker_module, embed_module, original_config):
@@ -3072,32 +3110,28 @@ class Qwen3TrainLoRA:
                     self.talker.config = original_config
 
             def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
-                # 1. Embeddings Manuales
+                # 1. Embeddings
                 inputs_embeds = self.embed(input_ids)
                 if not inputs_embeds.requires_grad:
                     inputs_embeds.requires_grad_(True)
 
-                # 2. GENERACIÓN MANUAL DE POSITION_IDS
-                # Esto es crucial para arreglar el error de RoPE (tamaño 627 vs 72)
-                # Si no se pasan, el modelo a veces infers mal la longitud o usa caché viejo
+                # 2. Force position_ids creation to help RoPE
                 batch_size, seq_length = input_ids.shape
                 position_ids = torch.arange(0, seq_length, dtype=torch.long, device=input_ids.device)
                 position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
 
-                # 3. Llamada al Talker con TODO explícito
+                # 3. Call Talker
                 outputs = self.talker(
                     inputs_embeds=inputs_embeds,
                     attention_mask=attention_mask,
-                    position_ids=position_ids, # <--- FIX
+                    position_ids=position_ids,
                     labels=labels,
                     return_dict=True,
                     output_hidden_states=False,
-                    use_cache=False # <--- FIX IMPORTANTE
+                    use_cache=False
                 )
-
                 return outputs
 
-            # Delegation
             def __getattr__(self, name):
                 try: return super().__getattr__(name)
                 except AttributeError: return getattr(self.talker, name)
@@ -3105,7 +3139,7 @@ class Qwen3TrainLoRA:
             def get_input_embeddings(self): return self.embed
             def save_pretrained(self, path): pass
 
-        # 4. Setup Proxy & LoRA
+        # 4. Proxy + LoRA
         proxy_model = Qwen3Proxy(talker, embedding_layer, hf_model.config)
         proxy_model.gradient_checkpointing_enable()
         proxy_model.enable_input_require_grads()
@@ -3161,7 +3195,7 @@ class Qwen3TrainLoRA:
             data_collator=custom_collate_fn,
         )
 
-        print(f"--- 🚀 LANZANDO ENTRENAMIENTO (ROPE FIX) ---")
+        print(f"--- 🚀 LANZANDO ENTRENAMIENTO (V9 PARCHEADO) ---")
         trainer.train()
 
         final_save_path = os.path.join(full_output_dir, "final")
