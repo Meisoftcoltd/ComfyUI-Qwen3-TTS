@@ -2727,6 +2727,7 @@ class Qwen3LoadAudioFolder:
         }
 
     RETURN_TYPES = ("AUDIO",)
+    OUTPUT_IS_LIST = (True,)
     FUNCTION = "load_folder"
     CATEGORY = "Qwen3-TTS/Utils"
 
@@ -2742,53 +2743,28 @@ class Qwen3LoadAudioFolder:
 
         print(f"[Qwen3-TTS] Loading {len(files)} audio files from {folder_path}")
 
-        # Load first file to determine sample rate
-        first_path = os.path.join(folder_path, files[0])
-        wav0, sr = sf.read(first_path)
-
-        # We need a list of waveforms to stack
-        waveforms = []
+        output_list = []
 
         # Helper to process single file
         def process_wav(w):
             if w.dtype != np.float32: w = w.astype(np.float32)
             if w.ndim == 1: w = w[np.newaxis, :] # (1, samples)
             if w.shape[0] > w.shape[1]: w = w.T # Ensure (channels, samples)
-            return torch.from_numpy(w)
-
-        # Load all
-        max_len = 0
-        loaded_wavs = []
+            return torch.from_numpy(w).unsqueeze(0) # Add batch dim: [1, C, T]
 
         for fname in files:
             p = os.path.join(folder_path, fname)
             try:
                 w, s = sf.read(p)
-                if s != sr:
-                    # Resample if needed (skip for now or use librosa)
-                    if HAS_LIBROSA:
-                        w = librosa.resample(w, orig_sr=s, target_sr=sr)
-                    else:
-                        print(f"Warning: Skipping {fname} due to sample rate mismatch ({s} vs {sr}) and no librosa.")
-                        continue
-
                 wt = process_wav(w)
-                loaded_wavs.append(wt)
-                max_len = max(max_len, wt.shape[1])
+                output_list.append({"waveform": wt, "sample_rate": s})
             except Exception as e:
                 print(f"Error loading {fname}: {e}")
 
-        if not loaded_wavs:
+        if not output_list:
             raise ValueError("Failed to load any valid audio files.")
 
-        # Pad and Stack
-        # Final shape: [Batch, Channels, Samples]
-        batch_tensor = torch.zeros(len(loaded_wavs), loaded_wavs[0].shape[0], max_len)
-
-        for i, w in enumerate(loaded_wavs):
-            batch_tensor[i, :, :w.shape[1]] = w
-
-        return ({"waveform": batch_tensor, "sample_rate": sr},)
+        return (output_list,)
 
 
 class Qwen3LoadVideoFromPath:
@@ -2840,6 +2816,7 @@ class Qwen3LoadVideoFolder:
         }
 
     RETURN_TYPES = ("AUDIO",)
+    OUTPUT_IS_LIST = (True,)
     FUNCTION = "load_folder"
     CATEGORY = "Qwen3-TTS/Utils"
 
@@ -2856,9 +2833,7 @@ class Qwen3LoadVideoFolder:
         if not files:
             raise ValueError(f"No video files found in {folder_path}")
 
-        loaded_wavs = []
-        sr = None
-        max_len = 0
+        output_list = []
 
         print(f"[Qwen3-TTS] Processing {len(files)} video files...")
 
@@ -2866,10 +2841,6 @@ class Qwen3LoadVideoFolder:
             p = os.path.join(folder_path, fname)
             try:
                 audio = AudioSegment.from_file(p)
-                if sr is None: sr = audio.frame_rate
-
-                if audio.frame_rate != sr:
-                    audio = audio.set_frame_rate(sr)
 
                 samples = np.array(audio.get_array_of_samples())
                 if audio.channels > 1:
@@ -2878,35 +2849,17 @@ class Qwen3LoadVideoFolder:
                     samples = samples.reshape((1, -1)) # (Channels, Samples)
 
                 samples = samples.astype(np.float32) / (1 << (8 * audio.sample_width - 1))
-                samples_tensor = torch.from_numpy(samples) # [C, T]
+                samples_tensor = torch.from_numpy(samples).unsqueeze(0) # [1, C, T]
 
-                loaded_wavs.append(samples_tensor)
-                max_len = max(max_len, samples_tensor.shape[1])
+                output_list.append({"waveform": samples_tensor, "sample_rate": audio.frame_rate})
 
             except Exception as e:
                 print(f"Error processing {fname}: {e}")
 
-        if not loaded_wavs:
+        if not output_list:
             raise ValueError("Failed to process any video files.")
 
-        # Batch Stack
-        batch_tensor = torch.zeros(len(loaded_wavs), loaded_wavs[0].shape[0], max_len)
-        for i, w in enumerate(loaded_wavs):
-            # Ensure channel match (mono vs stereo mix)
-            if w.shape[0] != batch_tensor.shape[1]:
-                # If mismatch, force mono for safety
-                if w.shape[0] > 1: w = torch.mean(w, dim=0, keepdim=True)
-                if batch_tensor.shape[1] > 1:
-                    # This case is tricky if batch started stereo.
-                    # Ideally we check all channels first.
-                    # Simplify: force all to Mono if mixed.
-                    pass
-
-            # Simple copy (assuming channels match for now or handled by pydub consistency)
-            if w.shape[0] == batch_tensor.shape[1]:
-                batch_tensor[i, :, :w.shape[1]] = w
-
-        return ({"waveform": batch_tensor, "sample_rate": sr},)
+        return (output_list,)
 
 
 class Qwen3AudioCompare:
