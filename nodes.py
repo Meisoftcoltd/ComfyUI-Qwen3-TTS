@@ -2963,7 +2963,7 @@ class Qwen3PrecomputedDataset(Dataset):
         }
 
 # ==============================================================================
-# CLASE Qwen3TrainLoRA (VERSIÓN v10 - HYBRID SAFE MODE)
+# CLASE Qwen3TrainLoRA (VERSIÓN v10.1 - DIPLOMATIC PROXY)
 # ==============================================================================
 class Qwen3TrainLoRA:
     @classmethod
@@ -3014,52 +3014,46 @@ class Qwen3TrainLoRA:
                 def __getitem__(self, idx): return self.data[idx]
             dataset_cls = Qwen3PrecomputedDataset
 
-        print(f"🔄 [Qwen3-TTS] Iniciando Protocolo v10 (Hybrid Safe): {model_version}")
+        print(f"🔄 [Qwen3-TTS] Iniciando Protocolo v10.1 (Diplomatic Proxy): {model_version}")
 
         # 1. Config
         try:
             from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
             from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
-            # RoPE Patch
+            # RoPE Patch global por si acaso
             import qwen_tts.core.models.modeling_qwen3_tts as qwen_module
+
+            def patched_apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+                seq_len = q.shape[2]
+                if cos.shape[2] < seq_len:
+                    repeats = (seq_len // cos.shape[2]) + 1
+                    cos = cos.repeat(1, 1, repeats, 1)[..., :seq_len, :]
+                    sin = sin.repeat(1, 1, repeats, 1)[..., :seq_len, :]
+                elif cos.shape[2] > seq_len:
+                    cos = cos[..., :seq_len, :]
+                    sin = sin[..., :seq_len, :]
+
+                from qwen_tts.core.models.modeling_qwen3_tts import rotate_half
+                q_embed = (q * cos) + (rotate_half(q) * sin)
+                k_embed = (k * cos) + (rotate_half(k) * sin)
+                return q_embed, k_embed
+
+            qwen_module.apply_multimodal_rotary_pos_emb = patched_apply_rotary_pos_emb
+
             AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
             AutoModelForCausalLM.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
         except ImportError: pass
 
-        # ============================================================
-        # 🧬 GLOBAL PATCH: FIX RoPE (Just in case)
-        # ============================================================
-        def patched_apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-            seq_len = q.shape[2]
-            if cos.shape[2] < seq_len:
-                repeats = (seq_len // cos.shape[2]) + 1
-                cos = cos.repeat(1, 1, repeats, 1)[..., :seq_len, :]
-                sin = sin.repeat(1, 1, repeats, 1)[..., :seq_len, :]
-            elif cos.shape[2] > seq_len:
-                cos = cos[..., :seq_len, :]
-                sin = sin[..., :seq_len, :]
-
-            from qwen_tts.core.models.modeling_qwen3_tts import rotate_half
-            q_embed = (q * cos) + (rotate_half(q) * sin)
-            k_embed = (k * cos) + (rotate_half(k) * sin)
-            return q_embed, k_embed
-
-        if 'qwen_module' in locals():
-            qwen_module.apply_multimodal_rotary_pos_emb = patched_apply_rotary_pos_emb
-
-        # ============================================================
-
-        # 2. Load Model (FORCE SDPA / NO FLASH ATTENTION)
-        # Flash Attention causes the 6144 shape error with LoRA sometimes
+        # 2. Load Model (SDPA Safe Mode)
         try:
             hf_model = AutoModelForCausalLM.from_pretrained(
                 model_version,
                 device_map="auto",
                 torch_dtype=torch.bfloat16,
                 trust_remote_code=True,
-                attn_implementation="sdpa" # <--- CAMBIO CLAVE
+                attn_implementation="sdpa"
             )
-            print("⚡ Attention Mode: SDPA (Safer than Flash Attn 2)")
+            print("⚡ Attention Mode: SDPA")
         except:
             hf_model = AutoModelForCausalLM.from_pretrained(
                 model_version,
@@ -3074,23 +3068,21 @@ class Qwen3TrainLoRA:
         talker = getattr(hf_model, "talker", None)
         if not talker: raise ValueError("CRITICAL: Talker not found.")
 
-        # We target the INNER model (Qwen2Model), skipping Talker wrapper logic
+        # Target INNER model
         backbone = getattr(talker, "model", None)
-        if not backbone: raise ValueError("CRITICAL: Backbone (Qwen2Model) not found.")
+        if not backbone: raise ValueError("CRITICAL: Backbone not found.")
 
-        # Locate Head
         lm_head = getattr(talker, "lm_head", None)
-        if not lm_head: print("⚠️ Warning: LM Head not found explicitely.")
 
         embedding_layer = getattr(backbone, "text_embedding", None)
         if not embedding_layer:
              for m in backbone.modules():
                 if isinstance(m, nn.Embedding): embedding_layer = m; break
 
-        print("✅ Componentes localizados (Backbone + Embeddings).")
+        print("✅ Componentes localizados.")
 
         # ============================================================
-        # 🧬 Qwen3Proxy v10: Direct Backbone Access
+        # 🧬 Qwen3Proxy v10.1: Diplomatic Interface
         # ============================================================
         class Qwen3Proxy(nn.Module):
             def __init__(self, backbone_module, embed_module, head_module, original_config):
@@ -3100,9 +3092,20 @@ class Qwen3TrainLoRA:
                 self.lm_head = head_module
                 self.config = original_config
 
-                # PEFT compatibility
                 if not hasattr(self.backbone, "config"):
                     self.backbone.config = original_config
+
+            # --- DIPLOMACIA PARA PEFT (Funciones Dummy) ---
+            # Esto evita que PEFT busque estas funciones en el backbone y falle
+            def prepare_inputs_for_generation(self, *args, **kwargs):
+                return {}
+
+            def _validate_model_class(self):
+                pass
+
+            def _validate_model_kwargs(self, model_kwargs):
+                pass
+            # ---------------------------------------------
 
             def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
                 # 1. Manual Embedding
@@ -3110,13 +3113,12 @@ class Qwen3TrainLoRA:
                 if not inputs_embeds.requires_grad:
                     inputs_embeds.requires_grad_(True)
 
-                # 2. Manual Position IDs (Standard Causal LM)
+                # 2. Manual Position IDs
                 batch_size, seq_length = input_ids.shape
                 position_ids = torch.arange(0, seq_length, dtype=torch.long, device=input_ids.device)
                 position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
 
-                # 3. Call Backbone (Qwen2Model) DIRECTLY
-                # Skips Qwen3TTSTalkerModel logic completely
+                # 3. Call Backbone
                 outputs = self.backbone(
                     inputs_embeds=inputs_embeds,
                     attention_mask=attention_mask,
@@ -3127,13 +3129,13 @@ class Qwen3TrainLoRA:
 
                 hidden_states = outputs.last_hidden_state
 
-                # 4. LM Head Projection
+                # 4. Projection
                 if self.lm_head:
                     logits = self.lm_head(hidden_states)
                 else:
                     logits = hidden_states
 
-                # 5. Loss Calculation
+                # 5. Loss
                 loss = None
                 if labels is not None:
                     shift_logits = logits[..., :-1, :].contiguous()
@@ -3143,7 +3145,6 @@ class Qwen3TrainLoRA:
 
                 return {"loss": loss, "logits": logits} if loss is not None else {"logits": logits}
 
-            # Delegation for PEFT utils
             def __getattr__(self, name):
                 try: return super().__getattr__(name)
                 except AttributeError: return getattr(self.backbone, name)
@@ -3154,8 +3155,6 @@ class Qwen3TrainLoRA:
         # 4. Setup
         proxy_model = Qwen3Proxy(backbone, embedding_layer, lm_head, hf_model.config)
         proxy_model.gradient_checkpointing_enable()
-
-        # Force enable grads on embeddings manually before LoRA
         embedding_layer.weight.requires_grad_(True)
 
         peft_config = LoraConfig(
@@ -3170,7 +3169,7 @@ class Qwen3TrainLoRA:
         lora_model = get_peft_model(proxy_model, peft_config)
         lora_model.print_trainable_parameters()
 
-        # 5. Dataset
+        # 5. Dataset & Train
         train_dataset = dataset_cls(dataset_path)
 
         def custom_collate_fn(batch):
@@ -3184,7 +3183,6 @@ class Qwen3TrainLoRA:
             padded_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
             return {"input_ids": padded_inputs, "labels": padded_labels, "attention_mask": padded_mask}
 
-        # 6. Train
         full_output_dir = os.path.join(save_path, lora_name)
 
         args = TrainingArguments(
@@ -3209,7 +3207,7 @@ class Qwen3TrainLoRA:
             data_collator=custom_collate_fn,
         )
 
-        print(f"--- 🚀 LANZANDO ENTRENAMIENTO (V10 SAFE) ---")
+        print(f"--- 🚀 LANZANDO ENTRENAMIENTO (DIPLOMATIC V10.1) ---")
         trainer.train()
 
         final_save_path = os.path.join(full_output_dir, "final")
