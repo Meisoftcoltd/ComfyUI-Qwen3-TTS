@@ -2989,9 +2989,17 @@ class Qwen3TrainLoRA:
     CATEGORY = "Qwen3-TTS/Training"
 
     def train(self, model_version, dataset_path, lora_name, rank, alpha, epochs, batch_size, learning_rate, save_path):
+        # --- IMPORTACIONES EXPLÍCITAS (FIX NAME ERROR) ---
+        import torch
+        import torch.nn as nn
+        import os
+        import json
         import types
+        from transformers import AutoModelForCausalLM, TrainingArguments, Trainer, AutoConfig
+        from peft import LoraConfig, get_peft_model, TaskType
+        from torch.nn.utils.rnn import pad_sequence
 
-        print(f"🔄 [Qwen3-TTS] Starting Training Protocol v4 (Hardcoded Patch): {model_version}")
+        print(f"🔄 [Qwen3-TTS] Starting Training Protocol v4.1 (Hardcoded Patch): {model_version}")
 
         # 1. Config
         try:
@@ -2999,7 +3007,9 @@ class Qwen3TrainLoRA:
             from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
             AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
             AutoModelForCausalLM.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
+            print("✅ Configuración Qwen3TTS registrada.")
         except ImportError:
+            print("⚠️ No se pudo importar config local. Se confiará en remote code.")
             pass
 
         # 2. Load Model
