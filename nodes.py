@@ -2061,7 +2061,12 @@ class Qwen3FineTune:
                 PromptServer.instance.send_progress_text(text, unique_id)
 
         # Setup output directory
-        base_output_dir = os.path.abspath(output_dir)
+        # Fix path resolution: if relative, anchor to ComfyUI base path
+        if not os.path.isabs(output_dir):
+            base_output_dir = os.path.abspath(os.path.join(folder_paths.base_path, output_dir))
+        else:
+            base_output_dir = os.path.abspath(output_dir)
+
         # Create the speaker subdirectory
         full_output_dir = os.path.join(base_output_dir, speaker_name)
         os.makedirs(full_output_dir, exist_ok=True)
