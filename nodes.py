@@ -2963,7 +2963,7 @@ class Qwen3PrecomputedDataset(Dataset):
         }
 
 # ==============================================================================
-# CLASE Qwen3TrainLoRA (VERSIÓN v8 - PROXY STRATEGY)
+# CLASE Qwen3TrainLoRA (VERSIÓN v8.1 - THE MIMIC PROXY)
 # ==============================================================================
 class Qwen3TrainLoRA:
     @classmethod
@@ -3013,7 +3013,7 @@ class Qwen3TrainLoRA:
                 def __getitem__(self, idx): return self.data[idx]
             dataset_cls = Qwen3PrecomputedDataset
 
-        print(f"🔄 [Qwen3-TTS] Iniciando Protocolo v8 (Proxy Strategy): {model_version}")
+        print(f"🔄 [Qwen3-TTS] Iniciando Protocolo v8.1 (Mimic Proxy): {model_version}")
 
         # 1. Config Registration
         try:
@@ -3044,18 +3044,15 @@ class Qwen3TrainLoRA:
 
         hf_model.config.use_cache = False
 
-        # 3. EXTRAER COMPONENTES PARA EL PROXY
-        # Necesitamos el Talker (LLM) y la capa de Embeddings
+        # 3. EXTRAER COMPONENTES
         talker = getattr(hf_model, "talker", None)
         if not talker:
-            raise ValueError("CRITICAL: No se encontró el módulo 'talker' en el modelo.")
+            raise ValueError("CRITICAL: No se encontró el módulo 'talker'.")
 
         embedding_layer = None
-        # Búsqueda quirúrgica de embeddings
         if hasattr(talker, "model") and hasattr(talker.model, "text_embedding"):
             embedding_layer = talker.model.text_embedding
         else:
-            # Búsqueda por fuerza bruta
             for m in talker.modules():
                 if isinstance(m, nn.Embedding) and m.num_embeddings > 50000:
                     embedding_layer = m; break
@@ -3063,10 +3060,10 @@ class Qwen3TrainLoRA:
         if not embedding_layer:
             raise ValueError("CRITICAL: No se encontró la capa de embeddings.")
 
-        print("✅ Componentes extraídos para el Proxy.")
+        print("✅ Componentes extraídos.")
 
         # ============================================================
-        # 🧬 Qwen3Proxy: El intermediario que arregla todo
+        # 🧬 Qwen3Proxy v8.1: The Mimic
         # ============================================================
         class Qwen3Proxy(nn.Module):
             def __init__(self, talker_module, embed_module, original_config):
@@ -3075,17 +3072,19 @@ class Qwen3TrainLoRA:
                 self.embed = embed_module
                 self.config = original_config
 
-                # Asegurar que el talker tiene config accesible para PEFT
+                # Make sure talker has config access
                 if not hasattr(self.talker, "config"):
                     self.talker.config = original_config
 
             def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
-                # 1. Calculamos embeddings manualmente
-                # Esto evita que el Talker intente usar self.embed_tokens (que no tiene)
+                # 1. Manual Embedding (Fixes 'embed_tokens' error)
                 inputs_embeds = self.embed(input_ids)
 
-                # 2. Pasamos los embeddings al Talker
-                # Talker acepta 'inputs_embeds' y calcula todo lo demás (loss, logits)
+                # 2. Force Gradients (Fixes 'element 0' error)
+                if not inputs_embeds.requires_grad:
+                    inputs_embeds.requires_grad_(True)
+
+                # 3. Pass to Talker
                 outputs = self.talker(
                     inputs_embeds=inputs_embeds,
                     attention_mask=attention_mask,
@@ -3096,30 +3095,23 @@ class Qwen3TrainLoRA:
 
                 return outputs
 
-            def enable_input_require_grads(self):
-                # Habilitar gradientes en embeddings (crucial para LoRA)
-                self.embed.weight.requires_grad_(True)
-
-            def gradient_checkpointing_enable(self, **kwargs):
-                if hasattr(self.talker, "gradient_checkpointing_enable"):
-                    self.talker.gradient_checkpointing_enable(**kwargs)
+            # DELEGATION: Pass all unknown calls (like prepare_inputs_for_generation) to the talker
+            def __getattr__(self, name):
+                try:
+                    return super().__getattr__(name)
+                except AttributeError:
+                    return getattr(self.talker, name)
 
             def get_input_embeddings(self):
                 return self.embed
 
             def save_pretrained(self, path):
-                # Dummy method, PEFT guarda los adaptadores por su cuenta
                 pass
 
         # 4. Instanciar Proxy
-        # Este será el modelo "base" que ve PEFT
         proxy_model = Qwen3Proxy(talker, embedding_layer, hf_model.config)
 
-        # Activar optimizaciones en el proxy
-        proxy_model.gradient_checkpointing_enable()
-        proxy_model.enable_input_require_grads()
-
-        # 5. Configurar LoRA sobre el Proxy
+        # 5. Configurar LoRA
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False,
@@ -3129,11 +3121,10 @@ class Qwen3TrainLoRA:
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
         )
 
-        # Ahora PEFT envuelve a nuestro Proxy, que funciona correctamente
         lora_model = get_peft_model(proxy_model, peft_config)
         lora_model.print_trainable_parameters()
 
-        # 6. Dataset
+        # 6. Dataset & Collator
         train_dataset = dataset_cls(dataset_path)
 
         def custom_collate_fn(batch):
@@ -3147,7 +3138,7 @@ class Qwen3TrainLoRA:
             padded_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
             return {"input_ids": padded_inputs, "labels": padded_labels, "attention_mask": padded_mask}
 
-        # 7. Ejecutar Entrenamiento
+        # 7. Ejecutar
         full_output_dir = os.path.join(save_path, lora_name)
 
         args = TrainingArguments(
@@ -3172,7 +3163,7 @@ class Qwen3TrainLoRA:
             data_collator=custom_collate_fn,
         )
 
-        print(f"--- 🚀 LANZANDO ENTRENAMIENTO (PROXY) ---")
+        print(f"--- 🚀 LANZANDO ENTRENAMIENTO (MIMIC PROXY) ---")
         trainer.train()
 
         final_save_path = os.path.join(full_output_dir, "final")
