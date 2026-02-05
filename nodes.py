@@ -119,28 +119,16 @@ def get_finetuned_speakers() -> list:
 
     for base_path in scan_paths:
         if os.path.exists(base_path):
-            # Check immediate subfolders (epochs)
-            # Actually, typically structure is output_dir/epoch_3/config.json
-            # But the 'speaker' name is what we need.
-            # In Qwen3FineTune, we ask for 'speaker_name'.
-            # It saves config.json with "spk_id": { "speaker_name": 3000 } inside the checkpoint folder.
-            # So any valid checkpoint folder effectively contains a speaker.
-            # BUT, the user wants the NAME to appear in the list.
-            # We can't easily know the name without reading every config.json.
-            # Alternatively, if the user followed conventions, maybe the folder name helps?
-            # But usually folder is 'epoch_3' or 'ckpt_step_100'.
+            # 1. New Structure: Check immediate subfolders as speaker names
+            # Structure: finetuned_model/{speaker_name}/epoch_N
+            for item in os.listdir(base_path):
+                if os.path.isdir(os.path.join(base_path, item)):
+                    # Add directory name as speaker (if not already known)
+                    if item not in speakers and item not in found_speakers:
+                        found_speakers.append(item)
 
-            # Wait, the user request says: "las voces creadas quiseran que aparecieran en su nodo correspondiente autodetectadas a través de combo"
-            # If they use "AudioToDataset", they get a dataset folder.
-            # If they Train, they get a model folder.
-
-            # If they use Qwen3CustomVoice, they load a model.
-            # If the model IS the fine-tuned model, then 'speaker' input should likely match what was trained.
-            # But Qwen3CustomVoice takes a 'model' input. The speaker list is static in INPUT_TYPES.
-            # Changing INPUT_TYPES dynamically based on disk scan is possible but static per session.
-
-            # Let's try to find speaker names from config.json files in subdirectories of known paths.
-             for root, dirs, files in os.walk(base_path):
+            # 2. Deep Scan: Check config.json for spk_id (Legacy & Robustness)
+            for root, dirs, files in os.walk(base_path):
                 if "config.json" in files:
                     try:
                         with open(os.path.join(root, "config.json"), 'r', encoding='utf-8') as f:
@@ -152,11 +140,6 @@ def get_finetuned_speakers() -> list:
                                         found_speakers.append(name)
                     except:
                         pass
-
-    # Also allow scanning "dataset_final" folders if that's what the user meant by "voces creadas"?
-    # "voces creadas" might mean the dataset folders for reference?
-    # No, Qwen3CustomVoice needs the speaker name defined in the model config.
-    # So scanning config.json of fine-tuned models is the correct approach.
 
     return sorted(found_speakers) + speakers
 
@@ -594,23 +577,42 @@ class Qwen3LoadFineTuned:
             os.path.join(folder_paths.models_dir, "Qwen3-TTS", "finetuned_model"),
         ]
 
-        models = []
+        speakers = []
+        versions = []
+
         for base_path in scan_paths:
             if os.path.exists(base_path):
+                # Scan speakers (directories)
                 for item in os.listdir(base_path):
                     item_path = os.path.join(base_path, item)
                     if os.path.isdir(item_path):
-                        # Verify it has config.json (valid model)
-                        if os.path.exists(os.path.join(item_path, "config.json")):
-                            models.append(item)
+                        speakers.append(item)
+                        # Scan versions (subdirectories)
+                        for v in os.listdir(item_path):
+                            if os.path.isdir(os.path.join(item_path, v)):
+                                versions.append(v)
 
-        models = sorted(list(set(models)))
-        if not models:
-            models = ["No fine-tuned models found"]
+        speakers = sorted(list(set(speakers)))
+        versions = sorted(list(set(versions)))
+
+        if not speakers:
+            speakers = ["No fine-tuned speakers found"]
+        if not versions:
+            versions = ["No versions found"]
+
+        # Base models list
+        base_models = [k for k in QWEN3_TTS_MODELS.keys() if "Base" in k]
+        # Add local base models if available
+        available = get_available_models()
+        for m in available:
+            if "Base" in m and m not in base_models:
+                base_models.append(m)
 
         return {
             "required": {
-                "model_name": (models,),
+                "base_model": (base_models, {"default": "Qwen/Qwen3-TTS-12Hz-1.7B-Base"}),
+                "speaker_name": (speakers,),
+                "version": (versions,),
                 "precision": (["fp16", "bf16", "fp32"], {"default": "bf16"}),
                 "attention": (["auto", "flash_attention_2", "sdpa", "eager"], {"default": "auto"}),
             }
@@ -621,35 +623,57 @@ class Qwen3LoadFineTuned:
     FUNCTION = "load_model"
     CATEGORY = "Qwen3-TTS/Loader"
 
-    def load_model(self, model_name, precision, attention):
-        if model_name == "No fine-tuned models found":
+    def load_model(self, base_model, speaker_name, version, precision, attention):
+        if speaker_name == "No fine-tuned speakers found":
             raise ValueError("No fine-tuned models found. Please train a model first or check models/tts/finetuned_model.")
 
-        # Resolve path
+        # Resolve paths
         scan_paths = [
             os.path.join(folder_paths.models_dir, "tts", "finetuned_model"),
             os.path.join(folder_paths.models_dir, "Qwen3-TTS", "finetuned_model"),
         ]
 
-        model_path = None
+        checkpoint_path = None
         for base_path in scan_paths:
-            candidate = os.path.join(base_path, model_name)
+            candidate = os.path.join(base_path, speaker_name, version)
             if os.path.exists(candidate) and os.path.isdir(candidate):
-                model_path = candidate
+                checkpoint_path = candidate
                 break
 
-        if not model_path:
-             raise FileNotFoundError(f"Model '{model_name}' not found in finetuned_model directories.")
+        if not checkpoint_path:
+             raise FileNotFoundError(f"Checkpoint not found for speaker '{speaker_name}' version '{version}'. Checked paths: {[os.path.join(p, speaker_name, version) for p in scan_paths]}")
 
-        print(f"[Qwen3-TTS] Loading Fine-Tuned Model from: {model_path}")
+        print(f"[Qwen3-TTS] Loading Fine-Tuned Checkpoint: {checkpoint_path}")
+        print(f"[Qwen3-TTS] Using Base Model: {base_model}")
+
+        # Resolve Base Model Path
+        if base_model in QWEN3_TTS_MODELS:
+            local_path = get_local_model_path(base_model)
+            if os.path.exists(local_path) and os.listdir(local_path):
+                base_model_path = local_path
+            else:
+                base_model_path = download_model_to_comfyui(base_model, "HuggingFace")
+        else:
+            # Handle "✓ " or "Local: " prefix if present from get_available_models
+            clean_base = base_model.replace("✓ ", "").replace("Local: ", "")
+            # Check if it's a known repo
+            local_path = get_local_model_path(clean_base)
+            if os.path.exists(local_path):
+                 base_model_path = local_path
+            else:
+                 # Try full path if it's a relative path provided
+                 base_model_path = os.path.join(TTS_MODELS_DIR, clean_base)
+                 if not os.path.exists(base_model_path):
+                     base_model_path = os.path.join(OLD_QWEN3_TTS_MODELS_DIR, clean_base)
+
+        if not os.path.exists(base_model_path):
+            raise FileNotFoundError(f"Base model path not found: {base_model_path}")
 
         device = mm.get_torch_device()
-
         dtype = torch.float32
         if precision == "bf16":
             if device.type == "mps":
                 dtype = torch.float16
-                print("Note: Using fp16 on MPS (bf16 has limited support)")
             else:
                 dtype = torch.bfloat16
         elif precision == "fp16":
@@ -661,29 +685,42 @@ class Qwen3LoadFineTuned:
         else:
             try:
                 import flash_attn
-                import importlib.metadata
-                importlib.metadata.version("flash_attn")
                 attn_impl = "flash_attention_2"
             except Exception:
                 attn_impl = "sdpa"
 
-        print(f"Loading Qwen3-TTS model on {device} as {dtype} (Attn: {attn_impl})")
+        print(f"Loading Base Qwen3-TTS model on {device} as {dtype}")
 
+        # Load Base Model (Initializes architecture + tokenizer correctly)
         model = Qwen3TTSModel.from_pretrained(
-            model_path,
+            base_model_path,
             device_map=device,
             dtype=dtype,
             attn_implementation=attn_impl
         )
 
-        # INJECTION LOGIC
+        # Load Weights from Checkpoint
+        ckpt_weights = os.path.join(checkpoint_path, "pytorch_model.bin")
+        if os.path.exists(ckpt_weights):
+            print(f"Loading fine-tuned weights from {ckpt_weights}...")
+            state_dict = torch.load(ckpt_weights, map_location="cpu")
+            # Loose strictness to allow for potential mismatch in unused layers if any,
+            # though usually finetune matches base structure.
+            keys = model.model.load_state_dict(state_dict, strict=False)
+            if keys.missing_keys:
+                print(f"DEBUG: Missing keys (expected for PEFT or partial loads, check if critical): {keys.missing_keys[:5]}...")
+            if keys.unexpected_keys:
+                print(f"DEBUG: Unexpected keys: {keys.unexpected_keys[:5]}...")
+        else:
+             raise ValueError(f"pytorch_model.bin not found in checkpoint: {checkpoint_path}")
+
+        # INJECTION LOGIC (Speaker Config)
         try:
-            cfg_file = os.path.join(model_path, "config.json")
+            cfg_file = os.path.join(checkpoint_path, "config.json")
             if os.path.exists(cfg_file):
                 with open(cfg_file, 'r', encoding='utf-8') as f:
                     cfg_data = json.load(f)
 
-                # Helper to update recursive configs
                 configs_to_update = []
                 if hasattr(model, "config"): configs_to_update.append(model.config)
                 if hasattr(model, "model") and hasattr(model.model, "config"): configs_to_update.append(model.model.config)
@@ -705,10 +742,9 @@ class Qwen3LoadFineTuned:
                                 t_cfg.spk_is_dialect = {}
                             if isinstance(t_cfg.spk_is_dialect, dict):
                                 t_cfg.spk_is_dialect.update(new_spk_dialect)
-
                             found_any = True
 
-                    # Update internal talker config (Critical for generation validation)
+                    # Update internal talker config
                     if hasattr(model, "model") and hasattr(model.model, "talker") and hasattr(model.model.talker, "config"):
                         st_cfg = model.model.talker.config
                         if not hasattr(st_cfg, "spk_id") or st_cfg.spk_id is None:
@@ -718,7 +754,7 @@ class Qwen3LoadFineTuned:
                         found_any = True
 
                     if found_any:
-                         print(f"DEBUG: Successfully injected custom speaker mapping from {model_name}: {list(new_spk_id.keys())}")
+                         print(f"DEBUG: Successfully injected custom speaker mapping from {checkpoint_path}: {list(new_spk_id.keys())}")
 
                 if "tts_model_type" in cfg_data:
                     new_tts_model_type = cfg_data["tts_model_type"]
@@ -2025,7 +2061,9 @@ class Qwen3FineTune:
                 PromptServer.instance.send_progress_text(text, unique_id)
 
         # Setup output directory
-        full_output_dir = os.path.abspath(output_dir)
+        base_output_dir = os.path.abspath(output_dir)
+        # Create the speaker subdirectory
+        full_output_dir = os.path.join(base_output_dir, speaker_name)
         os.makedirs(full_output_dir, exist_ok=True)
         print(f"[Qwen3-TTS DEBUG] Full output directory: {full_output_dir}")
 
