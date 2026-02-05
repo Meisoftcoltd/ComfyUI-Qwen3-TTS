@@ -2963,7 +2963,7 @@ class Qwen3PrecomputedDataset(Dataset):
         }
 
 # ==============================================================================
-# CLASE Qwen3TrainLoRA (VERSIÓN v7.3 - LoRA FIRST)
+# CLASE Qwen3TrainLoRA (VERSIÓN v8 - PROXY STRATEGY)
 # ==============================================================================
 class Qwen3TrainLoRA:
     @classmethod
@@ -2995,7 +2995,6 @@ class Qwen3TrainLoRA:
         import torch.nn as nn
         import os
         import json
-        import types
         from transformers import AutoModelForCausalLM, TrainingArguments, Trainer, AutoConfig
         from peft import LoraConfig, get_peft_model, TaskType
         from torch.nn.utils.rnn import pad_sequence
@@ -3014,7 +3013,7 @@ class Qwen3TrainLoRA:
                 def __getitem__(self, idx): return self.data[idx]
             dataset_cls = Qwen3PrecomputedDataset
 
-        print(f"🔄 [Qwen3-TTS] Iniciando Protocolo v7.3 (LoRA First): {model_version}")
+        print(f"🔄 [Qwen3-TTS] Iniciando Protocolo v8 (Proxy Strategy): {model_version}")
 
         # 1. Config Registration
         try:
@@ -3045,44 +3044,82 @@ class Qwen3TrainLoRA:
 
         hf_model.config.use_cache = False
 
+        # 3. EXTRAER COMPONENTES PARA EL PROXY
+        # Necesitamos el Talker (LLM) y la capa de Embeddings
+        talker = getattr(hf_model, "talker", None)
+        if not talker:
+            raise ValueError("CRITICAL: No se encontró el módulo 'talker' en el modelo.")
+
+        embedding_layer = None
+        # Búsqueda quirúrgica de embeddings
+        if hasattr(talker, "model") and hasattr(talker.model, "text_embedding"):
+            embedding_layer = talker.model.text_embedding
+        else:
+            # Búsqueda por fuerza bruta
+            for m in talker.modules():
+                if isinstance(m, nn.Embedding) and m.num_embeddings > 50000:
+                    embedding_layer = m; break
+
+        if not embedding_layer:
+            raise ValueError("CRITICAL: No se encontró la capa de embeddings.")
+
+        print("✅ Componentes extraídos para el Proxy.")
+
         # ============================================================
-        # 💉 FIX 1: GLOBAL EMBEDDING PATCH (Para que PEFT no falle al iniciar)
+        # 🧬 Qwen3Proxy: El intermediario que arregla todo
         # ============================================================
-        real_embeddings = None
-        for name, module in hf_model.named_modules():
-            if isinstance(module, nn.Embedding) and module.num_embeddings > 50000:
-                real_embeddings = module
-                print(f"✅ Embeddings encontrados: '{name}'")
-                break
+        class Qwen3Proxy(nn.Module):
+            def __init__(self, talker_module, embed_module, original_config):
+                super().__init__()
+                self.talker = talker_module
+                self.embed = embed_module
+                self.config = original_config
 
-        if real_embeddings:
-            def get_input_embeddings_patch(self): return real_embeddings
-            hf_model.get_input_embeddings = types.MethodType(get_input_embeddings_patch, hf_model)
-            # Patch children just in case
-            if hasattr(hf_model, "talker"):
-                hf_model.talker.get_input_embeddings = types.MethodType(get_input_embeddings_patch, hf_model.talker)
+                # Asegurar que el talker tiene config accesible para PEFT
+                if not hasattr(self.talker, "config"):
+                    self.talker.config = original_config
 
-        # Activamos gradientes (IMPORTANTE: Antes de LoRA)
-        hf_model.gradient_checkpointing_enable()
-        try: hf_model.enable_input_require_grads()
-        except: pass
+            def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
+                # 1. Calculamos embeddings manualmente
+                # Esto evita que el Talker intente usar self.embed_tokens (que no tiene)
+                inputs_embeds = self.embed(input_ids)
 
-        # ============================================================
-        # 💉 FIX 2: RUNTIME EMBEDDING INJECTION (Para que el forward no falle)
-        # ============================================================
-        # Inyectamos 'embed_tokens' directamente en el objeto Talker
-        # Esto soluciona el AttributeError original sin romper el grafo
-        if hasattr(hf_model, "talker"):
-            if not hasattr(hf_model.talker, "embed_tokens"):
-                hf_model.talker.embed_tokens = real_embeddings
-                print("💉 Inyectado 'embed_tokens' en hf_model.talker")
+                # 2. Pasamos los embeddings al Talker
+                # Talker acepta 'inputs_embeds' y calcula todo lo demás (loss, logits)
+                outputs = self.talker(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    return_dict=True,
+                    output_hidden_states=False
+                )
 
-        if hasattr(hf_model, "model") and hasattr(hf_model.model, "talker"):
-             if not hasattr(hf_model.model.talker, "embed_tokens"):
-                hf_model.model.talker.embed_tokens = real_embeddings
-                print("💉 Inyectado 'embed_tokens' en hf_model.model.talker")
+                return outputs
 
-        # 4. LoRA Setup (Standard)
+            def enable_input_require_grads(self):
+                # Habilitar gradientes en embeddings (crucial para LoRA)
+                self.embed.weight.requires_grad_(True)
+
+            def gradient_checkpointing_enable(self, **kwargs):
+                if hasattr(self.talker, "gradient_checkpointing_enable"):
+                    self.talker.gradient_checkpointing_enable(**kwargs)
+
+            def get_input_embeddings(self):
+                return self.embed
+
+            def save_pretrained(self, path):
+                # Dummy method, PEFT guarda los adaptadores por su cuenta
+                pass
+
+        # 4. Instanciar Proxy
+        # Este será el modelo "base" que ve PEFT
+        proxy_model = Qwen3Proxy(talker, embedding_layer, hf_model.config)
+
+        # Activar optimizaciones en el proxy
+        proxy_model.gradient_checkpointing_enable()
+        proxy_model.enable_input_require_grads()
+
+        # 5. Configurar LoRA sobre el Proxy
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False,
@@ -3092,43 +3129,11 @@ class Qwen3TrainLoRA:
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
         )
 
-        lora_model = get_peft_model(hf_model, peft_config)
+        # Ahora PEFT envuelve a nuestro Proxy, que funciona correctamente
+        lora_model = get_peft_model(proxy_model, peft_config)
         lora_model.print_trainable_parameters()
 
-        # RE-APPLY PATCH TO LORA WRAPPER (Critical!)
-        if hasattr(lora_model, "get_base_model"):
-            base = lora_model.get_base_model()
-            if hasattr(base, "talker"):
-                base.talker.embed_tokens = real_embeddings
-
-        # Wrapper mínimo para asegurar compatibilidad de argumentos con Trainer
-        class Qwen3SimpleWrapper(nn.Module):
-            def __init__(self, model):
-                super().__init__()
-                self.model = model
-                self.config = model.config
-
-            def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
-                # Llamamos al modelo LoRA normalmente
-                # El parche de embed_tokens debería hacer que funcione
-                return self.model(
-                    input_ids=input_ids,
-                    labels=labels,
-                    attention_mask=attention_mask,
-                    return_dict=True,
-                    use_cache=False
-                )
-
-            def save_pretrained(self, path):
-                self.model.save_pretrained(path)
-
-            def __getattr__(self, name):
-                try: return super().__getattr__(name)
-                except AttributeError: return getattr(self.model, name)
-
-        trainable_model = Qwen3SimpleWrapper(lora_model)
-
-        # 5. Dataset
+        # 6. Dataset
         train_dataset = dataset_cls(dataset_path)
 
         def custom_collate_fn(batch):
@@ -3142,7 +3147,7 @@ class Qwen3TrainLoRA:
             padded_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
             return {"input_ids": padded_inputs, "labels": padded_labels, "attention_mask": padded_mask}
 
-        # 6. Train
+        # 7. Ejecutar Entrenamiento
         full_output_dir = os.path.join(save_path, lora_name)
 
         args = TrainingArguments(
@@ -3161,20 +3166,20 @@ class Qwen3TrainLoRA:
         )
 
         trainer = Trainer(
-            model=trainable_model,
+            model=lora_model,
             args=args,
             train_dataset=train_dataset,
             data_collator=custom_collate_fn,
         )
 
-        print(f"--- 🚀 LAUNCHING V7.3 TRAINING ---")
+        print(f"--- 🚀 LANZANDO ENTRENAMIENTO (PROXY) ---")
         trainer.train()
 
         final_save_path = os.path.join(full_output_dir, "final")
         lora_model.save_pretrained(final_save_path)
-        print(f"✅ LoRA Saved: {final_save_path}")
+        print(f"✅ LoRA Guardado: {final_save_path}")
 
-        del trainer, lora_model, hf_model, trainable_model
+        del trainer, lora_model, hf_model, proxy_model
         torch.cuda.empty_cache()
 
         return (final_save_path,)
