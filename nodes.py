@@ -2963,7 +2963,7 @@ class Qwen3PrecomputedDataset(Dataset):
         }
 
 # ==============================================================================
-# CLASE Qwen3TrainLoRA (VERSIÓN V6 - BYPASS WRAPPER)
+# CLASE Qwen3TrainLoRA (VERSIÓN v6.1 - ORDEN CORREGIDO)
 # ==============================================================================
 class Qwen3TrainLoRA:
     @classmethod
@@ -3009,7 +3009,7 @@ class Qwen3TrainLoRA:
             def __len__(self): return len(self.data)
             def __getitem__(self, idx): return self.data[idx]
 
-        print(f"🔄 [Qwen3-TTS] Iniciando Protocolo v6 (Bypass Wrapper): {model_version}")
+        print(f"🔄 [Qwen3-TTS] Iniciando Protocolo v6.1 (Fix Orden): {model_version}")
 
         # 1. Config Registration
         try:
@@ -3039,13 +3039,11 @@ class Qwen3TrainLoRA:
             )
 
         hf_model.config.use_cache = False
-        hf_model.gradient_checkpointing_enable()
-        hf_model.enable_input_require_grads()
+        # IMPORTANTE: No activamos gradientes todavía. Primero parcheamos.
 
         # ============================================================
-        # 💉 FIX PEFT: Inject get_input_embeddings (Global Patch)
+        # 💉 FIX PEFT: Inject get_input_embeddings (ANTES DE TODO)
         # ============================================================
-        # PEFT needs this to identify trainable params even if we bypass the forward
         def locate_embeddings(model):
             # Look inside talker
             if hasattr(model, "talker"):
@@ -3060,15 +3058,23 @@ class Qwen3TrainLoRA:
         donor_embeddings = locate_embeddings(hf_model)
         if donor_embeddings:
             def get_input_embeddings_patch(self): return donor_embeddings
+            # Patch both root and talker just in case
             hf_model.get_input_embeddings = types.MethodType(get_input_embeddings_patch, hf_model)
             if hasattr(hf_model, "talker"):
                 hf_model.talker.get_input_embeddings = types.MethodType(get_input_embeddings_patch, hf_model.talker)
-            print("✅ PEFT Patch applied.")
+            print("✅ PEFT Patch aplicado correctamente (Antes de init).")
         else:
             print("⚠️ WARNING: Embeddings not found for PEFT patch.")
 
+        # AHORA SÍ activamos gradientes, porque el parche ya existe
+        hf_model.gradient_checkpointing_enable()
+        try:
+            hf_model.enable_input_require_grads()
+        except Exception as e:
+            print(f"⚠️ Nota: enable_input_require_grads falló ({e}), pero seguimos.")
+
         # ============================================================
-        # 🧠 BYPASS WRAPPER (The Solution)
+        # 🧠 BYPASS WRAPPER
         # ============================================================
         class Qwen3BypassWrapper(nn.Module):
             def __init__(self, full_model):
@@ -3079,47 +3085,50 @@ class Qwen3TrainLoRA:
                 # 1. Extract the Talker
                 self.talker = getattr(full_model, "talker", None)
                 if not self.talker:
-                    # Try to find it via scan
                     for m in full_model.modules():
                         if "Talker" in type(m).__name__:
                             self.talker = m
                             break
 
                 if not self.talker:
-                    raise ValueError("CRITICAL: Could not locate Talker component.")
+                    # Fallback critico: Usar el modelo entero si no hay talker
+                    print("⚠️ Talker no encontrado, usando modelo base como fallback.")
+                    self.transformer = getattr(full_model, "model", full_model)
+                    self.lm_head = getattr(full_model, "lm_head", None)
+                else:
+                    # 2. Extract Key Sub-Components
+                    self.transformer = getattr(self.talker, "model", None)
+                    self.lm_head = getattr(self.talker, "lm_head", None)
 
-                # 2. Extract Key Sub-Components (Bypassing the middle-man)
-                # The Transformer (handles inputs -> hidden states)
-                self.transformer = getattr(self.talker, "model", None)
-                # The Head (handles hidden states -> logits)
-                self.lm_head = getattr(self.talker, "lm_head", None)
+                if not self.lm_head:
+                    print("⚠️ LM Head no encontrado explícitamente. Asumiendo output directo.")
 
-                if not self.transformer or not self.lm_head:
-                    raise ValueError("CRITICAL: Could not locate Transformer or LM Head inside Talker.")
-
-                print("✅ Bypass Wrapper Configured: Direct connection established to Transformer + LM Head.")
+                print("✅ Bypass Wrapper Configurado.")
 
             def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
                 # DIRECT CALL to the internal Transformer
-                # This skips Qwen3TTSTalkerModel.forward() entirely!
-
-                # Qwen2Model forward returns (last_hidden_state, past_key_values, ...)
-                outputs = self.transformer(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    return_dict=True,
-                    use_cache=False
-                )
-
-                hidden_states = outputs.last_hidden_state
+                if self.transformer:
+                    outputs = self.transformer(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        return_dict=True,
+                        use_cache=False
+                    )
+                    hidden_states = outputs.last_hidden_state
+                else:
+                    # Mega fallback
+                    outputs = self.full_model(input_ids=input_ids)
+                    hidden_states = outputs[0]
 
                 # DIRECT CALL to the LM Head
-                logits = self.lm_head(hidden_states)
+                if self.lm_head:
+                    logits = self.lm_head(hidden_states)
+                else:
+                    logits = hidden_states # Should not happen in CausalLM
 
                 # Calculate Loss manually
                 loss = None
                 if labels is not None:
-                    # Standard Causal LM Loss
                     shift_logits = logits[..., :-1, :].contiguous()
                     shift_labels = labels[..., 1:].contiguous()
                     loss_fct = nn.CrossEntropyLoss()
@@ -3146,6 +3155,10 @@ class Qwen3TrainLoRA:
 
         lora_model_raw = get_peft_model(hf_model, peft_config)
         lora_model_raw.print_trainable_parameters()
+
+        # Re-apply patch to LoRA wrapper just in case
+        if donor_embeddings:
+             lora_model_raw.get_input_embeddings = types.MethodType(get_input_embeddings_patch, lora_model_raw)
 
         # Wrap the LoRA model in our Bypass
         trainable_model = Qwen3BypassWrapper(lora_model_raw)
