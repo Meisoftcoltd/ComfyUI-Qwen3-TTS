@@ -2963,7 +2963,7 @@ class Qwen3PrecomputedDataset(Dataset):
         }
 
 # ==============================================================================
-# CLASE Qwen3TrainLoRA (VERSIÓN v8.1 - THE MIMIC PROXY)
+# CLASE Qwen3TrainLoRA (VERSIÓN v8.2 - ROPE FIX)
 # ==============================================================================
 class Qwen3TrainLoRA:
     @classmethod
@@ -3013,9 +3013,9 @@ class Qwen3TrainLoRA:
                 def __getitem__(self, idx): return self.data[idx]
             dataset_cls = Qwen3PrecomputedDataset
 
-        print(f"🔄 [Qwen3-TTS] Iniciando Protocolo v8.1 (Mimic Proxy): {model_version}")
+        print(f"🔄 [Qwen3-TTS] Iniciando Protocolo v8.2 (RoPE Fix): {model_version}")
 
-        # 1. Config Registration
+        # 1. Config
         try:
             from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
             from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
@@ -3044,10 +3044,9 @@ class Qwen3TrainLoRA:
 
         hf_model.config.use_cache = False
 
-        # 3. EXTRAER COMPONENTES
+        # 3. Extract Components
         talker = getattr(hf_model, "talker", None)
-        if not talker:
-            raise ValueError("CRITICAL: No se encontró el módulo 'talker'.")
+        if not talker: raise ValueError("CRITICAL: No 'talker' found.")
 
         embedding_layer = None
         if hasattr(talker, "model") and hasattr(talker.model, "text_embedding"):
@@ -3057,13 +3056,11 @@ class Qwen3TrainLoRA:
                 if isinstance(m, nn.Embedding) and m.num_embeddings > 50000:
                     embedding_layer = m; break
 
-        if not embedding_layer:
-            raise ValueError("CRITICAL: No se encontró la capa de embeddings.")
-
+        if not embedding_layer: raise ValueError("CRITICAL: No embeddings found.")
         print("✅ Componentes extraídos.")
 
         # ============================================================
-        # 🧬 Qwen3Proxy v8.1: The Mimic
+        # 🧬 Qwen3Proxy v8.2: RoPE Stabilizer
         # ============================================================
         class Qwen3Proxy(nn.Module):
             def __init__(self, talker_module, embed_module, original_config):
@@ -3071,47 +3068,48 @@ class Qwen3TrainLoRA:
                 self.talker = talker_module
                 self.embed = embed_module
                 self.config = original_config
-
-                # Make sure talker has config access
                 if not hasattr(self.talker, "config"):
                     self.talker.config = original_config
 
             def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
-                # 1. Manual Embedding (Fixes 'embed_tokens' error)
+                # 1. Embeddings Manuales
                 inputs_embeds = self.embed(input_ids)
-
-                # 2. Force Gradients (Fixes 'element 0' error)
                 if not inputs_embeds.requires_grad:
                     inputs_embeds.requires_grad_(True)
 
-                # 3. Pass to Talker
+                # 2. GENERACIÓN MANUAL DE POSITION_IDS
+                # Esto es crucial para arreglar el error de RoPE (tamaño 627 vs 72)
+                # Si no se pasan, el modelo a veces infers mal la longitud o usa caché viejo
+                batch_size, seq_length = input_ids.shape
+                position_ids = torch.arange(0, seq_length, dtype=torch.long, device=input_ids.device)
+                position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+
+                # 3. Llamada al Talker con TODO explícito
                 outputs = self.talker(
                     inputs_embeds=inputs_embeds,
                     attention_mask=attention_mask,
+                    position_ids=position_ids, # <--- FIX
                     labels=labels,
                     return_dict=True,
-                    output_hidden_states=False
+                    output_hidden_states=False,
+                    use_cache=False # <--- FIX IMPORTANTE
                 )
 
                 return outputs
 
-            # DELEGATION: Pass all unknown calls (like prepare_inputs_for_generation) to the talker
+            # Delegation
             def __getattr__(self, name):
-                try:
-                    return super().__getattr__(name)
-                except AttributeError:
-                    return getattr(self.talker, name)
+                try: return super().__getattr__(name)
+                except AttributeError: return getattr(self.talker, name)
 
-            def get_input_embeddings(self):
-                return self.embed
+            def get_input_embeddings(self): return self.embed
+            def save_pretrained(self, path): pass
 
-            def save_pretrained(self, path):
-                pass
-
-        # 4. Instanciar Proxy
+        # 4. Setup Proxy & LoRA
         proxy_model = Qwen3Proxy(talker, embedding_layer, hf_model.config)
+        proxy_model.gradient_checkpointing_enable()
+        proxy_model.enable_input_require_grads()
 
-        # 5. Configurar LoRA
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False,
@@ -3124,7 +3122,7 @@ class Qwen3TrainLoRA:
         lora_model = get_peft_model(proxy_model, peft_config)
         lora_model.print_trainable_parameters()
 
-        # 6. Dataset & Collator
+        # 5. Dataset
         train_dataset = dataset_cls(dataset_path)
 
         def custom_collate_fn(batch):
@@ -3138,7 +3136,7 @@ class Qwen3TrainLoRA:
             padded_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
             return {"input_ids": padded_inputs, "labels": padded_labels, "attention_mask": padded_mask}
 
-        # 7. Ejecutar
+        # 6. Train
         full_output_dir = os.path.join(save_path, lora_name)
 
         args = TrainingArguments(
@@ -3163,7 +3161,7 @@ class Qwen3TrainLoRA:
             data_collator=custom_collate_fn,
         )
 
-        print(f"--- 🚀 LANZANDO ENTRENAMIENTO (MIMIC PROXY) ---")
+        print(f"--- 🚀 LANZANDO ENTRENAMIENTO (ROPE FIX) ---")
         trainer.train()
 
         final_save_path = os.path.join(full_output_dir, "final")
