@@ -2963,7 +2963,7 @@ class Qwen3PrecomputedDataset(Dataset):
         }
 
 # ==============================================================================
-# CLASE Qwen3TrainLoRA (VERSIÓN v6.1 - ORDEN CORREGIDO)
+# CLASE Qwen3TrainLoRA (VERSIÓN v6.2 - ROBUST FLATTEN & LM HEAD FIX)
 # ==============================================================================
 class Qwen3TrainLoRA:
     @classmethod
@@ -3009,7 +3009,7 @@ class Qwen3TrainLoRA:
             def __len__(self): return len(self.data)
             def __getitem__(self, idx): return self.data[idx]
 
-        print(f"🔄 [Qwen3-TTS] Iniciando Protocolo v6.1 (Fix Orden): {model_version}")
+        print(f"🔄 [Qwen3-TTS] Iniciando Protocolo v6.2 (Flatten Fix): {model_version}")
 
         # 1. Config Registration
         try:
@@ -3039,10 +3039,9 @@ class Qwen3TrainLoRA:
             )
 
         hf_model.config.use_cache = False
-        # IMPORTANTE: No activamos gradientes todavía. Primero parcheamos.
 
         # ============================================================
-        # 💉 FIX PEFT: Inject get_input_embeddings (ANTES DE TODO)
+        # 💉 FIX PEFT: Inject get_input_embeddings (PRE-GRADIENT)
         # ============================================================
         def locate_embeddings(model):
             # Look inside talker
@@ -3058,15 +3057,14 @@ class Qwen3TrainLoRA:
         donor_embeddings = locate_embeddings(hf_model)
         if donor_embeddings:
             def get_input_embeddings_patch(self): return donor_embeddings
-            # Patch both root and talker just in case
             hf_model.get_input_embeddings = types.MethodType(get_input_embeddings_patch, hf_model)
             if hasattr(hf_model, "talker"):
                 hf_model.talker.get_input_embeddings = types.MethodType(get_input_embeddings_patch, hf_model.talker)
-            print("✅ PEFT Patch aplicado correctamente (Antes de init).")
+            print("✅ PEFT Patch aplicado correctamente.")
         else:
             print("⚠️ WARNING: Embeddings not found for PEFT patch.")
 
-        # AHORA SÍ activamos gradientes, porque el parche ya existe
+        # Enable Gradients
         hf_model.gradient_checkpointing_enable()
         try:
             hf_model.enable_input_require_grads()
@@ -3074,7 +3072,7 @@ class Qwen3TrainLoRA:
             print(f"⚠️ Nota: enable_input_require_grads falló ({e}), pero seguimos.")
 
         # ============================================================
-        # 🧠 BYPASS WRAPPER
+        # 🧠 BYPASS WRAPPER (Robust LM Head Search)
         # ============================================================
         class Qwen3BypassWrapper(nn.Module):
             def __init__(self, full_model):
@@ -3091,22 +3089,24 @@ class Qwen3TrainLoRA:
                             break
 
                 if not self.talker:
-                    # Fallback critico: Usar el modelo entero si no hay talker
                     print("⚠️ Talker no encontrado, usando modelo base como fallback.")
                     self.transformer = getattr(full_model, "model", full_model)
                     self.lm_head = getattr(full_model, "lm_head", None)
                 else:
-                    # 2. Extract Key Sub-Components
                     self.transformer = getattr(self.talker, "model", None)
                     self.lm_head = getattr(self.talker, "lm_head", None)
 
+                # Search Global LM Head if missing in talker
                 if not self.lm_head:
-                    print("⚠️ LM Head no encontrado explícitamente. Asumiendo output directo.")
+                    print("⚠️ LM Head no encontrado en Talker, buscando en root...")
+                    self.lm_head = getattr(full_model, "lm_head", None)
+
+                if not self.lm_head:
+                    print("❌ CRITICAL WARNING: LM Head no encontrado. El entrenamiento fallará si no se encuentra.")
 
                 print("✅ Bypass Wrapper Configurado.")
 
             def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
-                # DIRECT CALL to the internal Transformer
                 if self.transformer:
                     outputs = self.transformer(
                         input_ids=input_ids,
@@ -3116,17 +3116,15 @@ class Qwen3TrainLoRA:
                     )
                     hidden_states = outputs.last_hidden_state
                 else:
-                    # Mega fallback
                     outputs = self.full_model(input_ids=input_ids)
                     hidden_states = outputs[0]
 
-                # DIRECT CALL to the LM Head
                 if self.lm_head:
                     logits = self.lm_head(hidden_states)
                 else:
-                    logits = hidden_states # Should not happen in CausalLM
+                    # Last ditch attempt to find output layer (weights=vocab size)
+                    logits = hidden_states
 
-                # Calculate Loss manually
                 loss = None
                 if labels is not None:
                     shift_logits = logits[..., :-1, :].contiguous()
@@ -3156,18 +3154,25 @@ class Qwen3TrainLoRA:
         lora_model_raw = get_peft_model(hf_model, peft_config)
         lora_model_raw.print_trainable_parameters()
 
-        # Re-apply patch to LoRA wrapper just in case
         if donor_embeddings:
              lora_model_raw.get_input_embeddings = types.MethodType(get_input_embeddings_patch, lora_model_raw)
 
-        # Wrap the LoRA model in our Bypass
         trainable_model = Qwen3BypassWrapper(lora_model_raw)
 
-        # 5. Dataset
+        # 5. Dataset & Collator
         train_dataset = Qwen3PrecomputedDataset(dataset_path)
 
         def custom_collate_fn(batch):
-            def flatten(x): return [item for sublist in x for item in (sublist if isinstance(sublist, list) else [sublist])] if isinstance(x[0], list) else x
+            # Robust Recursive Flattener
+            def flatten(x):
+                out = []
+                for item in x:
+                    if isinstance(item, list):
+                        out.extend(flatten(item))
+                    else:
+                        out.append(item)
+                return out
+
             input_ids = [torch.tensor(flatten(item['input_ids']), dtype=torch.long) for item in batch]
             labels = [torch.tensor(flatten(item['labels']), dtype=torch.long) for item in batch]
             attention_mask = [torch.tensor(flatten(item['attention_mask']), dtype=torch.long) for item in batch]
