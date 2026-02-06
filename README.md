@@ -88,10 +88,11 @@ Custom nodes for [Qwen2.5-Audio / Qwen3-TTS](https://huggingface.co/Qwen/Qwen2.5
 
 #### **Qwen3FineTune**
 *   **Function:** Performs full fine-tuning of the model.
-*   **Inputs:** `train_jsonl` (the `_codes.jsonl` file), `init_model`, `epochs`, `batch_size`, `lr`.
+*   **Inputs:** `train_jsonl` (the `_codes.jsonl` file), `init_model`, `epochs`, `batch_size`, `lr`, `target_loss`.
 *   **Outputs:** Path to the saved checkpoint.
 *   **Details:**
     *   **Epochs:** Minimum 50 recommended for convergence on small datasets.
+    *   **Target Loss:** Auto-stop mechanism. If loss drops below this value (e.g., 2.0), training stops and saves the model.
     *   **Learning Rate:** Defaults to `2e-6`. Higher values (e.g., `1e-5`) might cause noise/instability.
     *   **Mixed Precision:** Supports `bf16` (Ampere GPUs) and `fp32`.
     *   **Saving:** Saves `pytorch_model.bin` and `config.json` correctly mapped for immediate loading with `Qwen3LoadFineTuned`.
