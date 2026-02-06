@@ -1965,6 +1965,41 @@ class Qwen3DataPrep:
         print(f"Processing {total_items} items in {total_batches} batches...")
 
         with open(output_path, 'w', encoding='utf-8') as out_file:
+            def process_item_and_write(item, audio_code_tensor):
+                """Helper to process a single item with its audio code and write to file."""
+                audio_tokens = audio_code_tensor.cpu().tolist() # List of ints
+
+                # Prepare Prompt
+                instruction = item.get("instruction", "Speak clearly.")
+                text_content = item.get("text", "")
+
+                # ChatML format roughly (adapt as needed for Qwen instruct)
+                # For Qwen2.5 Audio/TTS, the prompt format usually involves <|audio_start|> tokens etc.
+                # but for basic causal LM training we treat it as text continuation.
+                # Simplified Prompt:
+                prompt_text = f"Instruction: {instruction}\nText: {text_content}\nGenerate Audio:"
+
+                # Tokenize Text
+                text_ids = text_tokenizer.encode(prompt_text, add_special_tokens=True)
+
+                # Combine: Text + Audio
+                input_ids = text_ids + audio_tokens
+
+                # Create Labels: -100 for text, audio_tokens for audio
+                labels = ([-100] * len(text_ids)) + audio_tokens
+
+                # Attention Mask
+                attention_mask = [1] * len(input_ids)
+
+                # Update item with training tensors
+                item['input_ids'] = input_ids
+                item['labels'] = labels
+                item['attention_mask'] = attention_mask
+                # Optional: keep audio_codes for reference
+                item['audio_codes'] = audio_tokens
+
+                out_file.write(json.dumps(item, ensure_ascii=False) + "\n")
+
             for batch_idx, i in enumerate(range(0, total_items, batch_size)):
                 batch = inputs[i:i+batch_size]
                 audio_paths = [b['audio'] for b in batch]
@@ -1973,45 +2008,44 @@ class Qwen3DataPrep:
                 print(status_msg)
                 send_status(status_msg)
 
-                # A. Encode Audio
-                enc_res = audio_tokenizer.encode(audio_paths)
-                audio_codes_batch = enc_res.audio_codes # List of tensors
+                try:
+                    # A. Attempt to Encode Audio (Batch)
+                    enc_res = audio_tokenizer.encode(audio_paths)
+                    audio_codes_batch = enc_res.audio_codes # List of tensors
 
-                # B. Process Text and Labels for each item
-                for j, code in enumerate(audio_codes_batch):
-                    item = batch[j]
-                    audio_tokens = code.cpu().tolist() # List of ints
+                    # B. Process Text and Labels for each item
+                    for j, code in enumerate(audio_codes_batch):
+                        process_item_and_write(batch[j], code)
 
-                    # Prepare Prompt
-                    instruction = item.get("instruction", "Speak clearly.")
-                    text_content = item.get("text", "")
+                except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                    # Catch OOM or "Allocation on device" RuntimeError
+                    err_msg = str(e)
+                    if "out of memory" in err_msg.lower() or "allocation on device" in err_msg.lower():
+                        print(f"[Qwen3DataPrep] ⚠️ OOM detected in batch {batch_idx+1}. Switching to sequential processing for this batch.")
+                        send_status(f"⚠️ OOM in batch {batch_idx+1}. Retrying sequentially...")
 
-                    # ChatML format roughly (adapt as needed for Qwen instruct)
-                    # For Qwen2.5 Audio/TTS, the prompt format usually involves <|audio_start|> tokens etc.
-                    # but for basic causal LM training we treat it as text continuation.
-                    # Simplified Prompt:
-                    prompt_text = f"Instruction: {instruction}\nText: {text_content}\nGenerate Audio:"
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
-                    # Tokenize Text
-                    text_ids = text_tokenizer.encode(prompt_text, add_special_tokens=True)
+                        # Fallback: Process one by one
+                        for b_item in batch:
+                            try:
+                                # Encode single audio
+                                # audio_tokenizer.encode expects a list
+                                enc_res_single = audio_tokenizer.encode([b_item['audio']])
+                                code_single = enc_res_single.audio_codes[0]
+                                process_item_and_write(b_item, code_single)
 
-                    # Combine: Text + Audio
-                    input_ids = text_ids + audio_tokens
-
-                    # Create Labels: -100 for text, audio_tokens for audio
-                    labels = ([-100] * len(text_ids)) + audio_tokens
-
-                    # Attention Mask
-                    attention_mask = [1] * len(input_ids)
-
-                    # Update item with training tensors
-                    item['input_ids'] = input_ids
-                    item['labels'] = labels
-                    item['attention_mask'] = attention_mask
-                    # Optional: keep audio_codes for reference
-                    item['audio_codes'] = audio_tokens
-
-                    out_file.write(json.dumps(item, ensure_ascii=False) + "\n")
+                                # Clear cache after each heavy item in fallback mode
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                            except Exception as inner_e:
+                                print(f"[Qwen3DataPrep] ❌ Failed to process file {b_item['audio']} even individually: {inner_e}")
+                                # We skip this file or raise?
+                                # If it fails individually, it's likely too big for VRAM even solo.
+                                # Let's skip it to allow the rest to finish, but log it error.
+                    else:
+                        raise e # Re-raise if it's not a memory error
 
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
