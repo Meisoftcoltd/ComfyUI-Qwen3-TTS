@@ -3263,37 +3263,60 @@ class Qwen3TrainLoRA:
         import json
         import types
         import sys
-        from transformers import AutoModelForCausalLM, TrainingArguments, Trainer, AutoConfig
+        import random
+        from transformers import AutoModelForCausalLM, TrainingArguments, Trainer, AutoConfig, EarlyStoppingCallback
         from peft import LoraConfig, get_peft_model, TaskType
         from torch.nn.utils.rnn import pad_sequence
 
-        # 0. Dataset Class
-        try:
-            from .nodes import Qwen3PrecomputedDataset
-            dataset_cls = Qwen3PrecomputedDataset
-        except ImportError:
-            class Qwen3PrecomputedDataset(torch.utils.data.Dataset):
-                def __init__(self, path):
-                    self.data = []
-                    with open(path, 'r') as f:
+        # --- 0. DATASET CLASS MEJORADA (Soporta listas en memoria) ---
+        class Qwen3SmartDataset(torch.utils.data.Dataset):
+            def __init__(self, data_source):
+                self.data = []
+                if isinstance(data_source, str): # Ruta de archivo
+                    with open(data_source, 'r', encoding='utf-8') as f:
                         for line in f: self.data.append(json.loads(line))
-                def __len__(self): return len(self.data)
-                def __getitem__(self, idx): return self.data[idx]
-            dataset_cls = Qwen3PrecomputedDataset
+                elif isinstance(data_source, list): # Lista en memoria
+                    self.data = data_source
+                else:
+                    raise ValueError("Fuente de datos no válida (debe ser ruta o lista)")
+            def __len__(self): return len(self.data)
+            def __getitem__(self, idx): return self.data[idx]
 
-        print(f"🔄 [Qwen3-TTS] Iniciando Protocolo v11 (Eager Force): {model_version}")
+        print(f"🔄 [Qwen3-TTS] Iniciando Protocolo Inteligente (Auto-Stop): {model_version}")
 
-        # 1. FORZAR DESACTIVACIÓN DE FLASH ATTENTION
-        # Mentimos a transformers para que crea que no existe FA2
+        # --- 1. PREPARACIÓN DE DATOS (TRAIN / VAL SPLIT) ---
+        all_data = []
+        try:
+            with open(dataset_path, 'r', encoding='utf-8') as f:
+                for line in f: all_data.append(json.loads(line))
+        except Exception as e:
+            raise ValueError(f"Error cargando dataset: {e}")
+
+        # Mezclar y dividir (90% Train / 10% Validacion)
+        random.seed(42)
+        random.shuffle(all_data)
+
+        val_size = int(len(all_data) * 0.1)
+        if val_size < 1: val_size = 1 # Mínimo 1 para validar
+
+        train_data = all_data[val_size:]
+        eval_data = all_data[:val_size]
+
+        print(f"📊 Datos Totales: {len(all_data)} | Train: {len(train_data)} | Val: {len(eval_data)}")
+
+        train_dataset = Qwen3SmartDataset(train_data)
+        eval_dataset = Qwen3SmartDataset(eval_data)
+
+        # --- 2. CONFIGURACIÓN DEL MODELO (Igual que v11) ---
+        # Forzar desactivación de Flash Attention 2
         import transformers.utils
         transformers.utils.is_flash_attn_2_available = lambda: False
-        print("🚫 Flash Attention 2 forzado a OFF (Monkey Patch).")
+        print("🚫 Flash Attention 2 forzado a OFF.")
 
-        # 2. Config & Register
         try:
             from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
             from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
-            # RoPE Patch (Mantenemos esto por seguridad)
+            # RoPE Patch
             import qwen_tts.core.models.modeling_qwen3_tts as qwen_module
 
             def patched_apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -3317,18 +3340,17 @@ class Qwen3TrainLoRA:
             AutoModelForCausalLM.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
         except ImportError: pass
 
-        # 3. Load Model (EAGER MODE)
+        # Carga del Modelo (EAGER MODE)
         try:
             hf_model = AutoModelForCausalLM.from_pretrained(
                 model_version,
                 device_map="auto",
                 torch_dtype=torch.bfloat16,
                 trust_remote_code=True,
-                attn_implementation="eager" # <--- MODO COMPATIBILIDAD MÁXIMA
+                attn_implementation="eager"
             )
-            print("⚡ Attention Mode: EAGER (Standard PyTorch)")
+            print("⚡ Attention Mode: EAGER")
         except:
-            print("⚠️ Fallback a carga estándar.")
             hf_model = AutoModelForCausalLM.from_pretrained(
                 model_version,
                 device_map="auto",
@@ -3338,36 +3360,27 @@ class Qwen3TrainLoRA:
 
         hf_model.config.use_cache = False
 
-        # 4. Component Extraction & Patching
+        # Extracción de componentes
         talker = getattr(hf_model, "talker", None)
         if not talker: raise ValueError("CRITICAL: Talker not found.")
-
-        # Inner backbone
         backbone = getattr(talker, "model", None)
         if not backbone: raise ValueError("CRITICAL: Backbone not found.")
 
-        # Embeddings
         embedding_layer = None
         for m in backbone.modules():
             if isinstance(m, nn.Embedding) and m.num_embeddings > 50000:
                 embedding_layer = m; break
-
         if not embedding_layer: raise ValueError("CRITICAL: Embeddings not found.")
 
-        # Inject Embedding Patch (Fixes initialization crashes)
+        # Patch init embeddings
         def get_input_embeddings_patch(self): return embedding_layer
         hf_model.get_input_embeddings = types.MethodType(get_input_embeddings_patch, hf_model)
         if hasattr(hf_model, "talker"):
             hf_model.talker.get_input_embeddings = types.MethodType(get_input_embeddings_patch, hf_model.talker)
 
-        # Habilitar gradientes en embeddings MANUALMENTE
         embedding_layer.weight.requires_grad_(True)
 
-        print("✅ Modelo preparado y parcheado.")
-
-        # ============================================================
-        # 🧬 Qwen3Proxy v11: Eager & Safe
-        # ============================================================
+        # --- 3. PROXY CLASS ---
         class Qwen3Proxy(nn.Module):
             def __init__(self, backbone_module, embed_module, original_config):
                 super().__init__()
@@ -3377,22 +3390,16 @@ class Qwen3TrainLoRA:
                 if not hasattr(self.backbone, "config"):
                     self.backbone.config = original_config
 
-            # DIPLOMACIA PARA PEFT
             def prepare_inputs_for_generation(self, *args, **kwargs): return {}
             def _validate_model_class(self): pass
             def _validate_model_kwargs(self, model_kwargs): pass
 
             def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
-                # 1. Embeddings
                 inputs_embeds = self.embed(input_ids)
-
-                # 2. Position IDs
                 batch_size, seq_length = input_ids.shape
                 position_ids = torch.arange(0, seq_length, dtype=torch.long, device=input_ids.device)
                 position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
 
-                # 3. Backbone Forward (Qwen2Model)
-                # Al usar Eager mode, esperamos que output sea normal
                 outputs = self.backbone(
                     inputs_embeds=inputs_embeds,
                     attention_mask=attention_mask,
@@ -3401,25 +3408,17 @@ class Qwen3TrainLoRA:
                     use_cache=False
                 )
 
-                # Qwen2Model devuelve (hidden_states, ...)
                 hidden_states = outputs.last_hidden_state
 
-                # 4. LM Head Projection (Manual)
-                # Buscamos la head dinámicamente en el padre (talker)
-                # Esto es más seguro que guardarla en init
+                # Auto-detect Head
                 logits = hidden_states
-                if hasattr(self.backbone, "lm_head"):
-                    logits = self.backbone.lm_head(hidden_states)
-                elif hasattr(talker, "lm_head"):
-                    logits = talker.lm_head(hidden_states)
+                if hasattr(self.backbone, "lm_head"): logits = self.backbone.lm_head(hidden_states)
+                elif hasattr(talker, "lm_head"): logits = talker.lm_head(hidden_states)
                 else:
-                    # Fallback de emergencia: búsqueda global
                     for m in talker.modules():
-                        if isinstance(m, nn.Linear) and m.out_features == 151936: # Vocab size aprox
-                            logits = m(hidden_states)
-                            break
+                        if isinstance(m, nn.Linear) and m.out_features == 151936:
+                            logits = m(hidden_states); break
 
-                # 5. Loss
                 loss = None
                 if labels is not None:
                     shift_logits = logits[..., :-1, :].contiguous()
@@ -3432,18 +3431,12 @@ class Qwen3TrainLoRA:
             def __getattr__(self, name):
                 try: return super().__getattr__(name)
                 except AttributeError: return getattr(self.backbone, name)
-
             def get_input_embeddings(self): return self.embed
             def save_pretrained(self, path): pass
 
-        # 5. Setup Proxy
         proxy_model = Qwen3Proxy(backbone, embedding_layer, hf_model.config)
 
-        # NOTA: Desactivamos gradient checkpointing para evitar errores de autograd complejos
-        # Con 24GB VRAM y batch=1, debería entrar sin problemas.
-        # proxy_model.gradient_checkpointing_enable()
-
-        # 6. LoRA
+        # --- 4. CONFIGURACIÓN LORA & TRAINER ---
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False,
@@ -3455,9 +3448,6 @@ class Qwen3TrainLoRA:
 
         lora_model = get_peft_model(proxy_model, peft_config)
         lora_model.print_trainable_parameters()
-
-        # 7. Train
-        train_dataset = dataset_cls(dataset_path)
 
         def custom_collate_fn(batch):
             def flatten(x): return [item for sublist in x for item in (sublist if isinstance(sublist, list) else [sublist])] if isinstance(x[0], list) else x
@@ -3472,16 +3462,32 @@ class Qwen3TrainLoRA:
 
         full_output_dir = os.path.join(save_path, lora_name)
 
+        # Lógica de seguridad para Early Stopping
+        # Aseguramos al menos 50 epochs para dejar trabajar al algoritmo,
+        # pero si el usuario pide más (ej. 100), respetamos su deseo.
+        run_epochs = max(epochs, 50)
+
+        print(f"ℹ️ Configuración Auto-Stop: Se ha establecido un techo de {run_epochs} Epochs.")
+        print(f"   (El entrenamiento parará antes si no mejora la calidad durante 5 epochs seguidas).")
+
         args = TrainingArguments(
             output_dir=full_output_dir,
             per_device_train_batch_size=batch_size,
             gradient_accumulation_steps=4,
             learning_rate=learning_rate,
-            num_train_epochs=epochs,
-            bf16=True,
-            fp16=False,
+
+            # --- PARÁMETROS DE AUTO-STOP ---
+            num_train_epochs=run_epochs,     # Techo dinámico
+            evaluation_strategy="epoch",     # Evaluar cada epoch
+            save_strategy="epoch",           # Guardar cada epoch
+            load_best_model_at_end=True,     # Recuperar el mejor al final
+            metric_for_best_model="eval_loss",
+            greater_is_better=False,
+            save_total_limit=3,              # Guardar solo los 3 mejores
+            # -------------------------------
+
+            bf16=True, fp16=False,
             logging_steps=5,
-            save_strategy="no",
             optim="adamw_torch",
             remove_unused_columns=False,
             report_to="none"
@@ -3491,15 +3497,26 @@ class Qwen3TrainLoRA:
             model=lora_model,
             args=args,
             train_dataset=train_dataset,
+            eval_dataset=eval_dataset,       # <--- VALIDACIÓN
             data_collator=custom_collate_fn,
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=5)] # <--- PACIENCIA 5
         )
 
-        print(f"--- 🚀 LANZANDO ENTRENAMIENTO (V11 EAGER) ---")
+        print(f"--- 🚀 LANZANDO ENTRENAMIENTO AUTOMÁTICO (HASTA {run_epochs} EPOCHS O STOP) ---")
         trainer.train()
 
         final_save_path = os.path.join(full_output_dir, "final")
-        lora_model.save_pretrained(final_save_path)
-        print(f"✅ LoRA Guardado: {final_save_path}")
+
+        # Guardar el mejor modelo (ya cargado en memoria)
+        print("💾 Guardando el MEJOR modelo obtenido...")
+        if hasattr(lora_model, "save_pretrained"):
+            lora_model.save_pretrained(final_save_path)
+        else:
+            # Fallback
+            try: lora_model.base_model.save_pretrained(final_save_path)
+            except: pass
+
+        print(f"✅ LoRA Final Guardado: {final_save_path}")
 
         del trainer, lora_model, hf_model, proxy_model
         torch.cuda.empty_cache()
