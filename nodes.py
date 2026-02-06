@@ -2084,6 +2084,7 @@ class Qwen3FineTune:
                 "epochs": ("INT", {"default": 3, "min": 1, "max": 1000, "tooltip": "Number of training epochs to run."}),
                 "batch_size": ("INT", {"default": 2, "min": 1, "max": 64, "tooltip": "Number of samples per batch. Lower values use less VRAM."}),
                 "lr": ("FLOAT", {"default": 2e-6, "step": 1e-7, "tooltip": "Learning rate. Qwen default (2e-5) is too aggressive for small batches, causing noise output. Defaults to 2e-6 for stability."}),
+                "target_loss": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100.0, "step": 0.1, "tooltip": "Detener entrenamiento si el Loss baja de este valor (0.0 = desactivado)"}),
                 "speaker_name": ("STRING", {"default": "my_speaker", "tooltip": "Name for the custom speaker. Use this name when generating with the fine-tuned model."}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff, "tooltip": "Random seed for reproducibility."}),
             },
@@ -2117,7 +2118,7 @@ class Qwen3FineTune:
     FUNCTION = "train"
     CATEGORY = "Qwen3-TTS/Training"
 
-    def train(self, train_jsonl, init_model, source, output_dir, epochs, batch_size, lr, speaker_name, seed, mixed_precision="bf16", resume_training=False, log_every_steps=10, save_every_epochs=1, save_every_steps=0, gradient_accumulation=4, gradient_checkpointing=True, use_8bit_optimizer=True, weight_decay=0.01, max_grad_norm=1.0, warmup_steps=0, warmup_ratio=0.0, save_optimizer_state=False, unique_id=None):
+    def train(self, train_jsonl, init_model, source, output_dir, epochs, batch_size, lr, target_loss, speaker_name, seed, mixed_precision="bf16", resume_training=False, log_every_steps=10, save_every_epochs=1, save_every_steps=0, gradient_accumulation=4, gradient_checkpointing=True, use_8bit_optimizer=True, weight_decay=0.01, max_grad_norm=1.0, warmup_steps=0, warmup_ratio=0.0, save_optimizer_state=False, unique_id=None):
         train_jsonl = fix_wsl_path(train_jsonl)
         output_dir = fix_wsl_path(output_dir)
         init_model = fix_wsl_path(init_model)
@@ -2614,6 +2615,26 @@ class Qwen3FineTune:
 
                             epoch_loss += loss.item()
                             steps += 1
+
+                            # --- LOGICA DE TARGET LOSS ---
+                            if target_loss > 0 and loss.item() <= target_loss:
+                                print(f"\n🎯 [Qwen3-TTS] OBJETIVO ALCANZADO: Loss {loss.item():.4f} <= {target_loss}")
+                                send_status(f"🎯 Target Loss reached: {loss.item():.4f}")
+                                print(f"💾 Guardando checkpoint final y deteniendo...")
+
+                                final_path = save_final_model(f"target_reached_loss_{loss.item():.4f}")
+
+                                # Clean up and exit
+                                accelerator.free_memory()
+                                del model, optimizer, train_dataloader, qwen3tts
+                                if torch.cuda.is_available():
+                                    torch.cuda.synchronize()
+                                    torch.cuda.empty_cache()
+
+                                print(f"Fine-tuning complete (Target Reached). Model saved to {final_path}")
+                                send_status("Training complete (Target Reached)!")
+                                return (final_path, speaker_name)
+                            # -----------------------------
 
                             # Only count optimizer steps (after gradient accumulation completes)
                             if accelerator.sync_gradients:
