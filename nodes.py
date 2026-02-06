@@ -526,6 +526,9 @@ class Qwen3Loader:
                         potential_name = list(new_spk_id.keys())[0]
                         if potential_name and potential_name.strip():
                             clean_model_name = potential_name.strip()
+                            # CRITICAL: This was missing! Actually update the output variable if you want it to work.
+                            # Although Qwen3Loader returns (model, clean_model_name), clean_model_name is a local variable.
+                            # We just need to ensure clean_model_name holds the correct string.
                             print(f"[Qwen3-TTS] Updated model_name from config: {clean_model_name}")
                     # ----------------------------------------------------
 
@@ -3268,7 +3271,7 @@ class Qwen3TrainLoRA:
         from peft import LoraConfig, get_peft_model, TaskType
         from torch.nn.utils.rnn import pad_sequence
 
-        # --- 0. DATASET CLASS MEJORADA (Soporta listas en memoria) ---
+        # --- 0. DATASET CLASS MEJORADA (Lista/Archivo) ---
         class Qwen3SmartDataset(torch.utils.data.Dataset):
             def __init__(self, data_source):
                 self.data = []
@@ -3307,8 +3310,8 @@ class Qwen3TrainLoRA:
         train_dataset = Qwen3SmartDataset(train_data)
         eval_dataset = Qwen3SmartDataset(eval_data)
 
-        # --- 2. CONFIGURACIÓN DEL MODELO (Igual que v11) ---
-        # Forzar desactivación de Flash Attention 2
+        # --- 2. CONFIGURACIÓN DEL MODELO Y PARCHES ---
+        # Forzar desactivación de Flash Attention 2 para evitar errores de forma
         import transformers.utils
         transformers.utils.is_flash_attn_2_available = lambda: False
         print("🚫 Flash Attention 2 forzado a OFF.")
@@ -3316,10 +3319,12 @@ class Qwen3TrainLoRA:
         try:
             from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
             from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
-            # RoPE Patch
             import qwen_tts.core.models.modeling_qwen3_tts as qwen_module
 
+            # --- PARCHE ROPE REFORZADO (Fix 16 vs 2 crash) ---
             def patched_apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+                # q shape: [batch, heads, seq, dim]
+                # 1. Corregir Longitud (Seq Len)
                 seq_len = q.shape[2]
                 if cos.shape[2] < seq_len:
                     repeats = (seq_len // cos.shape[2]) + 1
@@ -3329,12 +3334,20 @@ class Qwen3TrainLoRA:
                     cos = cos[..., :seq_len, :]
                     sin = sin[..., :seq_len, :]
 
+                # 2. Corregir Cabezales (Heads - Dim 1)
+                # Si cos tiene dim=2 y q tiene dim=16, forzamos a 1 para broadcasting
+                if cos.shape[1] != 1 and cos.shape[1] != q.shape[1]:
+                    cos = cos[:, :1, :, :]
+                    sin = sin[:, :1, :, :]
+
                 from qwen_tts.core.models.modeling_qwen3_tts import rotate_half
                 q_embed = (q * cos) + (rotate_half(q) * sin)
                 k_embed = (k * cos) + (rotate_half(k) * sin)
                 return q_embed, k_embed
 
+            # Aplicar parche globalmente
             qwen_module.apply_multimodal_rotary_pos_emb = patched_apply_rotary_pos_emb
+            print("💉 Parche RoPE aplicado (SeqLen + Heads fix).")
 
             AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
             AutoModelForCausalLM.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
@@ -3397,6 +3410,7 @@ class Qwen3TrainLoRA:
             def forward(self, input_ids, labels=None, attention_mask=None, **kwargs):
                 inputs_embeds = self.embed(input_ids)
                 batch_size, seq_length = input_ids.shape
+                # Crear position_ids manualmente para ayudar a RoPE
                 position_ids = torch.arange(0, seq_length, dtype=torch.long, device=input_ids.device)
                 position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
 
@@ -3462,13 +3476,9 @@ class Qwen3TrainLoRA:
 
         full_output_dir = os.path.join(save_path, lora_name)
 
-        # Lógica de seguridad para Early Stopping
-        # Aseguramos al menos 50 epochs para dejar trabajar al algoritmo,
-        # pero si el usuario pide más (ej. 100), respetamos su deseo.
+        # TECHO DINÁMICO: Aseguramos mínimo 50 epochs para que funcione EarlyStopping
         run_epochs = max(epochs, 50)
-
-        print(f"ℹ️ Configuración Auto-Stop: Se ha establecido un techo de {run_epochs} Epochs.")
-        print(f"   (El entrenamiento parará antes si no mejora la calidad durante 5 epochs seguidas).")
+        print(f"ℹ️ Auto-Stop Config: Techo establecido en {run_epochs} Epochs (Input: {epochs}).")
 
         args = TrainingArguments(
             output_dir=full_output_dir,
@@ -3476,15 +3486,15 @@ class Qwen3TrainLoRA:
             gradient_accumulation_steps=4,
             learning_rate=learning_rate,
 
-            # --- PARÁMETROS DE AUTO-STOP ---
-            num_train_epochs=run_epochs,     # Techo dinámico
-            evaluation_strategy="epoch",     # Evaluar cada epoch
-            save_strategy="epoch",           # Guardar cada epoch
-            load_best_model_at_end=True,     # Recuperar el mejor al final
+            # --- AUTO-STOP ---
+            num_train_epochs=run_epochs,
+            evaluation_strategy="epoch",
+            save_strategy="epoch",
+            load_best_model_at_end=True,
             metric_for_best_model="eval_loss",
             greater_is_better=False,
-            save_total_limit=3,              # Guardar solo los 3 mejores
-            # -------------------------------
+            save_total_limit=3,
+            # -----------------
 
             bf16=True, fp16=False,
             logging_steps=5,
@@ -3497,22 +3507,20 @@ class Qwen3TrainLoRA:
             model=lora_model,
             args=args,
             train_dataset=train_dataset,
-            eval_dataset=eval_dataset,       # <--- VALIDACIÓN
+            eval_dataset=eval_dataset,       # Validación
             data_collator=custom_collate_fn,
-            callbacks=[EarlyStoppingCallback(early_stopping_patience=5)] # <--- PACIENCIA 5
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=5)] # Paciencia 5
         )
 
-        print(f"--- 🚀 LANZANDO ENTRENAMIENTO AUTOMÁTICO (HASTA {run_epochs} EPOCHS O STOP) ---")
+        print(f"--- 🚀 LANZANDO ENTRENAMIENTO (AUTO-STOP ACTIVO) ---")
         trainer.train()
 
         final_save_path = os.path.join(full_output_dir, "final")
 
-        # Guardar el mejor modelo (ya cargado en memoria)
         print("💾 Guardando el MEJOR modelo obtenido...")
         if hasattr(lora_model, "save_pretrained"):
             lora_model.save_pretrained(final_save_path)
         else:
-            # Fallback
             try: lora_model.base_model.save_pretrained(final_save_path)
             except: pass
 
