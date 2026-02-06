@@ -4,10 +4,10 @@ Custom nodes for [Qwen2.5-Audio / Qwen3-TTS](https://huggingface.co/Qwen/Qwen2.5
 
 ## Features
 
-*   **🎙️ Text-to-Speech (TTS):** Generate high-quality speech from text in multiple languages.
+*   **🎙️ Text-to-Speech (TTS):** Generate high-quality speech from text in multiple languages (English, Chinese, Spanish, etc.).
 *   **👥 Voice Cloning:** Clone voices from a short reference audio clip (3-10s recommended).
 *   **🎨 Voice Design:** Design custom voices by describing attributes like gender, age, pitch, speed, and emotion.
-*   **🎓 Fine-Tuning & LoRA:** Complete pipeline to fine-tune the model or train lightweight LoRA adapters on your own voice dataset.
+*   **🎓 Fine-Tuning:** Complete pipeline to fine-tune the model on your own voice dataset. Fine-tuning provides superior stability and tone matching compared to zero-shot cloning.
 *   **📁 Modular Dataset Pipeline:** Automate dataset creation: Load raw audio -> Transcribe with Whisper -> Auto-Label emotions with Qwen2-Audio -> Export JSONL.
 *   **⚙️ Advanced Config:** Fixes for "Unsupported speakers" in fine-tuned models and detailed prompt control.
 
@@ -24,32 +24,113 @@ Custom nodes for [Qwen2.5-Audio / Qwen3-TTS](https://huggingface.co/Qwen/Qwen2.5
     ```bash
     pip install -r requirements.txt
     ```
-    *Note: Training features require `peft`, `bitsandbytes`, and `accelerate`. Dataset creation requires `openai-whisper` and `pydub`.*
+    *Note: Training features require `bitsandbytes` and `accelerate`. Dataset creation requires `openai-whisper` and `pydub` (and ffmpeg installed on your system).*
 
-## Nodes Overview
+---
 
-### 🎙️ Inference
-*   **Qwen3Loader:** Loads the base model (e.g., `Qwen/Qwen3-TTS-12Hz-1.7B-Base`).
-*   **Qwen3LoadFineTuned:** Loads a fine-tuned model (full checkpoint) and injects the custom speaker configuration required for inference.
-*   **Qwen3ApplyLoRA:** Loads a LoRA adapter (`.safetensors` directory) and applies it to a base model.
-*   **Qwen3VoiceDesign:** Generates speech based on text and a set of optional design parameters (Gender, Pitch, Emotion, etc.).
-*   **Qwen3VoiceClone:** Generates speech by cloning a reference audio.
+## 📚 Nodes Detailed Description
 
-### 📁 Dataset Creation (Modular Pipeline)
-1.  **Qwen3LoadDatasetAudio:** Scans a folder for `.wav` files.
-2.  **Qwen3TranscribeWhisper:** Transcribes audio using Whisper, trims silence, and slices long files. (Requires `openai-whisper`).
-3.  **Qwen3AutoLabelEmotions:** Uses `Qwen2-Audio-Instruct` to listen to the audio and generate descriptive labels (emotion, gender, tone) automatically.
-4.  **Qwen3ExportJSONL:** Exports the final processed data to a `.jsonl` file ready for training.
+### 🎙️ Inference Nodes
 
-### 🎓 Training
-*   **Qwen3DataPrep:** Pre-processes the JSONL file into tokenized tensors (`input_ids`, `labels`) for efficient training.
-*   **Qwen3TrainLoRA:** Trains a LoRA adapter on the pre-processed data. Supports `rank`, `alpha`, `epochs`, etc.
-*   **Qwen3FineTune:** (Legacy) Full fine-tuning logic.
+#### **Qwen3Loader**
+*   **Function:** Loads the base model (e.g., `Qwen/Qwen3-TTS-12Hz-1.7B-Base`) or specialized variants like `CustomVoice` or `VoiceDesign`.
+*   **Inputs:** `repo_id`, `precision` (bf16 recommended), `attention` (sdpa/flash_attn).
+*   **Outputs:** `QWEN3_MODEL` object.
+*   **Details:** Handles downloading from HuggingFace/ModelScope and caching. If a checkpoint path is provided, it attempts to load it as a base (useful for debugging).
 
-### 🛠️ Utils
-*   **Qwen3SaveAudio:** Saves generated audio batches to a specific subfolder in the output directory.
-*   **Qwen3LoadAudioFromPath:** Loads audio from an absolute path (useful for testing).
+#### **Qwen3LoadFineTuned**
+*   **Function:** Loads a fine-tuned model checkpoint for inference.
+*   **Inputs:** `base_model` (required for architecture/tokenizer), `speaker_name`, `version`.
+*   **Outputs:** `QWEN3_MODEL` object ready for generation.
+*   **Details:** Crucial node for using your trained voices. It performs "Deep Injection" of the custom speaker configuration (`spk_id`) into the base model structure, preventing "Unsupported speaker" errors that occur if you just load weights.
 
-## Usage Tips
-*   **Voice Design:** Use the individual fields (Gender, Pitch, etc.) to craft a specific voice. You don't need to fill them all.
-*   **LoRA Training:** Always run **DataPrep** first to generate the `_codes.jsonl` file. This speeds up training significantly by pre-calculating tokens.
+#### **Qwen3CustomVoice**
+*   **Function:** Generates speech using a specific trained speaker ID.
+*   **Inputs:** `model`, `text`, `language`, `speaker` (dropdown of detected fine-tuned speakers).
+*   **Outputs:** Audio waveform.
+*   **Details:** Used for fine-tuned models. Allows selecting the specific `speaker_name` you trained.
+
+#### **Qwen3VoiceDesign**
+*   **Function:** Generates speech based on text and a set of descriptive attributes.
+*   **Inputs:** `gender`, `pitch`, `speed`, `emotion`, `tone`, `age`, etc.
+*   **Outputs:** Audio waveform.
+*   **Details:** Uses the `VoiceDesign` variant of the model. You don't need to fill all fields; empty fields are ignored. Great for creating unique characters without reference audio.
+
+#### **Qwen3VoiceClone**
+*   **Function:** Zero-shot voice cloning from a reference audio.
+*   **Inputs:** `ref_audio` (3-10s clip), `ref_text` (transcription of the audio), `text` (what you want it to say).
+*   **Outputs:** Audio waveform.
+*   **Details:** Uses the `Base` or `CustomVoice` variants. Requires the reference text for accurate prompt alignment.
+
+### 📁 Dataset Pipeline (Step-by-Step)
+
+1.  **Qwen3LoadDatasetAudio:**
+    *   Scans a local folder for `.wav` files. Returns a list of files.
+2.  **Qwen3TranscribeWhisper:**
+    *   Uses OpenAI Whisper to transcribe audio.
+    *   Automatically slices long audio into chunks (e.g., < 15s) and trims silence.
+    *   Outputs `DATASET_ITEMS` (audio path + text).
+3.  **Qwen3AutoLabelEmotions:**
+    *   Uses `Qwen2-Audio-Instruct` to "listen" to each clip.
+    *   Generates tags like "Male voice, angry, shouting, fast speed".
+    *   Enhances dataset quality by allowing the model to learn emotional conditioning.
+4.  **Qwen3ExportJSONL:**
+    *   Saves the processed items into a `dataset.jsonl` file.
+    *   Format: `{"audio": "path/to/wav", "text": "transcription", "instruction": "tags"}`.
+
+### 🎓 Training Nodes
+
+#### **Qwen3DataPrep**
+*   **Function:** Pre-tokenizes the audio and text data.
+*   **Inputs:** `jsonl_path` (from Step 4).
+*   **Outputs:** Path to `_codes.jsonl`.
+*   **Details:** Converts audio to discrete codes using the `speech_tokenizer` and text to tokens. This step is heavy but ensures the training loop is fast and doesn't run OOM during tokenization. Handles OOM by falling back to sequential processing if batch processing fails.
+
+#### **Qwen3FineTune**
+*   **Function:** Performs full fine-tuning of the model.
+*   **Inputs:** `train_jsonl` (the `_codes.jsonl` file), `init_model`, `epochs`, `batch_size`, `lr`.
+*   **Outputs:** Path to the saved checkpoint.
+*   **Details:**
+    *   **Epochs:** Minimum 50 recommended for convergence on small datasets.
+    *   **Learning Rate:** Defaults to `2e-6`. Higher values (e.g., `1e-5`) might cause noise/instability.
+    *   **Mixed Precision:** Supports `bf16` (Ampere GPUs) and `fp32`.
+    *   **Saving:** Saves `pytorch_model.bin` and `config.json` correctly mapped for immediate loading with `Qwen3LoadFineTuned`.
+
+---
+
+## 🧪 Workflow Examples
+
+### 1. Dataset Creation Workflow
+1.  **Load Audio:** Connect `Qwen3LoadDatasetAudio` pointing to your raw wavs folder.
+2.  **Transcribe:** Connect to `Qwen3TranscribeWhisper`. Set `max_duration` to 15.0s.
+3.  **Label:** Connect to `Qwen3AutoLabelEmotions`. This adds style tags.
+4.  **Export:** Connect to `Qwen3ExportJSONL`.
+5.  **Run:** This generates `dataset.jsonl`.
+
+### 2. Training (Fine-Tuning) Workflow
+1.  **Prep Data:** Connect the `dataset.jsonl` (from above) to `Qwen3DataPrep`.
+    *   *Tip: Run this once. It creates `dataset_codes.jsonl`.*
+2.  **Train:** Connect `Qwen3DataPrep` output to `Qwen3FineTune`.
+    *   **Base Model:** `Qwen/Qwen3-TTS-12Hz-1.7B-Base`.
+    *   **Speaker Name:** e.g., "Batman".
+    *   **Epochs:** 100.
+    *   **Batch Size:** 2 or 4 (depending on VRAM).
+    *   **LR:** 2e-6.
+3.  **Run:** Monitor the console. It will save checkpoints to `models/tts/finetuned_model/Batman/epoch_100`.
+
+### 3. Inference with Fine-Tuned Voice
+1.  **Load:** Use `Qwen3LoadFineTuned`.
+    *   **Speaker Name:** Select "Batman".
+    *   **Version:** Select "epoch_100".
+2.  **Generate:** Connect to `Qwen3CustomVoice`.
+    *   **Text:** "I am vengeance."
+    *   **Speaker:** "Batman" (should appear in list).
+3.  **Save:** Connect to `Qwen3SaveAudio`.
+
+### 4. Voice Design Inference (Zero-Shot)
+1.  **Load:** Use `Qwen3Loader` with `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`.
+2.  **Generate:** Connect to `Qwen3VoiceDesign`.
+    *   **Gender:** "Male"
+    *   **Tone:** "Deep, raspy, intimidating"
+    *   **Text:** "This city is mine."
+3.  **Save:** Connect to `Qwen3SaveAudio`.
