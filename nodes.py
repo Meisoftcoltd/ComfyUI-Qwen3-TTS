@@ -521,6 +521,14 @@ class Qwen3Loader:
                     new_spk_id = cfg_data["talker_config"]["spk_id"]
                     new_spk_dialect = cfg_data["talker_config"].get("spk_is_dialect", {})
                     
+                    # --- FIX: Extract Correct Speaker Name for Output ---
+                    if isinstance(new_spk_id, dict) and len(new_spk_id) > 0:
+                        potential_name = list(new_spk_id.keys())[0]
+                        if potential_name and potential_name.strip():
+                            clean_model_name = potential_name.strip()
+                            print(f"[Qwen3-TTS] Updated model_name from config: {clean_model_name}")
+                    # ----------------------------------------------------
+
                     # Target List: where spk_id might be hidden
                     configs_to_update = []
                     
