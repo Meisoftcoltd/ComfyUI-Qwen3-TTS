@@ -352,8 +352,13 @@ def convert_audio(wav, sr):
     # Qwen outputs numpy float32 usually.
     # Check if stereo/mono. Qwen3-TTS is mono usually?
     # Ensure shape is [1, channels, samples] for ComfyUI
-    if wav.shape[0] > wav.shape[1]: 
-        # assume (samples, channels) - verify this assumption
+
+    # Robust shape detection:
+    # Audio usually has Samples >> Channels (e.g. 24000 samples vs 1 or 2 channels).
+    # If dim0 > dim1, it's likely (Samples, Channels).
+    # We verify this by checking if dim1 is reasonably small (< 2048) to be channels.
+    if wav.shape[0] > wav.shape[1] and wav.shape[1] < 2048:
+        # Detected (Samples, Channels) format -> Transpose to (Channels, Samples)
         wav = wav.transpose(0, 1)
         
     # If it's just (samples,), we made it (1, samples). 
@@ -546,7 +551,7 @@ class Qwen3Loader:
         if checkpoint_path:
             ckpt_weights = os.path.join(checkpoint_path, "pytorch_model.bin")
             if os.path.exists(ckpt_weights):
-                state_dict = torch.load(ckpt_weights, map_location="cpu")
+                state_dict = torch.load(ckpt_weights, map_location="cpu", weights_only=True)
                 model.model.load_state_dict(state_dict, strict=False)
                 print(f"Loaded checkpoint weights from {ckpt_weights}")
             else:
@@ -786,7 +791,7 @@ class Qwen3LoadFineTuned:
         ckpt_weights = os.path.join(checkpoint_path, "pytorch_model.bin")
         if os.path.exists(ckpt_weights):
             print(f"Loading fine-tuned weights from {ckpt_weights}...")
-            state_dict = torch.load(ckpt_weights, map_location="cpu")
+            state_dict = torch.load(ckpt_weights, map_location="cpu", weights_only=True)
             # Loose strictness to allow for potential mismatch in unused layers if any,
             # though usually finetune matches base structure.
             keys = model.model.load_state_dict(state_dict, strict=False)
@@ -1369,13 +1374,11 @@ class Qwen3AudioToDataset:
             raise ValueError(f"Audio folder not found: {audio_folder}")
 
         # Determine output folder
-        # If output_folder_name is relative, put it inside audio_folder parent or similar?
-        # User script put it in "dataset_final" inside CURRENT_DIR.
-        # Let's put it as a subfolder of audio_folder by default if not absolute.
-        if os.path.isabs(output_folder_name):
-            output_folder = output_folder_name
-        else:
-            output_folder = os.path.join(audio_folder, output_folder_name)
+        # Security: Enforce relative output path to prevent arbitrary file writes
+        output_folder_name = os.path.basename(output_folder_name.strip())
+        if not output_folder_name or output_folder_name in [".", ".."]:
+            output_folder_name = "dataset_final"
+        output_folder = os.path.join(audio_folder, output_folder_name)
 
         os.makedirs(output_folder, exist_ok=True)
         print(f"[Qwen3-TTS] Output folder: {output_folder}")
@@ -1968,10 +1971,48 @@ class Qwen3DataPrep:
         # Note: We don't have a dedicated folder mapping for arbitrary text tokenizers,
         # so we rely on HF cache or download to standard cache for now, or use download_model_to_comfyui generic logic
         # Ideally, we check if it's already in the models folder.
-        text_tok_local = get_local_model_path(text_tokenizer_repo)
-        if os.path.exists(text_tok_local) and os.listdir(text_tok_local):
-             text_tok_path = text_tok_local
-        else:
+
+        text_tok_path = None
+
+        # Search candidates
+        search_candidates = [
+            text_tokenizer_repo.replace("/", "_"),
+            text_tokenizer_repo.split("/")[-1]
+        ]
+
+        # 1. Check LLM folders
+        if text_tok_path is None:
+            try:
+                llm_paths = folder_paths.get_folder_paths("LLM")
+                if llm_paths:
+                    for base_path in llm_paths:
+                        for name in search_candidates:
+                            p = os.path.join(base_path, name)
+                            if os.path.exists(p) and os.path.isdir(p) and os.listdir(p):
+                                text_tok_path = p
+                                print(f"Found text tokenizer in LLM folder: {text_tok_path}")
+                                break
+                        if text_tok_path: break
+            except:
+                pass
+
+        # 2. Check models root
+        if text_tok_path is None:
+            for name in search_candidates:
+                p = os.path.join(folder_paths.models_dir, name)
+                if os.path.exists(p) and os.path.isdir(p) and os.listdir(p):
+                    text_tok_path = p
+                    print(f"Found text tokenizer in models folder: {text_tok_path}")
+                    break
+
+        # 3. Check TTS folders (standard fallback)
+        if text_tok_path is None:
+            text_tok_local = get_local_model_path(text_tokenizer_repo)
+            if os.path.exists(text_tok_local) and os.listdir(text_tok_local):
+                 text_tok_path = text_tok_local
+
+        # 4. Download if not found
+        if text_tok_path is None:
              print(f"Text Tokenizer not found locally. Downloading {text_tokenizer_repo}...")
              # This uses the same logic (snapshot download), which is fine for tokenizers
              text_tok_path = download_model_to_comfyui(text_tokenizer_repo, source)
@@ -2021,6 +2062,16 @@ class Qwen3DataPrep:
                 item['attention_mask'] = attention_mask
                 # Optional: keep audio_codes for reference
                 item['audio_codes'] = audio_tokens
+
+                # OPTIMIZATION: Pre-compute text_ids for TTSDataset (to avoid re-tokenization during training)
+                # TTSDataset expects: <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
+                tts_text = f"<|im_start|>assistant\n{text_content}<|im_end|>\n<|im_start|>assistant\n"
+                # Use standard encoding. dataset.py uses processor(text=...) which defaults to adding special tokens.
+                # However, for Qwen, manually constructing the template implies we might want to be careful.
+                # But dataset.py uses processor() on the constructed string, so we should do the same.
+                # UPDATE: TTSDataset collate_fn expects strict token alignment. Avoiding implicit BOS is safer.
+                tts_text_ids = text_tokenizer.encode(tts_text, add_special_tokens=False)
+                item['text_ids'] = tts_text_ids
 
                 out_file.write(json.dumps(item, ensure_ascii=False) + "\n")
 
@@ -2311,7 +2362,7 @@ class Qwen3FineTune:
                 if resume_checkpoint_path:
                     ckpt_weights = os.path.join(resume_checkpoint_path, "pytorch_model.bin")
                     if os.path.exists(ckpt_weights):
-                        state_dict = torch.load(ckpt_weights, map_location="cpu")
+                        state_dict = torch.load(ckpt_weights, map_location="cpu", weights_only=True)
                         qwen3tts.model.load_state_dict(state_dict, strict=False)
                         print(f"Loaded training weights from {ckpt_weights}")
                     else:
@@ -2386,7 +2437,7 @@ class Qwen3FineTune:
                     # Load optimizer state (important for momentum/Adam statistics)
                     optimizer_state_path = os.path.join(resume_checkpoint_path, "optimizer.pt")
                     if os.path.exists(optimizer_state_path):
-                        optimizer.load_state_dict(torch.load(optimizer_state_path, map_location="cpu"))
+                        optimizer.load_state_dict(torch.load(optimizer_state_path, map_location="cpu", weights_only=True))
                         print(f"Loaded optimizer state from {optimizer_state_path}")
                     else:
                         print("No optimizer state found, starting fresh (momentum will be reset)")
@@ -2395,7 +2446,7 @@ class Qwen3FineTune:
                     if scheduler:
                         scheduler_state_path = os.path.join(resume_checkpoint_path, "scheduler.pt")
                         if os.path.exists(scheduler_state_path):
-                            scheduler.load_state_dict(torch.load(scheduler_state_path, map_location="cpu"))
+                            scheduler.load_state_dict(torch.load(scheduler_state_path, map_location="cpu", weights_only=True))
                             print(f"Loaded scheduler state from {scheduler_state_path}")
                         else:
                             # Fast-forward scheduler to current position (for checkpoints saved before this feature)

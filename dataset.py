@@ -136,8 +136,14 @@ class TTSDataset(Dataset):
         language        = item.get('language','Auto')
         ref_audio_path  = item['ref_audio']
 
-        text = self._build_assistant_text(text)
-        text_ids = self._tokenize_texts(text)
+        # Optimization: Use pre-computed text_ids if available (from Qwen3DataPrep)
+        if "text_ids" in item:
+            text_ids = torch.tensor(item["text_ids"], dtype=torch.long)
+            if text_ids.dim() == 1:
+                text_ids = text_ids.unsqueeze(0)
+        else:
+            text = self._build_assistant_text(text)
+            text_ids = self._tokenize_texts(text)
 
         audio_codes = torch.tensor(audio_codes, dtype=torch.long)
 
