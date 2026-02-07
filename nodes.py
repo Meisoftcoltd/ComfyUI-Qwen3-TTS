@@ -487,7 +487,7 @@ class Qwen3Loader:
         if checkpoint_path:
             ckpt_weights = os.path.join(checkpoint_path, "pytorch_model.bin")
             if os.path.exists(ckpt_weights):
-                state_dict = torch.load(ckpt_weights, map_location="cpu")
+                state_dict = torch.load(ckpt_weights, map_location="cpu", weights_only=True)
                 model.model.load_state_dict(state_dict, strict=False)
                 print(f"Loaded checkpoint weights from {ckpt_weights}")
             else:
@@ -727,7 +727,7 @@ class Qwen3LoadFineTuned:
         ckpt_weights = os.path.join(checkpoint_path, "pytorch_model.bin")
         if os.path.exists(ckpt_weights):
             print(f"Loading fine-tuned weights from {ckpt_weights}...")
-            state_dict = torch.load(ckpt_weights, map_location="cpu")
+            state_dict = torch.load(ckpt_weights, map_location="cpu", weights_only=True)
             # Loose strictness to allow for potential mismatch in unused layers if any,
             # though usually finetune matches base structure.
             keys = model.model.load_state_dict(state_dict, strict=False)
