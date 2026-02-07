@@ -1305,13 +1305,11 @@ class Qwen3AudioToDataset:
             raise ValueError(f"Audio folder not found: {audio_folder}")
 
         # Determine output folder
-        # If output_folder_name is relative, put it inside audio_folder parent or similar?
-        # User script put it in "dataset_final" inside CURRENT_DIR.
-        # Let's put it as a subfolder of audio_folder by default if not absolute.
-        if os.path.isabs(output_folder_name):
-            output_folder = output_folder_name
-        else:
-            output_folder = os.path.join(audio_folder, output_folder_name)
+        # Security: Enforce relative output path to prevent arbitrary file writes
+        output_folder_name = os.path.basename(output_folder_name.strip())
+        if not output_folder_name or output_folder_name in [".", ".."]:
+            output_folder_name = "dataset_final"
+        output_folder = os.path.join(audio_folder, output_folder_name)
 
         os.makedirs(output_folder, exist_ok=True)
         print(f"[Qwen3-TTS] Output folder: {output_folder}")
