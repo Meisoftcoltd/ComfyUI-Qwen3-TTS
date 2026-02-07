@@ -141,18 +141,38 @@ def get_finetuned_speakers() -> list:
     found_speakers = []
 
     for base_path in scan_paths:
-        if os.path.exists(base_path):
-            # 1. New Structure: Check immediate subfolders as speaker names
-            # Structure: finetuned_model/{speaker_name}/epoch_N
-            for item in os.listdir(base_path):
-                if os.path.isdir(os.path.join(base_path, item)):
-                    # Add directory name as speaker (if not already known)
-                    if item not in speakers and item not in found_speakers:
-                        found_speakers.append(item)
+        if not os.path.exists(base_path):
+            continue
 
-            # 2. Deep Scan: Check config.json for spk_id (Legacy & Robustness)
-            for root, dirs, files in os.walk(base_path):
-                if "config.json" in files:
+        # Cache Check
+        try:
+            mtime = os.path.getmtime(base_path)
+        except OSError:
+            continue
+
+        cached = _SPEAKER_CACHE.get(base_path)
+        if cached and cached[0] == mtime:
+            found_speakers.extend(cached[1])
+            continue
+
+        local_found = []
+
+        # 1. Scan direct subdirectories
+        try:
+            with os.scandir(base_path) as it:
+                entries = list(it)
+        except OSError:
+            entries = []
+
+        for entry in entries:
+            if entry.is_dir():
+                # Add directory name as speaker (if not already known)
+                if entry.name not in speakers and entry.name not in found_speakers and entry.name not in local_found:
+                    local_found.append(entry.name)
+
+                # 2. Smart Scan: Check ONE config.json inside this directory branch
+                cfg_path = _find_first_config(entry.path)
+                if cfg_path:
                     try:
                         with open(
                             os.path.join(root, "config.json"), "r", encoding="utf-8"
@@ -172,7 +192,23 @@ def get_finetuned_speakers() -> list:
                     except:
                         pass
 
-    return sorted(found_speakers) + speakers
+        # 3. Check base_path/config.json (Legacy/Edge Case)
+        base_cfg = os.path.join(base_path, "config.json")
+        if os.path.exists(base_cfg):
+             try:
+                with open(base_cfg, 'r', encoding='utf-8') as f:
+                    cfg = json.load(f)
+                    if "talker_config" in cfg and "spk_id" in cfg["talker_config"]:
+                        spk_ids = cfg["talker_config"]["spk_id"]
+                        for name in spk_ids.keys():
+                            if name not in speakers and name not in found_speakers and name not in local_found:
+                                local_found.append(name)
+             except: pass
+
+        _SPEAKER_CACHE[base_path] = (mtime, local_found)
+        found_speakers.extend(local_found)
+
+    return sorted(list(set(found_speakers + speakers)))
 
 
 def get_local_model_path(repo_id: str) -> str:
@@ -565,7 +601,7 @@ class Qwen3Loader:
         if checkpoint_path:
             ckpt_weights = os.path.join(checkpoint_path, "pytorch_model.bin")
             if os.path.exists(ckpt_weights):
-                state_dict = torch.load(ckpt_weights, map_location="cpu")
+                state_dict = torch.load(ckpt_weights, map_location="cpu", weights_only=True)
                 model.model.load_state_dict(state_dict, strict=False)
                 print(f"Loaded checkpoint weights from {ckpt_weights}")
             else:
@@ -864,7 +900,7 @@ class Qwen3LoadFineTuned:
         ckpt_weights = os.path.join(checkpoint_path, "pytorch_model.bin")
         if os.path.exists(ckpt_weights):
             print(f"Loading fine-tuned weights from {ckpt_weights}...")
-            state_dict = torch.load(ckpt_weights, map_location="cpu")
+            state_dict = torch.load(ckpt_weights, map_location="cpu", weights_only=True)
             # Loose strictness to allow for potential mismatch in unused layers if any,
             # though usually finetune matches base structure.
             keys = model.model.load_state_dict(state_dict, strict=False)
@@ -1742,13 +1778,11 @@ class Qwen3AudioToDataset:
             raise ValueError(f"Audio folder not found: {audio_folder}")
 
         # Determine output folder
-        # If output_folder_name is relative, put it inside audio_folder parent or similar?
-        # User script put it in "dataset_final" inside CURRENT_DIR.
-        # Let's put it as a subfolder of audio_folder by default if not absolute.
-        if os.path.isabs(output_folder_name):
-            output_folder = output_folder_name
-        else:
-            output_folder = os.path.join(audio_folder, output_folder_name)
+        # Security: Enforce relative output path to prevent arbitrary file writes
+        output_folder_name = os.path.basename(output_folder_name.strip())
+        if not output_folder_name or output_folder_name in [".", ".."]:
+            output_folder_name = "dataset_final"
+        output_folder = os.path.join(audio_folder, output_folder_name)
 
         os.makedirs(output_folder, exist_ok=True)
         print(f"[Qwen3-TTS] Output folder: {output_folder}")
@@ -2562,6 +2596,16 @@ class Qwen3DataPrep:
                 # Optional: keep audio_codes for reference
                 item["audio_codes"] = audio_tokens
 
+                # OPTIMIZATION: Pre-compute text_ids for TTSDataset (to avoid re-tokenization during training)
+                # TTSDataset expects: <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
+                tts_text = f"<|im_start|>assistant\n{text_content}<|im_end|>\n<|im_start|>assistant\n"
+                # Use standard encoding. dataset.py uses processor(text=...) which defaults to adding special tokens.
+                # However, for Qwen, manually constructing the template implies we might want to be careful.
+                # But dataset.py uses processor() on the constructed string, so we should do the same.
+                # UPDATE: TTSDataset collate_fn expects strict token alignment. Avoiding implicit BOS is safer.
+                tts_text_ids = text_tokenizer.encode(tts_text, add_special_tokens=False)
+                item['text_ids'] = tts_text_ids
+
                 out_file.write(json.dumps(item, ensure_ascii=False) + "\n")
 
             for batch_idx, i in enumerate(range(0, total_items, batch_size)):
@@ -3098,7 +3142,7 @@ class Qwen3FineTune:
                         resume_checkpoint_path, "pytorch_model.bin"
                     )
                     if os.path.exists(ckpt_weights):
-                        state_dict = torch.load(ckpt_weights, map_location="cpu")
+                        state_dict = torch.load(ckpt_weights, map_location="cpu", weights_only=True)
                         qwen3tts.model.load_state_dict(state_dict, strict=False)
                         print(f"Loaded training weights from {ckpt_weights}")
                     else:
@@ -3640,6 +3684,10 @@ class Qwen3SaveAudio:
         base_output = folder_paths.get_output_directory()
         if output_subfolder:
             out_dir = os.path.join(base_output, output_subfolder)
+
+            # Security check for path traversal
+            if os.path.commonpath([os.path.abspath(out_dir), os.path.abspath(base_output)]) != os.path.abspath(base_output):
+                raise ValueError(f"Invalid output_subfolder '{output_subfolder}': Path traversal detected.")
         else:
             out_dir = base_output
 
