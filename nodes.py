@@ -482,7 +482,7 @@ class Qwen3Loader:
         if checkpoint_path:
             ckpt_weights = os.path.join(checkpoint_path, "pytorch_model.bin")
             if os.path.exists(ckpt_weights):
-                state_dict = torch.load(ckpt_weights, map_location="cpu")
+                state_dict = torch.load(ckpt_weights, map_location="cpu", weights_only=True)
                 model.model.load_state_dict(state_dict, strict=False)
                 print(f"Loaded checkpoint weights from {ckpt_weights}")
             else:
@@ -722,7 +722,7 @@ class Qwen3LoadFineTuned:
         ckpt_weights = os.path.join(checkpoint_path, "pytorch_model.bin")
         if os.path.exists(ckpt_weights):
             print(f"Loading fine-tuned weights from {ckpt_weights}...")
-            state_dict = torch.load(ckpt_weights, map_location="cpu")
+            state_dict = torch.load(ckpt_weights, map_location="cpu", weights_only=True)
             # Loose strictness to allow for potential mismatch in unused layers if any,
             # though usually finetune matches base structure.
             keys = model.model.load_state_dict(state_dict, strict=False)
@@ -2247,7 +2247,7 @@ class Qwen3FineTune:
                 if resume_checkpoint_path:
                     ckpt_weights = os.path.join(resume_checkpoint_path, "pytorch_model.bin")
                     if os.path.exists(ckpt_weights):
-                        state_dict = torch.load(ckpt_weights, map_location="cpu")
+                        state_dict = torch.load(ckpt_weights, map_location="cpu", weights_only=True)
                         qwen3tts.model.load_state_dict(state_dict, strict=False)
                         print(f"Loaded training weights from {ckpt_weights}")
                     else:
@@ -2322,7 +2322,7 @@ class Qwen3FineTune:
                     # Load optimizer state (important for momentum/Adam statistics)
                     optimizer_state_path = os.path.join(resume_checkpoint_path, "optimizer.pt")
                     if os.path.exists(optimizer_state_path):
-                        optimizer.load_state_dict(torch.load(optimizer_state_path, map_location="cpu"))
+                        optimizer.load_state_dict(torch.load(optimizer_state_path, map_location="cpu", weights_only=True))
                         print(f"Loaded optimizer state from {optimizer_state_path}")
                     else:
                         print("No optimizer state found, starting fresh (momentum will be reset)")
@@ -2331,7 +2331,7 @@ class Qwen3FineTune:
                     if scheduler:
                         scheduler_state_path = os.path.join(resume_checkpoint_path, "scheduler.pt")
                         if os.path.exists(scheduler_state_path):
-                            scheduler.load_state_dict(torch.load(scheduler_state_path, map_location="cpu"))
+                            scheduler.load_state_dict(torch.load(scheduler_state_path, map_location="cpu", weights_only=True))
                             print(f"Loaded scheduler state from {scheduler_state_path}")
                         else:
                             # Fast-forward scheduler to current position (for checkpoints saved before this feature)
