@@ -1909,10 +1909,48 @@ class Qwen3DataPrep:
         # Note: We don't have a dedicated folder mapping for arbitrary text tokenizers,
         # so we rely on HF cache or download to standard cache for now, or use download_model_to_comfyui generic logic
         # Ideally, we check if it's already in the models folder.
-        text_tok_local = get_local_model_path(text_tokenizer_repo)
-        if os.path.exists(text_tok_local) and os.listdir(text_tok_local):
-             text_tok_path = text_tok_local
-        else:
+
+        text_tok_path = None
+
+        # Search candidates
+        search_candidates = [
+            text_tokenizer_repo.replace("/", "_"),
+            text_tokenizer_repo.split("/")[-1]
+        ]
+
+        # 1. Check LLM folders
+        if text_tok_path is None:
+            try:
+                llm_paths = folder_paths.get_folder_paths("LLM")
+                if llm_paths:
+                    for base_path in llm_paths:
+                        for name in search_candidates:
+                            p = os.path.join(base_path, name)
+                            if os.path.exists(p) and os.path.isdir(p) and os.listdir(p):
+                                text_tok_path = p
+                                print(f"Found text tokenizer in LLM folder: {text_tok_path}")
+                                break
+                        if text_tok_path: break
+            except:
+                pass
+
+        # 2. Check models root
+        if text_tok_path is None:
+            for name in search_candidates:
+                p = os.path.join(folder_paths.models_dir, name)
+                if os.path.exists(p) and os.path.isdir(p) and os.listdir(p):
+                    text_tok_path = p
+                    print(f"Found text tokenizer in models folder: {text_tok_path}")
+                    break
+
+        # 3. Check TTS folders (standard fallback)
+        if text_tok_path is None:
+            text_tok_local = get_local_model_path(text_tokenizer_repo)
+            if os.path.exists(text_tok_local) and os.listdir(text_tok_local):
+                 text_tok_path = text_tok_local
+
+        # 4. Download if not found
+        if text_tok_path is None:
              print(f"Text Tokenizer not found locally. Downloading {text_tokenizer_repo}...")
              # This uses the same logic (snapshot download), which is fine for tokenizers
              text_tok_path = download_model_to_comfyui(text_tokenizer_repo, source)
