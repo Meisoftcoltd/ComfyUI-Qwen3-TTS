@@ -288,8 +288,13 @@ def convert_audio(wav, sr):
     # Qwen outputs numpy float32 usually.
     # Check if stereo/mono. Qwen3-TTS is mono usually?
     # Ensure shape is [1, channels, samples] for ComfyUI
-    if wav.shape[0] > wav.shape[1]: 
-        # assume (samples, channels) - verify this assumption
+
+    # Robust shape detection:
+    # Audio usually has Samples >> Channels (e.g. 24000 samples vs 1 or 2 channels).
+    # If dim0 > dim1, it's likely (Samples, Channels).
+    # We verify this by checking if dim1 is reasonably small (< 2048) to be channels.
+    if wav.shape[0] > wav.shape[1] and wav.shape[1] < 2048:
+        # Detected (Samples, Channels) format -> Transpose to (Channels, Samples)
         wav = wav.transpose(0, 1)
         
     # If it's just (samples,), we made it (1, samples). 
