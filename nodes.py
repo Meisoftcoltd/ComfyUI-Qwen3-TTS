@@ -96,8 +96,33 @@ QWEN3_TTS_TOKENIZERS = {
     "Qwen/Qwen3-TTS-Tokenizer-12Hz": "Qwen3-TTS-Tokenizer-12Hz",
 }
 
-# Simple cache for fine-tuned speakers: {base_path: (mtime, found_speakers_list)}
-_FINETUNED_SPEAKERS_CACHE = {}
+_SPEAKER_CACHE = {} # Cache for get_finetuned_speakers: path -> (mtime, speakers_list)
+
+def _find_first_config(start_path):
+    """BFS search to find the first config.json in a directory tree."""
+    queue = [start_path]
+    scan_limit = 50 # Safety limit
+    scanned_count = 0
+
+    while queue and scanned_count < scan_limit:
+        curr = queue.pop(0)
+        scanned_count += 1
+        try:
+            with os.scandir(curr) as it:
+                entries = list(it)
+        except OSError:
+            continue
+
+        # Check files first
+        for entry in entries:
+            if entry.is_file() and entry.name == "config.json":
+                return entry.path
+
+        # Then subdirs
+        for entry in entries:
+            if entry.is_dir():
+                queue.append(entry.path)
+    return None
 
 def get_finetuned_speakers() -> list:
     """Scan configured output directories for fine-tuned speakers."""
@@ -119,58 +144,63 @@ def get_finetuned_speakers() -> list:
         if not os.path.exists(base_path):
             continue
 
+        # Cache Check
         try:
-            current_mtime = os.path.getmtime(base_path)
+            mtime = os.path.getmtime(base_path)
         except OSError:
             continue
 
-        # Check cache
-        if base_path in _FINETUNED_SPEAKERS_CACHE:
-            cached_mtime, cached_speakers = _FINETUNED_SPEAKERS_CACHE[base_path]
-            if cached_mtime == current_mtime:
-                for s in cached_speakers:
-                    if s not in speakers and s not in found_speakers:
-                        found_speakers.append(s)
-                continue
+        cached = _SPEAKER_CACHE.get(base_path)
+        if cached and cached[0] == mtime:
+            found_speakers.extend(cached[1])
+            continue
 
-        # Cache miss - scan
         local_found = []
 
-        # Use os.walk with pruning to optimize I/O
-        for root, dirs, files in os.walk(base_path):
-            if root == base_path:
-                # Top level: Add all folders as speakers
-                for d in dirs:
-                    if d not in local_found:
-                        local_found.append(d)
-                # Don't prune top level
-            else:
-                # Inside a speaker folder: Prune to check only the last epoch/version
-                if dirs:
-                    dirs.sort()
-                    dirs[:] = [dirs[-1]]
+        # 1. Scan direct subdirectories
+        try:
+            with os.scandir(base_path) as it:
+                entries = list(it)
+        except OSError:
+            entries = []
 
-            if "config.json" in files:
-                try:
-                    with open(os.path.join(root, "config.json"), 'r', encoding='utf-8') as f:
-                        cfg = json.load(f)
-                        if "talker_config" in cfg and "spk_id" in cfg["talker_config"]:
-                            spk_ids = cfg["talker_config"]["spk_id"]
-                            for name in spk_ids.keys():
-                                if name not in local_found:
-                                    local_found.append(name)
-                except:
-                    pass
+        for entry in entries:
+            if entry.is_dir():
+                # Add directory name as speaker (if not already known)
+                if entry.name not in speakers and entry.name not in found_speakers and entry.name not in local_found:
+                    local_found.append(entry.name)
 
-        # Update cache
-        _FINETUNED_SPEAKERS_CACHE[base_path] = (current_mtime, local_found)
+                # 2. Smart Scan: Check ONE config.json inside this directory branch
+                cfg_path = _find_first_config(entry.path)
+                if cfg_path:
+                    try:
+                        with open(cfg_path, 'r', encoding='utf-8') as f:
+                            cfg = json.load(f)
+                            if "talker_config" in cfg and "spk_id" in cfg["talker_config"]:
+                                spk_ids = cfg["talker_config"]["spk_id"]
+                                for name in spk_ids.keys():
+                                    if name not in speakers and name not in found_speakers and name not in local_found:
+                                        local_found.append(name)
+                    except:
+                        pass
 
-        # Merge
-        for s in local_found:
-            if s not in speakers and s not in found_speakers:
-                found_speakers.append(s)
+        # 3. Check base_path/config.json (Legacy/Edge Case)
+        base_cfg = os.path.join(base_path, "config.json")
+        if os.path.exists(base_cfg):
+             try:
+                with open(base_cfg, 'r', encoding='utf-8') as f:
+                    cfg = json.load(f)
+                    if "talker_config" in cfg and "spk_id" in cfg["talker_config"]:
+                        spk_ids = cfg["talker_config"]["spk_id"]
+                        for name in spk_ids.keys():
+                            if name not in speakers and name not in found_speakers and name not in local_found:
+                                local_found.append(name)
+             except: pass
 
-    return sorted(found_speakers) + speakers
+        _SPEAKER_CACHE[base_path] = (mtime, local_found)
+        found_speakers.extend(local_found)
+
+    return sorted(list(set(found_speakers + speakers)))
 
 def get_local_model_path(repo_id: str) -> str:
     """Get the local path for a model/tokenizer in ComfyUI's models folder."""
