@@ -1958,6 +1958,16 @@ class Qwen3DataPrep:
                 # Optional: keep audio_codes for reference
                 item['audio_codes'] = audio_tokens
 
+                # OPTIMIZATION: Pre-compute text_ids for TTSDataset (to avoid re-tokenization during training)
+                # TTSDataset expects: <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
+                tts_text = f"<|im_start|>assistant\n{text_content}<|im_end|>\n<|im_start|>assistant\n"
+                # Use standard encoding. dataset.py uses processor(text=...) which defaults to adding special tokens.
+                # However, for Qwen, manually constructing the template implies we might want to be careful.
+                # But dataset.py uses processor() on the constructed string, so we should do the same.
+                # UPDATE: TTSDataset collate_fn expects strict token alignment. Avoiding implicit BOS is safer.
+                tts_text_ids = text_tokenizer.encode(tts_text, add_special_tokens=False)
+                item['text_ids'] = tts_text_ids
+
                 out_file.write(json.dumps(item, ensure_ascii=False) + "\n")
 
             for batch_idx, i in enumerate(range(0, total_items, batch_size)):
