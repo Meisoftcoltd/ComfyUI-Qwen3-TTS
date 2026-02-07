@@ -2660,6 +2660,10 @@ class Qwen3SaveAudio:
         base_output = folder_paths.get_output_directory()
         if output_subfolder:
             out_dir = os.path.join(base_output, output_subfolder)
+
+            # Security check for path traversal
+            if os.path.commonpath([os.path.abspath(out_dir), os.path.abspath(base_output)]) != os.path.abspath(base_output):
+                raise ValueError(f"Invalid output_subfolder '{output_subfolder}': Path traversal detected.")
         else:
             out_dir = base_output
 
