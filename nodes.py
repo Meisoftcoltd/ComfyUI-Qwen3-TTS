@@ -2718,7 +2718,7 @@ class Qwen3DataPrep:
             "version": 1,
             "input_hash": input_hash,
             "audio_tokenizer": audio_tokenizer_repo,
-            "output_line_count": len(inputs),
+            "output_line_count": input_line_count,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         save_cache_metadata(meta_path, metadata)
