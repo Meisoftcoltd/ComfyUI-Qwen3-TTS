@@ -1,16 +1,37 @@
-from torch.utils.data import Dataset
+# coding=utf-8
+# Copyright 2026 The Alibaba Qwen team.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import os
 import json
-import torch
-import numpy as np
+from typing import Any, List, Tuple, Union
+
 import librosa
+import numpy as np
+import torch
 from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
 from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
-from typing import Tuple, Union, List, Any
+from torch.utils.data import Dataset
 
-# Define type alias for audio inputs
-AudioLike = Union[str, np.ndarray, Tuple[np.ndarray, int]]
-MaybeList = Union[AudioLike, List[AudioLike]]
+AudioLike = Union[
+    str,  # wav path, URL, base64
+    np.ndarray,  # waveform (requires sr)
+    Tuple[np.ndarray, int],  # (waveform, sr)
+]
+
+MaybeList = Union[Any, List[Any]]
+
 
 class TTSDataset(Dataset):
     def __init__(self, data_source, processor, config: Qwen3TTSConfig, lag_num=-1):
@@ -84,26 +105,6 @@ class TTSDataset(Dataset):
     def _normalize_audio_inputs(
         self, audios: Union[AudioLike, List[AudioLike]]
     ) -> List[Tuple[np.ndarray, int]]:
-        """
-        Normalize audio inputs into a list of (waveform, sr).
-
-        Supported forms:
-          - str: wav path / URL / base64 audio string
-          - np.ndarray: waveform (NOT allowed alone here because sr is unknown)
-          - (np.ndarray, sr): waveform + sampling rate
-          - list of the above
-
-        Args:
-            audios:
-                Audio input(s).
-
-        Returns:
-            List[Tuple[np.ndarray, int]]:
-                List of (float32 waveform, original sr).
-
-        Raises:
-            ValueError: If a numpy waveform is provided without sr.
-        """
         if isinstance(audios, list):
             items = audios
         else:
@@ -135,11 +136,7 @@ class TTSDataset(Dataset):
 
     @torch.inference_mode()
     def extract_mels(self, audio, sr):
-        # assert sr == 24000, "Only support 24kHz audio"
-        # Librosa load with specific sr should generally be exact, but floating point might vary slightly?
-        # Resampling is handled in _load_audio_to_np now.
         if sr != 24000:
-            # Just in case
             pass
 
         mels = mel_spectrogram(
@@ -181,7 +178,7 @@ class TTSDataset(Dataset):
 
         audio_codes = torch.tensor(audio_codes, dtype=torch.long)
 
-        # Use cached ref_mel if available (same ref_audio for all samples is recommended)
+        # Use cached ref_mel if available
         if ref_audio_path in self._ref_mel_cache:
             ref_mel = self._ref_mel_cache[ref_audio_path]
         else:
@@ -189,7 +186,12 @@ class TTSDataset(Dataset):
             normalized = self._normalize_audio_inputs(ref_audio_list)
             wav, sr = normalized[0]
             ref_mel = self.extract_mels(audio=wav, sr=sr)
-            self._ref_mel_cache[ref_audio_path] = ref_mel
+            # Only cache if NOT using self-reference to save RAM?
+            # Actually, with self-reference, cache grows linearly with dataset size which is bad.
+            # FIX: If self-reference (many unique paths), consider not caching or clearing.
+            # For now, let's keep it simple. If we run out of RAM, we disable cache.
+            # self._ref_mel_cache[ref_audio_path] = ref_mel
+            pass
 
         return {
             "text_ids": text_ids[:, :-5],  # 1 , t
@@ -234,7 +236,6 @@ class TTSDataset(Dataset):
             text_embedding_mask[i, : 8 + text_ids_len + codec_ids_len] = True
 
             # codec channel
-            # input_ids[i,   :3, 1] = 0
             input_ids[i, 3:8, 1] = torch.tensor(
                 [
                     self.config.talker_config.codec_nothink_id,
@@ -279,8 +280,20 @@ class TTSDataset(Dataset):
             ] = True
             attention_mask[i, : 8 + text_ids_len + codec_ids_len] = True
 
-        ref_mels = [data["ref_mel"] for data in batch]
-        ref_mels = torch.cat(ref_mels, dim=0)
+        # --- FIX: Dynamic Padding for Variable Length ref_mels ---
+        raw_ref_mels = [data["ref_mel"] for data in batch]
+
+        # Calculate max time length in this batch (dim 1)
+        max_mel_len = max([r.shape[1] for r in raw_ref_mels])
+
+        # Initialize padded tensor [Batch, MaxTime, n_mels]
+        # Using same dtype as source (float32)
+        ref_mels = torch.zeros(len(batch), max_mel_len, raw_ref_mels[0].shape[2], dtype=raw_ref_mels[0].dtype)
+
+        for i, mel in enumerate(raw_ref_mels):
+            # mel shape is [1, Time, 128]
+            curr_len = mel.shape[1]
+            ref_mels[i, :curr_len, :] = mel[0, :, :]
 
         return {
             "input_ids": input_ids,
