@@ -2418,10 +2418,8 @@ class Qwen3ExportJSONL:
         return {
             "required": {
                 "dataset_items": ("DATASET_ITEMS",),
-                "output_filename": (
-                    "STRING",
-                    {"default": "dataset.jsonl", "multiline": False},
-                ),
+                "output_filename": ("STRING", {"default": "dataset.jsonl", "multiline": False}),
+                "use_self_as_reference": ("BOOLEAN", {"default": True, "tooltip": "If True, sets 'ref_audio' to the same path as 'audio' for each item. This forces the model to learn the specific style/emotion of each individual clip (Standard for expressive Fine-Tuning)."}),
             }
         }
 
@@ -2431,7 +2429,7 @@ class Qwen3ExportJSONL:
     FUNCTION = "export"
     CATEGORY = "Qwen3-TTS/Dataset"
 
-    def export(self, dataset_items, output_filename):
+    def export(self, dataset_items, output_filename, use_self_as_reference=True):
         if not dataset_items:
             raise ValueError("No dataset items to export.")
 
@@ -2440,39 +2438,49 @@ class Qwen3ExportJSONL:
         output_dir = os.path.dirname(first_path)
         jsonl_path = os.path.join(output_dir, output_filename)
 
-        # Auto-detect reference
-        # Try to find 'ref.wav' in the same folder
-        ref_path = os.path.join(output_dir, "ref.wav")
-        if not os.path.exists(ref_path):
-            # Use first item
-            ref_path = first_path
-            print(f"Using auto-selected reference: {ref_path}")
+        # Logic for GLOBAL reference (only needed if NOT using self-reference)
+        global_ref_path = None
+        if not use_self_as_reference:
+            # Try to find 'ref.wav' in the same folder
+            ref_candidate = os.path.join(output_dir, "ref.wav")
+            if os.path.exists(ref_candidate):
+                global_ref_path = ref_candidate
+                print(f"[Qwen3-TTS] Found manual global reference: {global_ref_path}")
+            else:
+                # Fallback: Use first item as global reference
+                global_ref_path = first_path
+                print(f"[Qwen3-TTS] Global reference not found, using first item as anchor: {global_ref_path}")
 
-        full_ref_path = os.path.abspath(ref_path)
+            global_ref_path = os.path.abspath(global_ref_path)
 
         count = 0
-        with open(jsonl_path, "w", encoding="utf-8") as f:
+        print(f"[Qwen3-TTS] Exporting dataset. Mode: {'Self-Reference (Per-Clip Prompt)' if use_self_as_reference else 'Global Reference'}")
+
+        with open(jsonl_path, 'w', encoding='utf-8') as f:
             for item in dataset_items:
                 wav_path = os.path.abspath(item["audio_path"])
 
-                # Check reference
-                if wav_path == full_ref_path:
-                    pass
+                # DECISION: Self vs Global
+                if use_self_as_reference:
+                    # Each audio is its own prompt -> "Prompt Maker" style for every line
+                    current_ref = wav_path
+                else:
+                    current_ref = global_ref_path
 
                 entry = {
                     "audio": wav_path,
                     "text": item["text"],
-                    "ref_audio": full_ref_path,
+                    "ref_audio": current_ref
                 }
 
-                # Add instruction if present
+                # Add instruction if present (from Label Emotions node)
                 if "instruction" in item:
                     entry["instruction"] = item["instruction"]
 
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
                 count += 1
 
-        print(f"Exported {count} items to {jsonl_path}")
+        print(f"✅ Exported {count} items to {jsonl_path}")
         return (jsonl_path,)
 
 
