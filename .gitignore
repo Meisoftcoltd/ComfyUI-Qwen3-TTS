@@ -42,5 +42,4 @@ venv.bak/
 output/
 temp/
 models/
-dummy_train.jsonl
-dummy_lazy_train.jsonl
+temp_large_dataset.jsonl

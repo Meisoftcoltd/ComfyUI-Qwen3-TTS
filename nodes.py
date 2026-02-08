@@ -43,8 +43,10 @@ def fix_wsl_path(path):
 
 from qwen_tts import Qwen3TTSModel, Qwen3TTSTokenizer
 from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem
-from .dataset import TTSDataset
-
+try:
+    from .dataset import TTSDataset
+except ImportError:
+    from dataset import TTSDataset
 try:
     import whisper
     from pydub import AudioSegment, silence
@@ -247,6 +249,23 @@ def count_jsonl_lines(file_path: str) -> int:
     with open(file_path, "r", encoding="utf-8") as f:
         return sum(1 for _ in f)
 
+def batched_jsonl_reader(file_path: str, batch_size: int):
+    """Yield batches of items from a JSONL file."""
+    batch = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line_num, line in enumerate(f, 1):
+            try:
+                item = json.loads(line.strip())
+                batch.append(item)
+            except json.JSONDecodeError:
+                print(f"[Qwen3DataPrep] Warning: Skipping invalid JSON at line {line_num} in {os.path.basename(file_path)}")
+                continue
+
+            if len(batch) == batch_size:
+                yield batch
+                batch = []
+    if batch:
+        yield batch
 
 def load_cache_metadata(meta_path: str) -> dict | None:
     """Load cache metadata, return None if invalid."""
@@ -2550,12 +2569,7 @@ class Qwen3DataPrep:
             text_tok_path, trust_remote_code=True
         )
 
-        inputs = []
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            for line in f:
-                inputs.append(json.loads(line.strip()))
-
-        total_items = len(inputs)
+        total_items = input_line_count
         total_batches = (total_items + batch_size - 1) // batch_size
         print(f"Processing {total_items} items in {total_batches} batches...")
 
@@ -2608,9 +2622,8 @@ class Qwen3DataPrep:
 
                 out_file.write(json.dumps(item, ensure_ascii=False) + "\n")
 
-            for batch_idx, i in enumerate(range(0, total_items, batch_size)):
-                batch = inputs[i : i + batch_size]
-                audio_paths = [b["audio"] for b in batch]
+            for batch_idx, batch in enumerate(batched_jsonl_reader(jsonl_path, batch_size)):
+                audio_paths = [b['audio'] for b in batch]
 
                 status_msg = f"Processing batch {batch_idx + 1}/{total_batches}..."
                 print(status_msg)
