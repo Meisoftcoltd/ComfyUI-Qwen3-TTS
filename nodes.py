@@ -2057,6 +2057,10 @@ class Qwen3TranscribeWhisper:
                     "FLOAT",
                     {"default": -40.0, "min": -100.0, "max": 0.0, "step": 1.0},
                 ),
+                "segment_padding": (
+                    "FLOAT",
+                    {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Time in seconds to add before and after each segment to prevent cutting words too abruptly."},
+                ),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -2077,6 +2081,7 @@ class Qwen3TranscribeWhisper:
         min_duration=0.8,
         max_duration=60.0,
         silence_threshold=-40.0,
+        segment_padding=0.1,
         unique_id=None,
     ):
         if not HAS_WHISPER_PYDUB:
@@ -2161,8 +2166,11 @@ class Qwen3TranscribeWhisper:
 
                 file_count = 0
                 for segment in result["segments"]:
-                    start_ms = segment["start"] * 1000
-                    end_ms = segment["end"] * 1000
+                    # Apply padding logic
+                    pad_ms = int(segment_padding * 1000)
+                    start_ms = max(0, (segment["start"] * 1000) - pad_ms)
+                    end_ms = min(len(audio_full), (segment["end"] * 1000) + pad_ms)
+
                     text = segment["text"].strip()
 
                     chunk = audio_full[start_ms:end_ms]
