@@ -1,37 +1,16 @@
-# coding=utf-8
-# Copyright 2026 The Alibaba Qwen team.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+from torch.utils.data import Dataset
 import os
 import json
-from typing import Any, List, Tuple, Union
-
-import librosa
-import numpy as np
 import torch
+import numpy as np
+import librosa
 from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
 from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
-from torch.utils.data import Dataset
+from typing import Tuple, Union, List, Any
 
-AudioLike = Union[
-    str,  # wav path, URL, base64
-    np.ndarray,  # waveform (requires sr)
-    Tuple[np.ndarray, int],  # (waveform, sr)
-]
-
-MaybeList = Union[Any, List[Any]]
-
+# Define type alias for audio inputs
+AudioLike = Union[str, np.ndarray, Tuple[np.ndarray, int]]
+MaybeList = Union[AudioLike, List[AudioLike]]
 
 class TTSDataset(Dataset):
     def __init__(self, data_source, processor, config: Qwen3TTSConfig, lag_num=-1):
@@ -40,23 +19,37 @@ class TTSDataset(Dataset):
         self.config = config
         self._ref_mel_cache = {}
 
-        # Handle Lazy Loading from JSONL
-        if isinstance(data_source, str) and os.path.exists(data_source):
-            self.jsonl_path = data_source
-            self.data_list = None
-            self.offsets = self._build_offsets(data_source)
-        else:
+        # --- FIX: Robust initialization logic ---
+        if isinstance(data_source, str):
+            # Clean path just in case (remove quotes/whitespace)
+            clean_path = data_source.strip().strip('"').strip("'")
+
+            if os.path.exists(clean_path):
+                self.jsonl_path = clean_path
+                self.data_list = None
+                print(f"[TTSDataset] Loading lazy dataset from: {self.jsonl_path}")
+                self.offsets = self._build_offsets(self.jsonl_path)
+            else:
+                # Raise explicit error instead of falling back to list mode
+                raise FileNotFoundError(f"❌ Critical Error: Dataset file not found at path: '{data_source}' (Cleaned: '{clean_path}')")
+
+        elif isinstance(data_source, list):
             self.data_list = data_source
             self.jsonl_path = None
             self.offsets = None
+        else:
+            raise ValueError(f"Invalid data_source type: {type(data_source)}. Expected str (path) or list.")
 
     def _build_offsets(self, path):
         offsets = []
         offset = 0
-        with open(path, "rb") as f:
-            for line in f:
-                offsets.append(offset)
-                offset += len(line)
+        try:
+            with open(path, "rb") as f:
+                for line in f:
+                    offsets.append(offset)
+                    offset += len(line)
+        except Exception as e:
+            raise RuntimeError(f"Error building offsets for {path}: {e}")
         return offsets
 
     def _get_item_from_jsonl(self, idx):
@@ -64,7 +57,10 @@ class TTSDataset(Dataset):
         with open(self.jsonl_path, "rb") as f:
             f.seek(offset)
             line = f.readline()
-            return json.loads(line.decode("utf-8"))
+            try:
+                return json.loads(line.decode("utf-8"))
+            except json.JSONDecodeError as e:
+                raise RuntimeError(f"JSON Decode Error at index {idx} in {self.jsonl_path}: {e}")
 
     def __len__(self):
         if self.data_list is not None:
@@ -75,7 +71,10 @@ class TTSDataset(Dataset):
 
         # Force load at 24000 to match model requirements
         target_sr = 24000
-        audio, sr = librosa.load(x, sr=target_sr, mono=True)
+        try:
+            audio, sr = librosa.load(x, sr=target_sr, mono=True)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load audio file '{x}': {e}")
 
         if audio.ndim > 1:
             audio = np.mean(audio, axis=-1)
@@ -160,6 +159,10 @@ class TTSDataset(Dataset):
             item = self.data_list[idx]
         else:
             item = self._get_item_from_jsonl(idx)
+
+        # Safety check for dictionary
+        if not isinstance(item, dict):
+             raise TypeError(f"Dataset item at index {idx} is not a dictionary. Got {type(item)}. Content: {str(item)[:100]}")
 
         audio_path = item["audio"]
         text = item["text"]

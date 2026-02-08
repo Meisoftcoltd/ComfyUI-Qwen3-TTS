@@ -2286,24 +2286,33 @@ class Qwen3AutoLabelEmotions:
         items_to_infer = []
         total = len(dataset_items)
 
-        # Helper to apply gender override
+        # Helper to apply gender override and fix repetition
         def apply_gender_fix(text, mode):
-            if mode == "Auto":
-                return text
+            # Clean repetitive artifacts
+            if "Fefef" in text:
+                text = text.replace("Fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefemale", "Female")
+                # General cleanup for partial repetitions
+                import re
+                text = re.sub(r'(Fe)+male', 'Female', text, flags=re.IGNORECASE)
+
+            # Remove existing gender tags if we are overriding
+            if mode != "Auto":
+                # Regex to remove "Male voice", "Female voice", "[Male]", "[Female]" etc at start or middle
+                import re
+                text = re.sub(r'\b(Male|Female)\s+voice,?\s*', '', text, flags=re.IGNORECASE)
+                text = re.sub(r'\[(Male|Female)\],?\s*', '', text, flags=re.IGNORECASE)
+
+            # Clean up double commas or spaces
+            text = text.replace(", ,", ",").replace("  ", " ").strip().strip(",")
 
             if mode == "Female":
-                # Fix common mislabeling
-                text = text.replace("Male voice", "Female voice")
-                text = text.replace("male voice", "female voice")
-                # Ensure presence
-                if "Female voice" not in text and "female voice" not in text:
-                    text = "Female voice, " + text
-
+                text = "Female voice, " + text
             elif mode == "Male":
-                text = text.replace("Female voice", "Male voice")
-                text = text.replace("female voice", "male voice")
-                if "Male voice" not in text and "male voice" not in text:
-                    text = "Male voice, " + text
+                text = "Male voice, " + text
+
+            # Capitalize first letter
+            if text:
+                text = text[0].upper() + text[1:]
 
             return text
 
@@ -2814,10 +2823,10 @@ class Qwen3FineTune:
                 "epochs": (
                     "INT",
                     {
-                        "default": 3,
+                        "default": 50,  # UPDATED: Higher ceiling to allow target_loss to work
                         "min": 1,
                         "max": 1000,
-                        "tooltip": "Number of training epochs to run.",
+                        "tooltip": "Number of training epochs. Set high (e.g. 50) and let Target Loss stop it automatically.",
                     },
                 ),
                 "batch_size": (
@@ -2826,35 +2835,35 @@ class Qwen3FineTune:
                         "default": 2,
                         "min": 1,
                         "max": 64,
-                        "tooltip": "Number of samples per batch. Lower values use less VRAM.",
+                        "tooltip": "Number of samples per batch. Keep at 2 for 24GB VRAM cards.",
                     },
                 ),
                 "lr": (
                     "FLOAT",
                     {
-                        "default": 2e-6,
+                        "default": 2e-5, # UPDATED: The "Gasoline" setting
                         "step": 1e-7,
-                        "tooltip": "Learning rate. Qwen default (2e-5) is too aggressive for small batches, causing noise output. Defaults to 2e-6 for stability.",
+                        "tooltip": "Learning rate. Default 2e-5 is recommended when using Gradient Accumulation 8 and Warmup 0.1.",
                     },
                 ),
                 "target_loss": (
                     "FLOAT",
                     {
-                        "default": 0.0,
+                        "default": 7.2, # UPDATED: The "Sniper" setting
                         "min": 0.0,
                         "max": 100.0,
                         "step": 0.01,
-                        "tooltip": "Detener entrenamiento si el Loss baja de este valor (0.0 = desactivado)",
+                        "tooltip": "Stop training immediately when Loss hits this value. 7.2 is usually the 'Sweet Spot' for high quality cloning.",
                     },
                 ),
                 "save_loss_threshold": (
                     "FLOAT",
                     {
-                        "default": 0.0,
+                        "default": 7.5, # UPDATED: Safety backup
                         "min": 0.0,
                         "max": 100.0,
                         "step": 0.01,
-                        "tooltip": "Guardar un checkpoint cuando el Loss baje de este valor (0.0 = desactivado). No detiene el entrenamiento.",
+                        "tooltip": "Save an extra checkpoint when Loss drops below this value (e.g. 7.5) without stopping.",
                     },
                 ),
                 "speaker_name": (
@@ -2898,7 +2907,7 @@ class Qwen3FineTune:
                         "default": 1,
                         "min": 0,
                         "max": 100,
-                        "tooltip": "Save checkpoint every N epochs. Set to 0 to only save final epoch. Ignored if save_every_steps > 0.",
+                        "tooltip": "Save checkpoint every N epochs. Set to 0 to only save final epoch.",
                     },
                 ),
                 "save_every_steps": (
@@ -2921,10 +2930,10 @@ class Qwen3FineTune:
                 "gradient_accumulation": (
                     "INT",
                     {
-                        "default": 4,
+                        "default": 8, # UPDATED: Higher stability for small batch size
                         "min": 1,
                         "max": 32,
-                        "tooltip": "Accumulate gradients over N steps before updating. Effective batch size = batch_size * gradient_accumulation.",
+                        "tooltip": "Accumulate gradients over N steps. Default 8 simulates Batch Size 16 (8*2) for stability.",
                     },
                 ),
                 "gradient_checkpointing": (
@@ -2969,17 +2978,17 @@ class Qwen3FineTune:
                         "default": 0,
                         "min": 0,
                         "max": 10000,
-                        "tooltip": "Number of warmup steps. Set to 0 to disable warmup. Recommended: 5-10% of total steps.",
+                        "tooltip": "Number of warmup steps. Ignored if warmup_ratio > 0.",
                     },
                 ),
                 "warmup_ratio": (
                     "FLOAT",
                     {
-                        "default": 0.0,
+                        "default": 0.1, # UPDATED: Critical for higher LR
                         "min": 0.0,
                         "max": 0.5,
                         "step": 0.01,
-                        "tooltip": "Warmup as ratio of total steps. Ignored if warmup_steps > 0. E.g., 0.1 = 10% warmup.",
+                        "tooltip": "Warmup as ratio of total steps. 0.1 (10%) prevents model shock at start.",
                     },
                 ),
                 "save_optimizer_state": (
