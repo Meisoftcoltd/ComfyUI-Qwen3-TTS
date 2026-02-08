@@ -2288,29 +2288,34 @@ class Qwen3AutoLabelEmotions:
 
         # Helper to apply gender override and fix repetition
         def apply_gender_fix(text, mode):
-            # Clean repetitive artifacts
-            if "Fefef" in text:
-                text = text.replace("Fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefemale", "Female")
-                # General cleanup for partial repetitions
-                import re
-                text = re.sub(r'(Fe)+male', 'Female', text, flags=re.IGNORECASE)
+            import re
 
-            # Remove existing gender tags if we are overriding
+            # 1. Strict artifact cleaning (Fefefefemale loops)
+            # Removes strings like "Fefefemale", "Fefefefemale", "Mememale", etc.
+            text = re.sub(r'\b(Fe)+male\b', 'Female', text, flags=re.IGNORECASE)
+            text = re.sub(r'\b(Me)+male\b', 'Male', text, flags=re.IGNORECASE)
+
+            # 2. Remove existing gender tags if we are overriding or just to clean up before re-adding
             if mode != "Auto":
-                # Regex to remove "Male voice", "Female voice", "[Male]", "[Female]" etc at start or middle
-                import re
+                # Remove "Male/Female voice" with optional comma/spaces
                 text = re.sub(r'\b(Male|Female)\s+voice,?\s*', '', text, flags=re.IGNORECASE)
-                text = re.sub(r'\[(Male|Female)\],?\s*', '', text, flags=re.IGNORECASE)
+                # Remove "[Male]", "[Female]" tags
+                text = re.sub(r'\[\s*(Male|Female)\s*\]?,?\s*', '', text, flags=re.IGNORECASE)
+                # Remove standalone "Male," or "Female," at start
+                text = re.sub(r'^\s*(Male|Female),?\s+', '', text, flags=re.IGNORECASE)
 
-            # Clean up double commas or spaces
-            text = text.replace(", ,", ",").replace("  ", " ").strip().strip(",")
+            # 3. Clean up formatting (double commas, spaces)
+            text = re.sub(r'\s{2,}', ' ', text) # Multiple spaces -> one
+            text = re.sub(r',\s*,', ',', text)  # Double commas -> one
+            text = text.strip().strip(",").strip()
 
+            # 4. Prepend the correct gender tag
             if mode == "Female":
                 text = "Female voice, " + text
             elif mode == "Male":
                 text = "Male voice, " + text
 
-            # Capitalize first letter
+            # 5. Capitalize first letter
             if text:
                 text = text[0].upper() + text[1:]
 
