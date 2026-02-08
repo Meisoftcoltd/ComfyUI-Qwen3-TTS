@@ -2088,7 +2088,16 @@ class Qwen3TranscribeWhisper:
                     continue
 
                 # Transcribe
-                result = model.transcribe(filepath, language="es", verbose=False)
+                # Optimization: Convert loaded AudioSegment to numpy for Whisper to avoid re-reading file
+                # Whisper expects 16kHz mono, float32, normalized [-1, 1]
+                audio_for_whisper = audio_full.set_frame_rate(16000).set_channels(1)
+                samples = np.array(audio_for_whisper.get_array_of_samples())
+
+                # Normalize based on sample width (pydub samples are integers)
+                normalization_factor = float(1 << (8 * audio_for_whisper.sample_width - 1))
+                audio_np = samples.astype(np.float32) / normalization_factor
+
+                result = model.transcribe(audio_np, language="es", verbose=False)
 
                 file_count = 0
                 for segment in result["segments"]:
