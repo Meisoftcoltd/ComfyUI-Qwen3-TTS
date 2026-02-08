@@ -4262,6 +4262,116 @@ Audio Details:
         return (report,)
 
 
+class Qwen3TranscribeSingle:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "model_size": (
+                    ["tiny", "base", "small", "medium", "large", "large-v3"],
+                    {"default": "medium"},
+                ),
+                "language": (
+                    [
+                        "Auto",
+                        "en",
+                        "es",
+                        "fr",
+                        "de",
+                        "it",
+                        "ja",
+                        "zh",
+                        "pt",
+                        "ru",
+                        "ko",
+                        "nl",
+                        "pl",
+                        "tr",
+                        "hi",
+                    ],
+                    {"default": "Auto"},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    FUNCTION = "transcribe"
+    CATEGORY = "Qwen3-TTS/Utils"
+
+    def transcribe(self, audio, model_size, language):
+        if not HAS_WHISPER_PYDUB:
+            raise ImportError(
+                "Please install 'openai-whisper' and 'pydub' to use this node."
+            )
+        if not HAS_LIBROSA:
+            raise ImportError(
+                "Please install 'librosa' to use this node (required for resampling)."
+            )
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(
+            f"[Qwen3-TTS] Transcribe Single: Loading Whisper '{model_size}' on {device}..."
+        )
+
+        try:
+            model = whisper.load_model(model_size, device=device)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load Whisper model: {e}")
+
+        # Process Audio Tensor
+        # audio is {"waveform": tensor[B, C, T], "sample_rate": int}
+        waveform = audio["waveform"]
+        sr = audio["sample_rate"]
+
+        # Ensure correct shape [Batch, Channels, Time]
+        if waveform.dim() == 2:
+            waveform = waveform.unsqueeze(0)  # [1, C, T]
+
+        # Take first item in batch
+        wav_tensor = waveform[0]  # [C, T]
+
+        # Mix to mono
+        if wav_tensor.shape[0] > 1:
+            wav_tensor = torch.mean(wav_tensor, dim=0)  # [T]
+        else:
+            wav_tensor = wav_tensor.squeeze(0)  # [T]
+
+        # Convert to numpy
+        wav_np = wav_tensor.cpu().numpy()
+
+        # Resample to 16000Hz (Whisper requirement)
+        target_sr = 16000
+        if sr != target_sr:
+            # Check if wav_np is float32 (librosa requires float)
+            if wav_np.dtype != np.float32:
+                wav_np = wav_np.astype(np.float32)
+
+            try:
+                wav_np = librosa.resample(wav_np, orig_sr=sr, target_sr=target_sr)
+            except Exception as e:
+                raise RuntimeError(f"Resampling failed: {e}")
+
+        # Transcribe
+        lang_arg = None if language == "Auto" else language
+
+        # Whisper expects float32
+        if wav_np.dtype != np.float32:
+            wav_np = wav_np.astype(np.float32)
+
+        result = model.transcribe(wav_np, language=lang_arg, verbose=False)
+        text = result["text"].strip()
+        print(f"[Qwen3-TTS] Transcription result: {text[:50]}...")
+
+        # Clean up VRAM
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return (text,)
+
+
 # Node Mappings
 NODE_CLASS_MAPPINGS = {
     "Qwen3Loader": Qwen3Loader,
@@ -4285,6 +4395,7 @@ NODE_CLASS_MAPPINGS = {
     "Qwen3LoadVideoFolder": Qwen3LoadVideoFolder,
     "Qwen3AudioCompare": Qwen3AudioCompare,
     "Qwen3AudioToDataset": Qwen3AudioToDataset,
+    "Qwen3TranscribeSingle": Qwen3TranscribeSingle,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -4309,4 +4420,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Qwen3LoadVideoFolder": "🎥 Qwen3-TTS Load Video Folder (Path)",
     "Qwen3AudioCompare": "📊 Qwen3-TTS Audio Compare",
     "Qwen3AudioToDataset": "📁 Qwen3-TTS Dataset Maker",
+    "Qwen3TranscribeSingle": "🎙️ Qwen3-TTS Whisper Transcribe (Single)",
 }
