@@ -4137,6 +4137,66 @@ class Qwen3LoadVideoFromPath:
         return (audio_out, video_out, video_info)
 
 
+class Qwen3VideoToAudio:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "video_folder": ("STRING", {"default": "", "multiline": False}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("audio_folder_path",)
+    OUTPUT_NODE = True
+    FUNCTION = "convert"
+    CATEGORY = "Qwen3-TTS/Utils"
+
+    def convert(self, video_folder):
+        if not HAS_WHISPER_PYDUB:
+            raise ImportError("Please install 'pydub' (and ffmpeg) to use this node.")
+
+        if not video_folder or not video_folder.strip():
+             raise ValueError("Video folder path is empty. Please select a valid folder.")
+
+        video_folder = fix_wsl_path(video_folder)
+        if not os.path.exists(video_folder):
+            raise ValueError(f"Video folder not found: {video_folder}")
+
+        # Create temp folder
+        temp_dir = folder_paths.get_temp_directory()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = os.path.join(temp_dir, f"qwen3_extracted_{timestamp}")
+        os.makedirs(output_dir, exist_ok=True)
+
+        files = [
+            f for f in os.listdir(video_folder)
+            if f.lower().endswith((".mp4", ".mkv", ".avi", ".mov", ".webm"))
+        ]
+
+        if not files:
+            raise ValueError(f"No video files found in {video_folder}")
+
+        print(f"[Qwen3-TTS] Extracting audio from {len(files)} videos to {output_dir}...")
+
+        count = 0
+        for fname in tqdm(files, desc="Extracting Audio"):
+            video_path = os.path.join(video_folder, fname)
+            wav_name = os.path.splitext(fname)[0] + ".wav"
+            wav_path = os.path.join(output_dir, wav_name)
+
+            try:
+                audio = AudioSegment.from_file(video_path)
+                # Export as standard 44.1kHz mono/stereo WAV (downstream nodes handle resampling)
+                audio.export(wav_path, format="wav")
+                count += 1
+            except Exception as e:
+                print(f"Error converting {fname}: {e}")
+
+        print(f"[Qwen3-TTS] Successfully extracted {count} audio files.")
+        return (output_dir,)
+
+
 class Qwen3LoadVideoFolder:
     @classmethod
     def INPUT_TYPES(s):
@@ -4570,6 +4630,7 @@ NODE_CLASS_MAPPINGS = {
     "Qwen3LoadAudioFolder": Qwen3LoadAudioFolder,
     "Qwen3LoadVideoFromPath": Qwen3LoadVideoFromPath,
     "Qwen3LoadVideoFolder": Qwen3LoadVideoFolder,
+    "Qwen3VideoToAudio": Qwen3VideoToAudio,
     "Qwen3AudioCompare": Qwen3AudioCompare,
     "Qwen3AudioToDataset": Qwen3AudioToDataset,
     "Qwen3TranscribeSingle": Qwen3TranscribeSingle,
@@ -4595,6 +4656,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Qwen3LoadAudioFolder": "📁 Qwen3-TTS Load Audio Folder (Path)",
     "Qwen3LoadVideoFromPath": "🎥 Qwen3-TTS Load Video (Path)",
     "Qwen3LoadVideoFolder": "🎥 Qwen3-TTS Load Video Folder (Path)",
+    "Qwen3VideoToAudio": "🎞️➡️🎵 Qwen3-TTS Video Folder to Audio",
     "Qwen3AudioCompare": "📊 Qwen3-TTS Audio Compare",
     "Qwen3AudioToDataset": "📁 Qwen3-TTS Dataset Maker",
     "Qwen3TranscribeSingle": "🎙️ Qwen3-TTS Whisper Transcribe (Single)",
