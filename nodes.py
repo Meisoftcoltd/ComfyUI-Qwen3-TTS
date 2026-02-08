@@ -2797,8 +2797,18 @@ class Qwen3FineTune:
                         "default": 0.0,
                         "min": 0.0,
                         "max": 100.0,
-                        "step": 0.1,
+                        "step": 0.01,
                         "tooltip": "Detener entrenamiento si el Loss baja de este valor (0.0 = desactivado)",
+                    },
+                ),
+                "save_loss_threshold": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 100.0,
+                        "step": 0.01,
+                        "tooltip": "Guardar un checkpoint cuando el Loss baje de este valor (0.0 = desactivado). No detiene el entrenamiento.",
                     },
                 ),
                 "speaker_name": (
@@ -2955,6 +2965,7 @@ class Qwen3FineTune:
         batch_size,
         lr,
         target_loss,
+        save_loss_threshold,
         speaker_name,
         seed,
         mixed_precision="bf16",
@@ -3352,6 +3363,10 @@ class Qwen3FineTune:
                 # Helper function to save a training checkpoint (also inference-ready)
                 def save_training_checkpoint(checkpoint_name, current_epoch, current_step):
                     """Save checkpoint for resuming training. Also inference-ready."""
+                    accelerator.wait_for_everyone()
+                    if not accelerator.is_main_process:
+                        return None
+
                     ckpt_path = os.path.join(full_output_dir, checkpoint_name)
                     os.makedirs(ckpt_path, exist_ok=True)
 
@@ -3361,9 +3376,15 @@ class Qwen3FineTune:
 
                     # Inject speaker embedding at index 3000 (for inference)
                     if target_speaker_embedding is not None:
+                        # Validate embedding shape
+                        if target_speaker_embedding.dim() > 1:
+                             emb_to_save = target_speaker_embedding[0]
+                        else:
+                             emb_to_save = target_speaker_embedding
+
                         weight = state_dict["talker.model.codec_embedding.weight"]
                         state_dict["talker.model.codec_embedding.weight"][3000] = (
-                            target_speaker_embedding[0].detach().cpu().to(weight.dtype)
+                            emb_to_save.detach().cpu().to(weight.dtype)
                         )
 
                     torch.save(state_dict, os.path.join(ckpt_path, "pytorch_model.bin"))
@@ -3412,6 +3433,10 @@ class Qwen3FineTune:
                 # Helper function to save final inference-ready model
                 def save_final_model(checkpoint_name, current_epoch, current_step):
                     """Save complete model ready for inference and resume."""
+                    accelerator.wait_for_everyone()
+                    if not accelerator.is_main_process:
+                        return None
+
                     ckpt_path = os.path.join(full_output_dir, checkpoint_name)
 
                     # Copy config files only (exclude speech_tokenizer, model files)
@@ -3452,9 +3477,15 @@ class Qwen3FineTune:
 
                     # Inject speaker embedding at index 3000 (for inference)
                     if target_speaker_embedding is not None:
+                        # Validate embedding shape
+                        if target_speaker_embedding.dim() > 1:
+                             emb_to_save = target_speaker_embedding[0]
+                        else:
+                             emb_to_save = target_speaker_embedding
+
                         weight = state_dict["talker.model.codec_embedding.weight"]
                         state_dict["talker.model.codec_embedding.weight"][3000] = (
-                            target_speaker_embedding[0].detach().cpu().to(weight.dtype)
+                            emb_to_save.detach().cpu().to(weight.dtype)
                         )
 
                     # Save as pytorch_model.bin (works for both inference and resume)
@@ -3647,32 +3678,67 @@ class Qwen3FineTune:
                             epoch_loss += loss.item()
                             steps += 1
 
-                            # --- LOGICA DE TARGET LOSS ---
-                            if target_loss > 0 and loss.item() <= target_loss:
-                                print(
-                                    f"\n🎯 [Qwen3-TTS] OBJETIVO ALCANZADO: Loss {loss.item():.4f} <= {target_loss}"
-                                )
-                                send_status(
-                                    f"🎯 Target Loss reached: {loss.item():.4f}"
-                                )
-                                print(f"💾 Guardando checkpoint final y deteniendo...")
+                            # Check for NaN loss
+                            if math.isnan(loss.item()):
+                                print(f"\n❌ [Qwen3-TTS] ERROR: Loss is NaN at epoch {epoch+1}, step {global_step}. Aborting training.")
+                                send_status("❌ Training aborted: Loss is NaN")
+                                accelerator.free_memory()
+                                del model, optimizer, train_dataloader, qwen3tts
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                raise ValueError("Training Aborted: Loss became NaN (diverged). Try lowering learning rate or increasing batch size.")
+
+                            current_loss_val = loss.item()
+
+                            # --- LOGICA DE TARGET LOSS (STOP) ---
+                            if target_loss > 0 and current_loss_val <= target_loss:
+                                if accelerator.is_main_process:
+                                    print(f"\n🎯 [Qwen3-TTS] OBJETIVO ALCANZADO: Loss {current_loss_val:.4f} <= {target_loss}")
+                                    send_status(f"🎯 Target Loss reached: {current_loss_val:.4f}")
+                                    print(f"💾 Guardando checkpoint final y deteniendo...")
 
                                 final_path = save_final_model(
-                                    f"target_reached_loss_{loss.item():.4f}", epoch, global_step
+                                    f"target_reached_loss_{current_loss_val:.4f}", epoch, global_step
                                 )
 
-                                # Clean up and exit
+                                # Only the main process returns a path, others might return None from save_final_model
+                                # But we need to sync exit.
+                                accelerator.wait_for_everyone()
+
                                 accelerator.free_memory()
                                 del model, optimizer, train_dataloader, qwen3tts
                                 if torch.cuda.is_available():
                                     torch.cuda.synchronize()
                                     torch.cuda.empty_cache()
 
-                                print(
-                                    f"Fine-tuning complete (Target Reached). Model saved to {final_path}"
-                                )
-                                send_status("Training complete (Target Reached)!")
-                                return (final_path, speaker_name)
+                                if accelerator.is_main_process:
+                                    print(f"Fine-tuning complete (Target Reached). Model saved to {final_path}")
+                                    send_status("Training complete (Target Reached)!")
+                                    return (final_path, speaker_name)
+                                else:
+                                    # Non-main processes just exit gracefully (return empty/dummy)
+                                    return ("", "")
+                            # -----------------------------
+
+                            # --- LOGICA DE SAVE LOSS THRESHOLD (CHECKPOINT) ---
+                            if save_loss_threshold > 0 and current_loss_val <= save_loss_threshold:
+                                # We need a flag to prevent saving repeatedly for the same drop event?
+                                # Or just save every time it's below? Saving 100 times per epoch is bad.
+                                # Let's save only if it's the *first time* in this run or significantly lower?
+                                # Simple approach: Save as ckpt_loss_X.XX. If file exists, skip.
+                                # This naturally limits frequency unless loss changes slightly.
+
+                                # Round to 3 decimals to avoid excessive saving for tiny fluctuations
+                                loss_str = f"{current_loss_val:.3f}"
+                                ckpt_name = f"ckpt_loss_{loss_str}"
+                                ckpt_full_path = os.path.join(full_output_dir, ckpt_name)
+
+                                if not os.path.exists(ckpt_full_path):
+                                     if accelerator.is_main_process:
+                                         print(f"\n💾 [Qwen3-TTS] Loss Threshold Reached: {current_loss_val:.4f} <= {save_loss_threshold}")
+                                         send_status(f"Saving checkpoint (Loss {current_loss_val:.3f})...")
+
+                                     save_training_checkpoint(ckpt_name, epoch, global_step)
                             # -----------------------------
 
                             # Only count optimizer steps (after gradient accumulation completes)
