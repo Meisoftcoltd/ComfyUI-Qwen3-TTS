@@ -4055,8 +4055,8 @@ class Qwen3LoadVideoFromPath:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "AUDIO")
-    RETURN_NAMES = ("images", "audio")
+    RETURN_TYPES = ("IMAGE", "AUDIO", "DICT")
+    RETURN_NAMES = ("images", "audio", "video_info")
     FUNCTION = "load_video"
     CATEGORY = "Qwen3-TTS/Utils"
 
@@ -4084,15 +4084,28 @@ class Qwen3LoadVideoFromPath:
             audio_out = convert_audio(samples, audio.frame_rate)
         except Exception as e:
             print(f"[Qwen3-TTS] Warning: Could not extract audio from video: {e}")
-            # Return silent audio if fails? Or raise? User said "extract audio which is its output".
-            # Better to raise if audio is critical, but maybe video only?
-            # Let's create silent audio as fallback or fail? User wants "audio output".
             raise RuntimeError(f"Error extracting audio from video: {e}")
 
         # 2. Load Video Frames
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
              raise ValueError(f"Could not open video file: {video_path}")
+
+        # Metadata extraction
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = total_frames / fps if fps > 0 else 0
+
+        video_info = {
+            "width": width,
+            "height": height,
+            "fps": fps,
+            "frame_count": total_frames,
+            "duration": duration,
+            "path": video_path
+        }
 
         frames = []
         count = 0
@@ -4120,8 +4133,8 @@ class Qwen3LoadVideoFromPath:
         # Stack frames: [T, H, W, C]
         video_out = torch.stack(frames)
 
-        print(f"[Qwen3-TTS] Loaded video: {count} frames, Audio duration: {len(audio)/1000:.2f}s")
-        return (video_out, audio_out)
+        print(f"[Qwen3-TTS] Loaded video: {count} frames, {width}x{height} @ {fps:.2f}fps. Audio: {len(audio)/1000:.2f}s")
+        return (video_out, audio_out, video_info)
 
 
 class Qwen3LoadVideoFolder:
@@ -4130,26 +4143,16 @@ class Qwen3LoadVideoFolder:
         return {
             "required": {
                 "folder_path": ("STRING", {"default": "", "multiline": False}),
-            },
-            "optional": {
-                "frame_limit": ("INT", {"default": 0, "min": 0, "max": 10000, "tooltip": "Limit number of frames per video (0 = all)."}),
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "AUDIO")
-    RETURN_NAMES = ("images", "audio")
-    OUTPUT_IS_LIST = (True, True)
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("video_path",)
+    OUTPUT_IS_LIST = (True,)
     FUNCTION = "load_folder"
     CATEGORY = "Qwen3-TTS/Utils"
 
-    def load_folder(self, folder_path, frame_limit=0):
-        if not HAS_WHISPER_PYDUB:
-            raise ImportError(
-                "Please install 'pydub' (and ffmpeg) to use video loading nodes."
-            )
-        if not HAS_CV2:
-            raise ImportError("Please install 'opencv-python' to use video loading nodes.")
-
+    def load_folder(self, folder_path):
         if not folder_path or not folder_path.strip():
              raise ValueError("Folder path is empty. Please select a valid folder.")
 
@@ -4168,84 +4171,12 @@ class Qwen3LoadVideoFolder:
         if not files:
             raise ValueError(f"No video files found in {folder_path}")
 
-        audio_list = []
-        video_list = []
+        # Just return list of paths to avoid OOM
+        # Downstream node (Qwen3LoadVideoFromPath) will load them one by one
+        full_paths = [os.path.join(folder_path, f) for f in files]
+        print(f"[Qwen3-TTS] Found {len(full_paths)} video files in {folder_path}. Passing paths only.")
 
-        print(f"[Qwen3-TTS] Processing {len(files)} video files from {folder_path}...")
-
-        for fname in files:
-            p = os.path.join(folder_path, fname)
-            try:
-                # 1. Audio
-                audio = AudioSegment.from_file(p)
-                samples = np.array(audio.get_array_of_samples())
-                if audio.channels > 1:
-                    samples = samples.reshape((-1, audio.channels)).T
-                else:
-                    samples = samples.reshape((1, -1))
-                samples = samples.astype(np.float32) / (1 << (8 * audio.sample_width - 1))
-                # Create Comfy audio dict
-                # convert_audio returns {"waveform": ..., "sample_rate": ...}
-                # But here we need to append to list. convert_audio does exactly what we need.
-                # However, convert_audio expects (samples, channels) usually?
-                # My `convert_audio` function handles various inputs.
-                # Let's check `convert_audio`:
-                # if wav.dim()==1: unsqueeze(0).
-                # It returns {"waveform": [1, C, T], ...}
-                # Let's use the helper directly
-
-                # samples is (C, T). convert_audio expects (T) or (C, T)?
-                # load_audio_input expects various.
-                # Let's check `convert_audio` logic in nodes.py again.
-                # It handles (Samples,) or (C, S) or (S, C).
-                # Just passing the raw float32 samples is safest if shape is right.
-                # Samples here is (C, T). Transpose to (T, C) for convert_audio?
-                # convert_audio checks: if wav.shape[0] > wav.shape[1]: transpose.
-                # So if (T, C) -> (C, T).
-                # If we have (C, T), 2 > 100000 is False. So it stays (C, T).
-                # Then unsqueeze(0) -> (1, C, T). Correct.
-
-                # We need to pass (C, T) numpy array?
-                # Let's pass the raw samples.
-                # samples shape is (Channels, Time).
-                # convert_audio:
-                # if wav.shape[0] > wav.shape[1]: transpose.
-                # Since C < T usually, it won't transpose.
-                # It returns {"waveform": (1, C, T), "sample_rate": sr}.
-
-                audio_item = convert_audio(samples, audio.frame_rate)
-
-                # 2. Video
-                cap = cv2.VideoCapture(p)
-                frames = []
-                f_count = 0
-                while True:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    frame = frame.astype(np.float32) / 255.0
-                    frames.append(torch.from_numpy(frame))
-                    f_count += 1
-                    if frame_limit > 0 and f_count >= frame_limit:
-                        break
-                cap.release()
-
-                if frames:
-                    video_tensor = torch.stack(frames) # [T, H, W, C]
-                    video_list.append(video_tensor)
-                    audio_list.append(audio_item)
-                    print(f"  Loaded {fname}: {f_count} frames")
-                else:
-                    print(f"  Warning: No frames in {fname}, skipping.")
-
-            except Exception as e:
-                print(f"Error processing {fname}: {e}")
-
-        if not video_list:
-            raise ValueError("Failed to process any video files.")
-
-        return (video_list, audio_list)
+        return (full_paths,)
 
 
 class Qwen3AudioCompare:
