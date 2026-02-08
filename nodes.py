@@ -1850,6 +1850,9 @@ class Qwen3AudioToDataset:
                 "Please install 'openai-whisper' and 'pydub' to use this node."
             )
 
+        if not audio_folder or not audio_folder.strip():
+            raise ValueError("Audio folder path is empty. Please select a valid folder.")
+
         audio_folder = fix_wsl_path(audio_folder)
         print(f"[Qwen3-TTS] AudioToDataset: Processing {audio_folder}")
 
@@ -2008,6 +2011,9 @@ class Qwen3LoadDatasetAudio:
     CATEGORY = "Qwen3-TTS/Dataset"
 
     def load_audio(self, folder_path):
+        if not folder_path or not folder_path.strip():
+             raise ValueError("Folder path is empty. Please select a valid folder.")
+
         folder_path = folder_path.strip().strip('"')
         folder_path = fix_wsl_path(folder_path)
 
@@ -3983,6 +3989,9 @@ class Qwen3LoadAudioFolder:
     CATEGORY = "Qwen3-TTS/Utils"
 
     def load_folder(self, folder_path):
+        if not folder_path or not folder_path.strip():
+             raise ValueError("Folder path is empty. Please select a valid folder.")
+
         folder_path = fix_wsl_path(folder_path)
         if not os.path.exists(folder_path):
             raise ValueError(f"Folder not found: {folder_path}")
@@ -4087,6 +4096,9 @@ class Qwen3LoadVideoFolder:
             raise ImportError(
                 "Please install 'pydub' (and ffmpeg) to use video loading nodes."
             )
+
+        if not folder_path or not folder_path.strip():
+             raise ValueError("Folder path is empty. Please select a valid folder.")
 
         folder_path = fix_wsl_path(folder_path)
         if not os.path.exists(folder_path):
