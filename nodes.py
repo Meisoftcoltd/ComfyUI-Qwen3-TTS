@@ -1415,6 +1415,20 @@ class Qwen3PromptMaker:
                 "ref_text": ("STRING", {"multiline": True}),
             },
             "optional": {
+                "enable_icl": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Enable In-Context Learning (ICL). Provides better prosody matching but might sometimes repeat the reference text. Disable if artifacts occur.",
+                    },
+                ),
+                "enable_x_vector": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Enable X-Vector speaker embedding. Provides stable speaker identity. Can be combined with ICL.",
+                    },
+                ),
                 "ref_audio_max_seconds": (
                     "FLOAT",
                     {"default": 30.0, "min": -1.0, "max": 120.0, "step": 5.0},
@@ -1426,7 +1440,15 @@ class Qwen3PromptMaker:
     FUNCTION = "create_prompt"
     CATEGORY = "Qwen3-TTS/Inference"
 
-    def create_prompt(self, model, ref_audio, ref_text, ref_audio_max_seconds=30.0):
+    def create_prompt(
+        self,
+        model,
+        ref_audio,
+        ref_text,
+        enable_icl=True,
+        enable_x_vector=False,
+        ref_audio_max_seconds=30.0,
+    ):
         audio_tuple = load_audio_input(ref_audio)
 
         # Trim reference audio if too long to prevent generation hangs (-1 = no limit)
@@ -1441,9 +1463,25 @@ class Qwen3PromptMaker:
                 audio_tuple = (wav_data, audio_sr)
 
         try:
-            prompt = model.create_voice_clone_prompt(
+            # Generate initial prompt items
+            raw_prompt = model.create_voice_clone_prompt(
                 ref_audio=audio_tuple, ref_text=ref_text
             )
+
+            # Reconstruct items with user overrides
+            prompt = []
+            if raw_prompt:
+                for item in raw_prompt:
+                    # Create new VoiceClonePromptItem with overrides
+                    new_item = VoiceClonePromptItem(
+                        ref_code=item.ref_code,
+                        ref_spk_embedding=item.ref_spk_embedding,
+                        ref_text=item.ref_text,
+                        icl_mode=enable_icl,
+                        x_vector_only_mode=enable_x_vector,
+                    )
+                    prompt.append(new_item)
+
         except ValueError as e:
             msg = str(e)
             # Assumption: create_voice_clone_prompt might also be restricted to Base models?
