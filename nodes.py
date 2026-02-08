@@ -2971,6 +2971,25 @@ class Qwen3FineTune:
         os.makedirs(full_output_dir, exist_ok=True)
         print(f"[Qwen3-TTS DEBUG] Full output directory: {full_output_dir}")
 
+        # --- SMART SKIP: Check if target already reached ---
+        if target_loss > 0 and os.path.exists(full_output_dir):
+            print(f"[Qwen3-TTS] Checking for existing finished models in {full_output_dir}...")
+            for item in os.listdir(full_output_dir):
+                if item.startswith("target_reached_loss_") and os.path.isdir(os.path.join(full_output_dir, item)):
+                    try:
+                        # Extract loss value from folder name
+                        loss_str = item.split("_")[-1]
+                        found_loss = float(loss_str)
+
+                        if found_loss <= target_loss:
+                            print(f"✅ [Smart Skip] Found existing model meeting target loss: {item} (Loss {found_loss} <= {target_loss})")
+                            print("Skipping training session.")
+                            existing_model_path = os.path.join(full_output_dir, item)
+                            return (existing_model_path, speaker_name)
+                    except ValueError:
+                        continue
+        # ---------------------------------------------------
+
         # Check for resume checkpoint
         start_epoch = 0
         resume_from_step = 0  # Track step offset for ckpt_step_N checkpoints
@@ -3032,6 +3051,12 @@ class Qwen3FineTune:
                     with open(training_config_path, "r") as f:
                         saved_config = json.load(f)
                         resume_from_step = saved_config.get("step_offset", 0)
+
+                        # Load epoch if available (fix for loop restarts)
+                        if "epoch" in saved_config:
+                            start_epoch = saved_config["epoch"]
+                            print(f"Loaded start_epoch={start_epoch} from checkpoint config")
+
                         if resume_from_step > 0:
                             print(
                                 f"Loaded step_offset={resume_from_step} from checkpoint config"
@@ -3294,7 +3319,7 @@ class Qwen3FineTune:
                 )
 
                 # Helper function to save a training checkpoint (also inference-ready)
-                def save_training_checkpoint(checkpoint_name):
+                def save_training_checkpoint(checkpoint_name, current_epoch, current_step):
                     """Save checkpoint for resuming training. Also inference-ready."""
                     ckpt_path = os.path.join(full_output_dir, checkpoint_name)
                     os.makedirs(ckpt_path, exist_ok=True)
@@ -3339,8 +3364,11 @@ class Qwen3FineTune:
                             )
 
                     # Save training config with step_offset for resume
+                    # We save 'step_offset' as current_step for compatibility/clarity
                     training_config = {
-                        "step_offset": resume_from_step,
+                        "step_offset": current_step,
+                        "global_step": current_step,
+                        "epoch": current_epoch
                     }
                     with open(
                         os.path.join(ckpt_path, "training_config.json"), "w"
@@ -3351,7 +3379,7 @@ class Qwen3FineTune:
                     return ckpt_path
 
                 # Helper function to save final inference-ready model
-                def save_final_model(checkpoint_name):
+                def save_final_model(checkpoint_name, current_epoch, current_step):
                     """Save complete model ready for inference and resume."""
                     ckpt_path = os.path.join(full_output_dir, checkpoint_name)
 
@@ -3414,7 +3442,9 @@ class Qwen3FineTune:
 
                     # Save training config with step_offset for resume
                     training_config = {
-                        "step_offset": resume_from_step,
+                        "step_offset": current_step,
+                        "global_step": current_step,
+                        "epoch": current_epoch
                     }
                     with open(
                         os.path.join(ckpt_path, "training_config.json"), "w"
@@ -3597,7 +3627,7 @@ class Qwen3FineTune:
                                 print(f"💾 Guardando checkpoint final y deteniendo...")
 
                                 final_path = save_final_model(
-                                    f"target_reached_loss_{loss.item():.4f}"
+                                    f"target_reached_loss_{loss.item():.4f}", epoch, global_step
                                 )
 
                                 # Clean up and exit
@@ -3637,7 +3667,7 @@ class Qwen3FineTune:
                                     send_status(
                                         f"Saving checkpoint step {global_step}..."
                                     )
-                                    save_training_checkpoint(f"ckpt_step_{global_step}")
+                                    save_training_checkpoint(f"ckpt_step_{global_step}", epoch, global_step)
 
                     avg_loss = epoch_loss / steps if steps > 0 else 0
                     print(f"Epoch {epoch + 1}/{end_epoch} - Avg Loss: {avg_loss}")
@@ -3651,11 +3681,11 @@ class Qwen3FineTune:
                         ) and not is_final_epoch
                         if should_save_checkpoint:
                             send_status(f"Saving checkpoint epoch {epoch + 1}...")
-                            save_training_checkpoint(f"ckpt_epoch_{epoch + 1}")
+                            save_training_checkpoint(f"ckpt_epoch_{epoch + 1}", epoch + 1, global_step)
 
                 # Always save final model as epoch_N for consistent resume
                 send_status(f"Saving final model epoch {end_epoch}...")
-                save_final_model(f"epoch_{end_epoch}")
+                save_final_model(f"epoch_{end_epoch}", end_epoch, global_step)
                 final_output_path = os.path.join(full_output_dir, f"epoch_{end_epoch}")
 
                 # Cleanup: free accelerator resources and synchronize CUDA
