@@ -4055,8 +4055,8 @@ class Qwen3LoadVideoFromPath:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "AUDIO", "DICT")
-    RETURN_NAMES = ("images", "audio", "video_info")
+    RETURN_TYPES = ("AUDIO", "IMAGE", "DICT")
+    RETURN_NAMES = ("audio", "images", "video_info")
     FUNCTION = "load_video"
     CATEGORY = "Qwen3-TTS/Utils"
 
@@ -4134,7 +4134,7 @@ class Qwen3LoadVideoFromPath:
         video_out = torch.stack(frames)
 
         print(f"[Qwen3-TTS] Loaded video: {count} frames, {width}x{height} @ {fps:.2f}fps. Audio: {len(audio)/1000:.2f}s")
-        return (video_out, audio_out, video_info)
+        return (audio_out, video_out, video_info)
 
 
 class Qwen3LoadVideoFolder:
@@ -4146,9 +4146,9 @@ class Qwen3LoadVideoFolder:
             }
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("video_path",)
-    OUTPUT_IS_LIST = (True,)
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("video_paths", "paths_info")
+    OUTPUT_IS_LIST = (True, True)
     FUNCTION = "load_folder"
     CATEGORY = "Qwen3-TTS/Utils"
 
@@ -4176,7 +4176,7 @@ class Qwen3LoadVideoFolder:
         full_paths = [os.path.join(folder_path, f) for f in files]
         print(f"[Qwen3-TTS] Found {len(full_paths)} video files in {folder_path}. Passing paths only.")
 
-        return (full_paths,)
+        return (full_paths, full_paths)
 
 
 class Qwen3AudioCompare:
