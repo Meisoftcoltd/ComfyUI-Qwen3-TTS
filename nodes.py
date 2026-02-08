@@ -116,6 +116,30 @@ QWEN3_TTS_TOKENIZERS = {
     "Qwen/Qwen3-TTS-Tokenizer-12Hz": "Qwen3-TTS-Tokenizer-12Hz",
 }
 
+_SPEAKER_CACHE = {}
+
+
+def _find_first_config(start_path):
+    """BFS search for the first config.json file."""
+    try:
+        queue = [start_path]
+        while queue:
+            current_path = queue.pop(0)
+
+            # Check for config.json in current directory
+            cfg_path = os.path.join(current_path, "config.json")
+            if os.path.exists(cfg_path):
+                return cfg_path
+
+            # Add subdirectories to queue
+            with os.scandir(current_path) as it:
+                for entry in it:
+                    if entry.is_dir():
+                        queue.append(entry.path)
+    except OSError:
+        pass
+    return None
+
 
 def get_finetuned_speakers() -> list:
     """Scan configured output directories for fine-tuned speakers."""
@@ -176,9 +200,7 @@ def get_finetuned_speakers() -> list:
                 cfg_path = _find_first_config(entry.path)
                 if cfg_path:
                     try:
-                        with open(
-                            os.path.join(root, "config.json"), "r", encoding="utf-8"
-                        ) as f:
+                        with open(cfg_path, "r", encoding="utf-8") as f:
                             cfg = json.load(f)
                             if (
                                 "talker_config" in cfg
@@ -2696,7 +2718,7 @@ class Qwen3DataPrep:
             "version": 1,
             "input_hash": input_hash,
             "audio_tokenizer": audio_tokenizer_repo,
-            "output_line_count": len(inputs),
+            "output_line_count": input_line_count,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         save_cache_metadata(meta_path, metadata)
