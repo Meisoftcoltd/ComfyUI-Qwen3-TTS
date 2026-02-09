@@ -2272,14 +2272,14 @@ class Qwen3AutoLabelEmotions:
                     ["Auto", "Female", "Male"],
                     {
                         "default": "Auto",
-                        "tooltip": "Force a specific gender tag implies changing 'Male voice' to 'Female voice' (or vice versa) in the description.",
+                        "tooltip": "Force a specific gender tag. Changes 'Male voice' to 'Female voice' (or vice versa) in the description.",
                     },
                 ),
                 "quantization": (
                     ["4bit", "8bit", "none"],
                     {
                         "default": "4bit",
-                        "tooltip": "Load model in 4-bit/8-bit to save VRAM and prevent CPU offloading. 4bit is highly recommended.",
+                        "tooltip": "Load model in 4-bit/8-bit to save VRAM. 4bit is highly recommended for speed.",
                     },
                 ),
                 "batch_size": (
@@ -2303,89 +2303,60 @@ class Qwen3AutoLabelEmotions:
     FUNCTION = "label_emotions"
     CATEGORY = "Qwen3-TTS/Dataset"
 
-    def label_emotions(
-        self,
-        dataset_items,
-        model,
-        gender_override,
-        quantization,
-        batch_size,
-        unique_id=None,
-    ):
+    def label_emotions(self, dataset_items, model, gender_override, quantization, batch_size, unique_id=None):
         import re
         import torch
-        from transformers import (
-            AutoProcessor,
-            Qwen2AudioForConditionalGeneration,
-            BitsAndBytesConfig,
-        )
-
+        from transformers import AutoProcessor, Qwen2AudioForConditionalGeneration, BitsAndBytesConfig
+        
         if not HAS_LIBROSA:
             raise ImportError("Please install 'librosa' to use this node.")
 
         print(
-            f"[Qwen3-TTS] Auto-Labeling Emotions. Items: {len(dataset_items)}, Batch: {batch_size}, Quant: {quantization}"
+            f"[Qwen3-TTS] Auto-Labeling Emotions ({len(dataset_items)} items). Mode: {gender_override}, Quant: {quantization}, Batch: {batch_size}"
         )
 
-        # Keyword mapping (Defaults mostly to Male, will be fixed by override)
+        # Keyword mapping
         keyword_map = {
-            "angry": "Male voice, very angry, shouting, aggressive tone, high pitch.",
-            "enfadado": "Male voice, very angry, shouting, aggressive tone, high pitch.",
-            "sad": "Male voice, very sad, crying, low pitch, melancholic tone.",
-            "triste": "Male voice, very sad, crying, low pitch, melancholic tone.",
-            "happy": "Male voice, happy, laughing, bright tone, excited.",
-            "feliz": "Male voice, happy, laughing, bright tone, excited.",
-            "whisper": "Male voice, whispering, quiet, soft tone.",
-            "susurro": "Male voice, whispering, quiet, soft tone.",
-            "scared": "Male voice, scared, trembling, high pitch, fearful.",
-            "miedo": "Male voice, scared, trembling, high pitch, fearful.",
-            "surprised": "Male voice, surprised, shocked, high pitch.",
-            "sorpresa": "Male voice, surprised, shocked, high pitch.",
+            "angry": "very angry, shouting, aggressive tone, high pitch.",
+            "enfadado": "very angry, shouting, aggressive tone, high pitch.",
+            "sad": "very sad, crying, low pitch, melancholic tone.",
+            "triste": "very sad, crying, low pitch, melancholic tone.",
+            "happy": "happy, laughing, bright tone, excited.",
+            "feliz": "happy, laughing, bright tone, excited.",
+            "whisper": "whispering, quiet, soft tone.",
+            "susurro": "whispering, quiet, soft tone.",
+            "scared": "scared, trembling, high pitch, fearful.",
+            "miedo": "scared, trembling, high pitch, fearful.",
+            "surprised": "surprised, shocked, high pitch.",
+            "sorpresa": "surprised, shocked, high pitch.",
         }
 
-        items_to_infer = []
-        total = len(dataset_items)
-
-        # Helper to apply gender override and fix repetition
+        # --- Helper: Gender Fix (Regex) ---
         def apply_gender_fix(text, mode):
-            import re
+            if mode == "Auto":
+                return text
 
-            # 1. Strict artifact cleaning (Fefefefemale loops)
-            # Removes strings like "Fefefemale", "Fefefefemale", "Mememale", etc.
-            text = re.sub(r'\b(Fe)+male\b', 'Female', text, flags=re.IGNORECASE)
-            text = re.sub(r'\b(Me)+male\b', 'Male', text, flags=re.IGNORECASE)
-
-            # 2. Remove existing gender tags if we are overriding or just to clean up before re-adding
-            if mode != "Auto":
-                # Remove "Male/Female voice" with optional comma/spaces
-                text = re.sub(r'\b(Male|Female)\s+voice,?\s*', '', text, flags=re.IGNORECASE)
-                # Remove "[Male]", "[Female]" tags
-                text = re.sub(r'\[\s*(Male|Female)\s*\]?,?\s*', '', text, flags=re.IGNORECASE)
-                # Remove standalone "Male," or "Female," at start
-                text = re.sub(r'^\s*(Male|Female),?\s+', '', text, flags=re.IGNORECASE)
-
-            # 3. Clean up formatting (double commas, spaces)
-            text = re.sub(r'\s{2,}', ' ', text) # Multiple spaces -> one
-            text = re.sub(r',\s*,', ',', text)  # Double commas -> one
-            text = text.strip().strip(",").strip()
-
-            # 4. Prepend the correct gender tag
+            # 1. Clean existing gender tags to avoid corruption/duplication
+            clean_text = re.sub(r"\b\[?(?:fe)?male\]?(?:\s+voice)?\b", "", text, flags=re.IGNORECASE)
+            
+            # 2. Clean up punctuation artifacts
+            clean_text = re.sub(r"\s+,", ",", clean_text)       # " ," -> ","
+            clean_text = re.sub(r",\s*,", ",", clean_text)      # ",," -> ","
+            clean_text = clean_text.strip(" ,.")                 # Trim edges
+            
+            # 3. Prepend target gender
             if mode == "Female":
-                text = "Female voice, " + text
+                return "Female voice, " + clean_text
             elif mode == "Male":
-                text = "Male voice, " + text
-
-            # 5. Capitalize first letter
-            if text:
-                text = text[0].upper() + text[1:]
-
+                return "Male voice, " + clean_text
+            
             return text
 
         # --- PHASE 1: Pre-Scan (Cache & Keywords) ---
-        print("[Qwen3-TTS] Scanning for cached labels and keywords...")
         items_to_infer = []
         total = len(dataset_items)
-
+        
+        print("[Qwen3-TTS] Scanning for cached labels and keywords...")
         for idx, item in enumerate(dataset_items):
             file_path = item["audio_path"]
             filename = os.path.basename(file_path)
@@ -2406,16 +2377,18 @@ class Qwen3AutoLabelEmotions:
                 path_lower = file_path.lower()
                 for kw, kw_instruction in keyword_map.items():
                     if kw in path_lower:
-                        instruction = kw_instruction
+                        # Apply gender immediately to keyword default
+                        prefix = "Male voice, " if gender_override != "Female" else "Female voice, "
+                        if gender_override == "Auto": prefix = "Male voice, " # Default fallback
+                        
+                        instruction = prefix + kw_instruction
                         print(f"[{idx+1}/{total}] Keyword match: {filename}")
                         break
 
-            # If we found an instruction (Cache or Keyword), apply gender fix immediately
+            # If found, save and continue
             if instruction:
                 instruction = apply_gender_fix(instruction, gender_override)
                 item["instruction"] = instruction
-
-                # Update cache with the fix to avoid re-doing it later
                 try:
                     with open(label_path, "w", encoding="utf-8") as f:
                         f.write(instruction)
@@ -2426,170 +2399,132 @@ class Qwen3AutoLabelEmotions:
             # 3. Needs Inference
             items_to_infer.append(item)
 
-        if not items_to_infer:
-            print("All items labeled via cache or keywords.")
-            return (dataset_items,)
+        # --- PHASE 2: Inference (Batched & Quantized) ---
+        if items_to_infer:
+            print(f"[Qwen3-TTS] {len(items_to_infer)} items require inference. Loading model...")
 
-        # --- Load Model with Quantization ---
-        print(f"[Qwen3-TTS] Loading model with {quantization} quantization...")
+            # --- Configure Quantization ---
+            bnb_config = None
+            if quantization == "4bit":
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.float16
+                )
+            elif quantization == "8bit":
+                bnb_config = BitsAndBytesConfig(load_in_8bit=True)
 
-        bnb_config = None
-        if quantization == "4bit":
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
-            )
-        elif quantization == "8bit":
-            bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+            try:
+                # Load Processor
+                processor = AutoProcessor.from_pretrained(model, trust_remote_code=True)
+                
+                # Load Model
+                model_kwargs = {"device_map": "auto", "trust_remote_code": True}
+                if bnb_config:
+                    model_kwargs["quantization_config"] = bnb_config
+                    model_kwargs["torch_dtype"] = torch.float16
+                
+                model_obj = Qwen2AudioForConditionalGeneration.from_pretrained(model, **model_kwargs)
+                
+            except Exception as e:
+                raise RuntimeError(f"Failed to load Qwen2-Audio: {e}. If using 4bit/8bit, make sure 'bitsandbytes' is installed.")
 
-        try:
-            # Load Processor
-            processor = AutoProcessor.from_pretrained(model, trust_remote_code=True)
-
-            # Load Model
-            model_kwargs = {"device_map": "auto", "trust_remote_code": True}
-            if bnb_config:
-                model_kwargs["quantization_config"] = bnb_config
-                model_kwargs["torch_dtype"] = torch.float16
-
-            model_obj = Qwen2AudioForConditionalGeneration.from_pretrained(
-                model, **model_kwargs
-            )
-
+            system_prompt = "You are a dataset tagger. Listen to the audio and output ONLY a short description. Format: [Gender], [Emotion], [Tone], [Speed], [Pitch]."
+            
             total_infer = len(items_to_infer)
-            for idx, item in enumerate(
-                tqdm(items_to_infer, desc="Labeling Emotions", unit="item")
-            ):
-                if unique_id:
-                    PromptServer.instance.send_progress(idx, total_infer, unique_id)
+            
+            with tqdm(total=total_infer, desc="Labeling (Batched)") as pbar:
+                for i in range(0, total_infer, batch_size):
+                    # Progress bar update for ComfyUI
+                    if unique_id:
+                        PromptServer.instance.send_progress(i, total_infer, unique_id)
 
-                file_path = item["audio_path"]
-                label_path = os.path.splitext(file_path)[0] + ".emotion.txt"
-
-        # --- Batch Inference ---
-        system_prompt = "You are a dataset tagger. Listen to the audio and output ONLY a short description. Format: [Gender], [Emotion], [Tone], [Speed], [Pitch]."
-
-        # Process in batches
-        total_batches = (len(items_to_infer) + batch_size - 1) // batch_size
-
-        with tqdm(total=len(items_to_infer), desc="Labeling (Batched)") as pbar:
-            for i in range(0, len(items_to_infer), batch_size):
-                batch_items = items_to_infer[i : i + batch_size]
-
-                # Prepare batch inputs
-                texts = []
-                audios = []
-                audio_urls = []  # Just for tracking
-
-                for item in batch_items:
-                    file_path = item["audio_path"]
-                    try:
-                        # Load and resample audio
-                        wav, sr = librosa.load(
-                            file_path, sr=processor.feature_extractor.sampling_rate
-                        )
-                        audios.append(wav)
-                        audio_urls.append(file_path)
-
-                        # Prepare chat template for this item
-                        conversation = [
-                            {
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "audio",
-                                        "audio_url": "placeholder",
-                                    },  # Processor handles the actual audio array
-                                    {"type": "text", "text": system_prompt},
-                                ],
-                            }
-                        ]
-                        text = processor.apply_chat_template(
-                            conversation, add_generation_prompt=True, tokenize=False
-                        )
-                        texts.append(text)
-                    except Exception as e:
-                        print(f"Error loading audio {file_path}: {e}")
-                        # Fallback for this item
-                        item["instruction"] = apply_gender_fix(
-                            "Neutral voice, normal speed.", gender_override
-                        )
-                        # We won't process this one in the batch
-
-                if not audios:
-                    pbar.update(len(batch_items))
-                    continue
-
-                # Tokenize Batch
-                try:
-                    inputs = processor(
-                        text=texts,
-                        audios=audios,
-                        return_tensors="pt",
-                        padding=True,
-                    ).to(model_obj.device)
-
-                    # Generate
-                    with torch.no_grad():
-                        generated_ids = model_obj.generate(
-                            **inputs,
-                            max_new_tokens=40,
-                            do_sample=True,
-                            temperature=0.5,
-                            top_p=0.9,
-                        )
-
-                    # Decode Batch
-                    # Qwen2Audio output includes input tokens, so we strip them
-                    generated_ids = generated_ids[:, inputs.input_ids.size(1) :]
-                    batch_outputs = processor.batch_decode(
-                        generated_ids, skip_special_tokens=True
-                    )
-
-                    # Assign results
-                    valid_idx = 0
+                    batch_items = items_to_infer[i : i + batch_size]
+                    
+                    texts = []
+                    audios = []
+                    
+                    # Prepare Batch Inputs
                     for item in batch_items:
-                        # Skip items that failed loading
-                        if "instruction" in item:
-                            continue
-
-                        raw_output = batch_outputs[valid_idx].strip()
-                        final_instruction = apply_gender_fix(
-                            raw_output, gender_override
-                        )
-                        item["instruction"] = final_instruction
-
-                        # Save to cache immediately
+                        file_path = item["audio_path"]
                         try:
-                            label_path = (
-                                os.path.splitext(item["audio_path"])[0] + ".emotion.txt"
+                            # Load audio
+                            wav, sr = librosa.load(file_path, sr=processor.feature_extractor.sampling_rate)
+                            audios.append(wav)
+                            
+                            # Prepare chat
+                            conversation = [
+                                {"role": "user", "content": [
+                                    {"type": "audio", "audio_url": "placeholder"}, 
+                                    {"type": "text", "text": system_prompt}
+                                ]}
+                            ]
+                            text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
+                            texts.append(text)
+                        except Exception as e:
+                            print(f"Error loading audio {file_path}: {e}")
+                            item["instruction"] = apply_gender_fix("Neutral voice, normal speed.", gender_override)
+                            # We keep it in batch_items but won't process it in model
+
+                    if not audios:
+                        pbar.update(len(batch_items))
+                        continue
+
+                    # Run Batch Inference
+                    try:
+                        inputs = processor(
+                            text=texts, 
+                            audios=audios, 
+                            return_tensors="pt", 
+                            padding=True
+                        ).to(model_obj.device)
+
+                        with torch.no_grad():
+                            generated_ids = model_obj.generate(
+                                **inputs,
+                                max_new_tokens=40,
+                                do_sample=True,
+                                temperature=0.5,
+                                top_p=0.9
                             )
-                            with open(label_path, "w", encoding="utf-8") as f:
-                                f.write(final_instruction)
-                        except:
-                            pass
 
-                        valid_idx += 1
+                        generated_ids = generated_ids[:, inputs.input_ids.size(1):]
+                        batch_outputs = processor.batch_decode(generated_ids, skip_special_tokens=True)
 
-                except Exception as e:
-                    print(
-                        f"Batch inference failed: {e}. Fallback to neutral for this batch."
-                    )
-                    for item in batch_items:
-                        if "instruction" not in item:
-                            item["instruction"] = apply_gender_fix(
-                                "Neutral voice, normal speed.", gender_override
-                            )
+                        # Assign results back to items
+                        valid_idx = 0
+                        for item in batch_items:
+                            if "instruction" in item: continue # Skip the ones that failed loading
+                            
+                            raw_output = batch_outputs[valid_idx].strip()
+                            final_instruction = apply_gender_fix(raw_output, gender_override)
+                            
+                            item["instruction"] = final_instruction
+                            
+                            # Cache result
+                            try:
+                                label_path = os.path.splitext(item["audio_path"])[0] + ".emotion.txt"
+                                with open(label_path, "w", encoding="utf-8") as f:
+                                    f.write(final_instruction)
+                            except: pass
+                            
+                            valid_idx += 1
 
-                pbar.update(len(batch_items))
+                    except Exception as e:
+                        print(f"Batch inference failed: {e}")
+                        # Fallback for entire batch
+                        for item in batch_items:
+                            if "instruction" not in item:
+                                item["instruction"] = apply_gender_fix("Neutral voice, normal speed.", gender_override)
 
-        # Cleanup
-        del model_obj, processor
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
+                    pbar.update(len(batch_items))
+
+            # Cleanup
+            del model_obj, processor
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
 
         return (dataset_items,)
 
