@@ -49,7 +49,7 @@ except ImportError:
     from dataset import TTSDataset
 try:
     import whisper
-    from pydub import AudioSegment, silence
+    from pydub import AudioSegment, silence, effects
 
     HAS_WHISPER_PYDUB = True
 except ImportError:
@@ -4432,6 +4432,89 @@ Audio Details:
         return (report,)
 
 
+class Qwen3NormalizeAudio:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "target_db": ("FLOAT", {"default": -1.0, "min": -30.0, "max": 0.0, "step": 0.1}),
+                "method": (["Peak Normalization", "Dynamic Compression"], {"default": "Dynamic Compression"}),
+            }
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    FUNCTION = "normalize"
+    CATEGORY = "Qwen3-TTS/Utils"
+
+    def normalize(self, audio, target_db, method):
+        if not HAS_WHISPER_PYDUB:
+             raise ImportError("Please install 'pydub' to use this node.")
+
+        waveform = audio["waveform"]
+        sr = audio["sample_rate"]
+
+        output_waveforms = []
+
+        if waveform.dim() == 2:
+            waveform = waveform.unsqueeze(0)
+
+        batch_size = waveform.shape[0]
+
+        for i in range(batch_size):
+            wav_tensor = waveform[i]
+            wav_np = wav_tensor.cpu().numpy()
+
+            # Check shape: [Channels, Samples] is standard ComfyUI
+            if wav_np.shape[0] < wav_np.shape[1]:
+                wav_np = wav_np.transpose(1, 0) # [T, C]
+
+            # Convert to int16 (clip to avoid wrap-around artifacts)
+            wav_np = np.clip(wav_np, -1.0, 1.0)
+            wav_int16 = (wav_np * 32767).astype(np.int16)
+
+            channels = wav_np.shape[1] if wav_np.ndim > 1 else 1
+
+            # Create AudioSegment
+            seg = AudioSegment(
+                wav_int16.tobytes(),
+                frame_rate=sr,
+                sample_width=2,
+                channels=channels
+            )
+
+            # Apply
+            headroom = -target_db
+
+            if method == "Dynamic Compression":
+                # 1. Normalize to 0dB to maximize dynamic range for compressor
+                seg = effects.normalize(seg, headroom=0.1)
+                # 2. Apply standard voice compression settings
+                seg = effects.compress_dynamic_range(seg, threshold=-20.0, ratio=4.0, attack=5.0, release=50.0)
+
+            # Final Normalization to target dB
+            seg = effects.normalize(seg, headroom=headroom)
+
+            # Convert back
+            samples = np.array(seg.get_array_of_samples())
+
+            if seg.channels > 1:
+                samples = samples.reshape((-1, seg.channels))
+
+            samples_float = samples.astype(np.float32) / 32768.0
+
+            if samples_float.ndim == 1:
+                samples_float = samples_float[np.newaxis, :] # [1, T]
+            else:
+                samples_float = samples_float.transpose(1, 0) # [C, T]
+
+            output_waveforms.append(torch.from_numpy(samples_float))
+
+        output_tensor = torch.stack(output_waveforms)
+
+        return ({"waveform": output_tensor, "sample_rate": sr},)
+
+
 class Qwen3TranscribeSingle:
     @classmethod
     def INPUT_TYPES(s):
@@ -4565,6 +4648,7 @@ NODE_CLASS_MAPPINGS = {
     "Qwen3AudioCompare": Qwen3AudioCompare,
     "Qwen3AudioToDataset": Qwen3AudioToDataset,
     "Qwen3TranscribeSingle": Qwen3TranscribeSingle,
+    "Qwen3NormalizeAudio": Qwen3NormalizeAudio,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -4589,4 +4673,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Qwen3AudioCompare": "📊 Qwen3-TTS Audio Compare",
     "Qwen3AudioToDataset": "📁 Qwen3-TTS Dataset Maker",
     "Qwen3TranscribeSingle": "🎙️ Qwen3-TTS Whisper Transcribe (Single)",
+    "Qwen3NormalizeAudio": "🎚️ Qwen3-TTS Normalize Audio",
 }
