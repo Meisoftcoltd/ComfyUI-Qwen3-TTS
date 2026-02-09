@@ -11,6 +11,7 @@ Custom nodes for [Qwen2.5-Audio / Qwen3-TTS](https://huggingface.co/Qwen/Qwen2.5
 *   **📁 Modular Dataset Pipeline:** Automate dataset creation: Load raw audio -> Transcribe with Whisper -> Auto-Label emotions with Qwen2-Audio -> Export JSONL. Or use the all-in-one **Dataset Maker**.
 *   **⚙️ Advanced Config:** Fixes for "Unsupported speakers" in fine-tuned models and detailed prompt control.
 *   **📊 Audio Analysis:** Tools to compare generated audio against reference audio (Speaker Similarity & Mel Distance).
+*   **⏳ Progress Reporting:** Real-time progress bars in the ComfyUI node title and HUD for long-running operations (transcription, labeling, training).
 
 ## Installation
 
@@ -84,7 +85,7 @@ Custom nodes for [Qwen2.5-Audio / Qwen3-TTS](https://huggingface.co/Qwen/Qwen2.5
 
 #### **Utilities**
 *   **Qwen3LoadAudioFromPath / Folder:** Load audio from absolute paths.
-*   **Qwen3LoadVideoFromPath / Folder:** Extract audio directly from video files (requires ffmpeg/pydub).
+*   **Qwen3VideoToAudio:** Batch convert a folder of video files (mp4, mkv, etc.) to .wav audio files. Optimized for large datasets to prevent OOM errors.
 *   **Qwen3SavePrompt / LoadPrompt:** Save generated voice prompts to .safetensors to reuse a cloned voice without re-computing.
 
 ### 📁 Modular Dataset Pipeline (Step-by-Step)

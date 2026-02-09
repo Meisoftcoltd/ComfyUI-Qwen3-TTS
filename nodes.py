@@ -1834,6 +1834,9 @@ class Qwen3AudioToDataset:
                     {"default": -40.0, "min": -100.0, "max": 0.0, "step": 1.0},
                 ),
             },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
     RETURN_TYPES = ("STRING",)
@@ -1850,6 +1853,7 @@ class Qwen3AudioToDataset:
         min_duration=0.8,
         max_duration=15.0,
         silence_threshold=-40.0,
+        unique_id=None,
     ):
         if not HAS_WHISPER_PYDUB:
             raise ImportError(
@@ -1895,7 +1899,8 @@ class Qwen3AudioToDataset:
         if not files:
             raise ValueError(f"No .wav files found in {audio_folder}")
 
-        print(f"[Qwen3-TTS] Found {len(files)} files")
+        total_files = len(files)
+        print(f"[Qwen3-TTS] Found {total_files} files")
 
         total_clips = 0
 
@@ -1912,11 +1917,14 @@ class Qwen3AudioToDataset:
             except:
                 return audio_segment
 
-        for filename in files:
+        for idx, filename in enumerate(files):
+            if unique_id:
+                PromptServer.instance.send_progress(idx, total_files, unique_id)
+
             filepath = os.path.join(audio_folder, filename)
             base_name = os.path.splitext(filename)[0]
 
-            print(f"Processing: {filename}")
+            print(f"Processing [{idx+1}/{total_files}]: {filename}")
 
             try:
                 audio_full = AudioSegment.from_wav(filepath)
@@ -2150,8 +2158,8 @@ class Qwen3TranscribeWhisper:
                 tqdm(files, desc="Processing Audio", unit="file")
             ):
                 # Update progress
-                # if unique_id:
-                #    PromptServer.instance.send_progress(idx, total_files, unique_id)
+                if unique_id:
+                   PromptServer.instance.send_progress(idx, total_files, unique_id)
 
                 filepath = os.path.join(folder_path, filename)
                 base_name = os.path.splitext(filename)[0]
@@ -2416,9 +2424,13 @@ class Qwen3AutoLabelEmotions:
                 "Format: [Gender], [Emotion], [Tone], [Speed], [Pitch]. "
             )
 
+            total_infer = len(items_to_infer)
             for idx, item in enumerate(
                 tqdm(items_to_infer, desc="Labeling Emotions", unit="item")
             ):
+                if unique_id:
+                    PromptServer.instance.send_progress(idx, total_infer, unique_id)
+
                 file_path = item["audio_path"]
                 label_path = os.path.splitext(file_path)[0] + ".emotion.txt"
 
@@ -2734,6 +2746,9 @@ class Qwen3DataPrep:
                 out_file.write(json.dumps(item, ensure_ascii=False) + "\n")
 
             for batch_idx, batch in enumerate(batched_jsonl_reader(jsonl_path, batch_size)):
+                if unique_id:
+                    PromptServer.instance.send_progress(batch_idx, total_batches, unique_id)
+
                 audio_paths = [b['audio'] for b in batch]
 
                 status_msg = f"Processing batch {batch_idx + 1}/{total_batches}..."
@@ -3825,6 +3840,9 @@ class Qwen3FineTune:
                             if accelerator.sync_gradients:
                                 global_step += 1
 
+                                if unique_id:
+                                    PromptServer.instance.send_progress(global_step, total_optimizer_steps, unique_id)
+
                                 # Show step progress periodically
                                 if (
                                     log_every_steps > 0
@@ -4050,7 +4068,10 @@ class Qwen3VideoToAudio:
         return {
             "required": {
                 "video_folder": ("STRING", {"default": "", "multiline": False}),
-            }
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
     RETURN_TYPES = ("STRING",)
@@ -4059,7 +4080,7 @@ class Qwen3VideoToAudio:
     FUNCTION = "convert"
     CATEGORY = "Qwen3-TTS/Utils"
 
-    def convert(self, video_folder):
+    def convert(self, video_folder, unique_id=None):
         if not HAS_WHISPER_PYDUB:
             raise ImportError("Please install 'pydub' (and ffmpeg) to use this node.")
 
@@ -4084,10 +4105,14 @@ class Qwen3VideoToAudio:
         if not files:
             raise ValueError(f"No video files found in {video_folder}")
 
-        print(f"[Qwen3-TTS] Extracting audio from {len(files)} videos to {output_dir}...")
+        total_files = len(files)
+        print(f"[Qwen3-TTS] Extracting audio from {total_files} videos to {output_dir}...")
 
         count = 0
-        for fname in tqdm(files, desc="Extracting Audio"):
+        for idx, fname in enumerate(tqdm(files, desc="Extracting Audio")):
+            if unique_id:
+                PromptServer.instance.send_progress(idx, total_files, unique_id)
+
             video_path = os.path.join(video_folder, fname)
             wav_name = os.path.splitext(fname)[0] + ".wav"
             wav_path = os.path.join(output_dir, wav_name)
