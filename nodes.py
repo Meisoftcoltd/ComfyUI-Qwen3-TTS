@@ -2333,22 +2333,27 @@ class Qwen3AutoLabelEmotions:
 
         # --- Helper: Gender Fix (Regex) ---
         def apply_gender_fix(text, mode):
-            if mode == "Auto":
-                return text
+            # 1. Remove specific artifacts
+            text = text.replace("[]", "").replace("[,]", "").replace("()", "")
 
-            # 1. Clean existing gender tags to avoid corruption/duplication
-            clean_text = re.sub(r"\b\[?(?:fe)?male\]?(?:\s+voice)?\b", "", text, flags=re.IGNORECASE)
+            # 2. Handle Gender Mode
+            if mode != "Auto":
+                # Remove existing gender tags
+                text = re.sub(r"\b\[?(?:fe)?male\]?(?:\s+voice)?\b", "", text, flags=re.IGNORECASE)
             
-            # 2. Clean up punctuation artifacts
-            clean_text = re.sub(r"\s+,", ",", clean_text)       # " ," -> ","
-            clean_text = re.sub(r",\s*,", ",", clean_text)      # ",," -> ","
-            clean_text = clean_text.strip(" ,.")                 # Trim edges
+            # 3. Clean Punctuation (Aggressive)
+            # Collapse multiple commas/spaces
+            text = re.sub(r"\s*,\s*", ", ", text)
+            # Remove leading/trailing punctuation
+            text = text.strip(" ,.")
+            # Remove double spaces
+            text = re.sub(r"\s+", " ", text)
             
-            # 3. Prepend target gender
+            # 4. Prepend Target Gender
             if mode == "Female":
-                return "Female voice, " + clean_text
+                return "Female voice, " + text
             elif mode == "Male":
-                return "Male voice, " + clean_text
+                return "Male voice, " + text
             
             return text
 
@@ -3090,6 +3095,28 @@ class Qwen3FineTune:
     OUTPUT_NODE = True
     FUNCTION = "train"
     CATEGORY = "Qwen3-TTS/Training"
+
+    def _save_instruction_report(self, jsonl_path, output_dir):
+        """Extracts unique instructions from dataset and saves them to a text file."""
+        try:
+            unique_inst = set()
+            with open(jsonl_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        data = json.loads(line)
+                        if "instruction" in data and data["instruction"]:
+                            unique_inst.add(data["instruction"].strip())
+                    except: pass
+
+            report_path = os.path.join(output_dir, "instruction.txt")
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write(f"# Training Prompts Report ({len(unique_inst)} unique)\n")
+                f.write("---------------------------------------------------\n")
+                for inst in sorted(list(unique_inst)):
+                    f.write(inst + "\n")
+            print(f"[Qwen3-TTS] 📝 Instruction report saved: {report_path}")
+        except Exception as e:
+            print(f"[Qwen3-TTS] ⚠️ Failed to save instruction report: {e}")
 
     def train(
         self,
@@ -3848,6 +3875,7 @@ class Qwen3FineTune:
                                     torch.cuda.empty_cache()
 
                                 if accelerator.is_main_process:
+                                    self._save_instruction_report(train_jsonl, full_output_dir)
                                     print(f"Fine-tuning complete (Target Reached). Model saved to {final_path}")
                                     send_status("Training complete (Target Reached)!")
                                     return (final_path, speaker_name)
@@ -3931,6 +3959,7 @@ class Qwen3FineTune:
                     torch.cuda.synchronize()
                     torch.cuda.empty_cache()
 
+                self._save_instruction_report(train_jsonl, full_output_dir)
                 print(f"Fine-tuning complete. Model saved to {final_output_path}")
                 send_status("Training complete!")
                 return (final_output_path, speaker_name)
