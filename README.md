@@ -8,8 +8,10 @@ Custom nodes for [Qwen2.5-Audio / Qwen3-TTS](https://huggingface.co/Qwen/Qwen2.5
 *   **👥 Voice Cloning:** Clone voices from a short reference audio clip (3-10s recommended).
 *   **🎨 Voice Design:** Design custom voices by describing attributes like gender, age, pitch, speed, and emotion.
 *   **🎓 Fine-Tuning:** Complete pipeline to fine-tune the model on your own voice dataset. Fine-tuning provides superior stability and tone matching compared to zero-shot cloning.
-*   **📁 Modular Dataset Pipeline:** Automate dataset creation: Load raw audio -> Transcribe with Whisper -> Auto-Label emotions with Qwen2-Audio -> Export JSONL.
+*   **📁 Modular Dataset Pipeline:** Automate dataset creation: Load raw audio -> Transcribe with Whisper -> Auto-Label emotions with Qwen2-Audio -> Export JSONL. Or use the all-in-one **Dataset Maker**.
 *   **⚙️ Advanced Config:** Fixes for "Unsupported speakers" in fine-tuned models and detailed prompt control.
+*   **📊 Audio Analysis:** Tools to compare generated audio against reference audio (Speaker Similarity & Mel Distance).
+*   **⏳ Progress Reporting:** Real-time progress bars in the ComfyUI node title and HUD for long-running operations (transcription, labeling, training).
 
 ## Installation
 
@@ -62,7 +64,31 @@ Custom nodes for [Qwen2.5-Audio / Qwen3-TTS](https://huggingface.co/Qwen/Qwen2.5
 *   **Outputs:** Audio waveform.
 *   **Details:** Uses the `Base` or `CustomVoice` variants. Requires the reference text for accurate prompt alignment.
 
-### 📁 Dataset Pipeline (Step-by-Step)
+### 📁 Dataset & Utilities
+
+#### **Qwen3AudioToDataset (Dataset Maker)**
+*   **Function:** All-in-one node to create a dataset from a folder of audio files.
+*   **Inputs:** `audio_folder`, `model_size` (Whisper), `output_folder_name`, `min/max_duration`, `silence_threshold`.
+*   **Outputs:** Path to the generated `dataset.jsonl`.
+*   **Details:** Automatically loads, transcribes, slices, and formats the dataset for training.
+
+#### **Qwen3TranscribeSingle**
+*   **Function:** Transcribe a single audio clip using Whisper.
+*   **Inputs:** `audio` (AUDIO input), `model_size`.
+*   **Outputs:** `text` (STRING).
+*   **Details:** Useful for preparing `ref_text` for Voice Cloning.
+
+#### **Qwen3AudioCompare**
+*   **Function:** Compares two audio clips (Reference vs Generated) to evaluate quality.
+*   **Inputs:** `reference_audio`, `generated_audio`, `speaker_encoder_model` (Base model path).
+*   **Outputs:** Text report with Speaker Similarity (Cosine) and Mel Spectrogram Distance (MSE).
+
+#### **Utilities**
+*   **Qwen3LoadAudioFromPath / Folder:** Load audio from absolute paths.
+*   **Qwen3VideoToAudio:** Batch convert a folder of video files (mp4, mkv, etc.) to .wav audio files. Optimized for large datasets to prevent OOM errors.
+*   **Qwen3SavePrompt / LoadPrompt:** Save generated voice prompts to .safetensors to reuse a cloned voice without re-computing.
+
+### 📁 Modular Dataset Pipeline (Step-by-Step)
 
 1.  **Qwen3LoadDatasetAudio:**
     *   Scans a local folder for `.wav` files. Returns a list of files.
@@ -88,11 +114,12 @@ Custom nodes for [Qwen2.5-Audio / Qwen3-TTS](https://huggingface.co/Qwen/Qwen2.5
 
 #### **Qwen3FineTune**
 *   **Function:** Performs full fine-tuning of the model.
-*   **Inputs:** `train_jsonl` (the `_codes.jsonl` file), `init_model`, `epochs`, `batch_size`, `lr`, `target_loss`.
+*   **Inputs:** `train_jsonl` (the `_codes.jsonl` file), `init_model`, `epochs`, `batch_size`, `lr`, `target_loss`, `save_loss_threshold`.
 *   **Outputs:** Path to the saved checkpoint.
 *   **Details:**
     *   **Epochs:** Minimum 50 recommended for convergence on small datasets.
     *   **Target Loss:** Auto-stop mechanism. If loss drops below this value (e.g., 2.0), training stops and saves the model.
+    *   **Save Loss Threshold:** Saves an intermediate checkpoint when loss drops below this value, without stopping training.
     *   **Learning Rate:** Defaults to `2e-6`. Higher values (e.g., `1e-5`) might cause noise/instability.
     *   **Mixed Precision:** Supports `bf16` (Ampere GPUs) and `fp32`.
     *   **Saving:** Saves `pytorch_model.bin` and `config.json` correctly mapped for immediate loading with `Qwen3LoadFineTuned`.

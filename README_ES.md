@@ -8,8 +8,10 @@ Nodos personalizados para [Qwen2.5-Audio / Qwen3-TTS](https://huggingface.co/Qwe
 *   **👥 Clonación de Voz:** Clona voces a partir de un clip de audio de referencia corto (se recomiendan 3-10s).
 *   **🎨 Diseño de Voz:** Diseña voces personalizadas describiendo atributos como género, edad, tono, velocidad y emoción.
 *   **🎓 Fine-Tuning:** Flujo completo para realizar fine-tuning del modelo con tu propio dataset de voz. El fine-tuning ofrece una estabilidad y fidelidad de tono muy superiores a la clonación "zero-shot".
-*   **📁 Pipeline Modular de Dataset:** Automatiza la creación de datasets: Cargar audio crudo -> Transcribir con Whisper -> Etiquetar emociones con Qwen2-Audio -> Exportar JSONL.
+*   **📁 Pipeline Modular de Dataset:** Automatiza la creación de datasets: Cargar audio crudo -> Transcribir con Whisper -> Etiquetar emociones con Qwen2-Audio -> Exportar JSONL. O usa el **Creador de Dataset** todo en uno.
 *   **⚙️ Configuración Avanzada:** Solución para errores de "Unsupported speakers" en modelos fine-tuned y control detallado de prompts.
+*   **📊 Análisis de Audio:** Herramientas para comparar el audio generado con el audio de referencia (Similitud de Hablante y Distancia Mel).
+*   **⏳ Reporte de Progreso:** Barras de progreso en tiempo real en el título y HUD de ComfyUI para operaciones largas (transcripción, etiquetado, entrenamiento).
 
 ## Instalación
 
@@ -62,6 +64,30 @@ Nodos personalizados para [Qwen2.5-Audio / Qwen3-TTS](https://huggingface.co/Qwe
 *   **Salidas:** Forma de onda de audio.
 *   **Detalles:** Utiliza las variantes `Base` o `CustomVoice`. Requiere el texto de referencia para una alineación precisa del prompt.
 
+### 📁 Dataset y Utilidades
+
+#### **Qwen3AudioToDataset (Creador de Dataset)**
+*   **Función:** Nodo todo-en-uno para crear un dataset desde una carpeta de archivos de audio.
+*   **Entradas:** `audio_folder`, `model_size` (Whisper), `output_folder_name`, `min/max_duration`, `silence_threshold`.
+*   **Salidas:** Ruta al archivo `dataset.jsonl` generado.
+*   **Detalles:** Carga, transcribe, corta y formatea automáticamente el dataset para el entrenamiento.
+
+#### **Qwen3TranscribeSingle**
+*   **Función:** Transcribe un solo clip de audio usando Whisper.
+*   **Entradas:** `audio` (entrada de AUDIO), `model_size`.
+*   **Salidas:** `text` (STRING).
+*   **Detalles:** Útil para preparar `ref_text` para la Clonación de Voz.
+
+#### **Qwen3AudioCompare**
+*   **Función:** Compara dos clips de audio (Referencia vs Generado) para evaluar la calidad.
+*   **Entradas:** `reference_audio`, `generated_audio`, `speaker_encoder_model` (Ruta al modelo Base).
+*   **Salidas:** Reporte de texto con Similitud de Hablante (Coseno) y Distancia de Espectrograma Mel (MSE).
+
+#### **Utilidades**
+*   **Qwen3LoadAudioFromPath / Folder:** Carga audio desde rutas absolutas.
+*   **Qwen3VideoToAudio:** Convierte por lotes una carpeta de videos (mp4, mkv, etc.) a archivos de audio .wav. Optimizado para grandes datasets para prevenir errores de memoria (OOM).
+*   **Qwen3SavePrompt / LoadPrompt:** Guarda prompts de voz generados en .safetensors para reutilizar una voz clonada sin recalcular.
+
 ### 📁 Pipeline de Dataset (Paso a Paso)
 
 1.  **Qwen3LoadDatasetAudio:**
@@ -88,10 +114,12 @@ Nodos personalizados para [Qwen2.5-Audio / Qwen3-TTS](https://huggingface.co/Qwe
 
 #### **Qwen3FineTune**
 *   **Función:** Realiza el fine-tuning completo del modelo.
-*   **Entradas:** `train_jsonl` (el archivo `_codes.jsonl`), `init_model`, `epochs`, `batch_size`, `lr`.
+*   **Entradas:** `train_jsonl` (el archivo `_codes.jsonl`), `init_model`, `epochs`, `batch_size`, `lr`, `target_loss`, `save_loss_threshold`.
 *   **Salidas:** Ruta al checkpoint guardado.
 *   **Detalles:**
     *   **Epochs:** Se recomienda un mínimo de 50 para convergencia en datasets pequeños.
+    *   **Target Loss:** Mecanismo de parada automática. Si el loss baja de este valor (ej. 2.0), el entrenamiento se detiene y guarda el modelo.
+    *   **Save Loss Threshold:** Guarda un checkpoint intermedio cuando el loss baja de este valor, sin detener el entrenamiento.
     *   **Learning Rate:** Por defecto `2e-6`. Valores más altos (ej. `1e-5`) pueden causar ruido/inestabilidad.
     *   **Mixed Precision:** Soporta `bf16` (GPUs Ampere) y `fp32`.
     *   **Guardado:** Guarda `pytorch_model.bin` y `config.json` correctamente mapeados para carga inmediata con `Qwen3LoadFineTuned`.

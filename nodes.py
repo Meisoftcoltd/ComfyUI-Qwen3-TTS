@@ -60,6 +60,12 @@ try:
     HAS_LIBROSA = True
 except ImportError:
     HAS_LIBROSA = False
+
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
 from accelerate import Accelerator
 from torch.optim import AdamW
 
@@ -1415,6 +1421,20 @@ class Qwen3PromptMaker:
                 "ref_text": ("STRING", {"multiline": True}),
             },
             "optional": {
+                "enable_icl": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Enable In-Context Learning (ICL). Provides better prosody matching but might sometimes repeat the reference text. Disable if artifacts occur.",
+                    },
+                ),
+                "enable_x_vector": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Enable X-Vector speaker embedding. Provides stable speaker identity. Can be combined with ICL.",
+                    },
+                ),
                 "ref_audio_max_seconds": (
                     "FLOAT",
                     {"default": 30.0, "min": -1.0, "max": 120.0, "step": 5.0},
@@ -1426,7 +1446,15 @@ class Qwen3PromptMaker:
     FUNCTION = "create_prompt"
     CATEGORY = "Qwen3-TTS/Inference"
 
-    def create_prompt(self, model, ref_audio, ref_text, ref_audio_max_seconds=30.0):
+    def create_prompt(
+        self,
+        model,
+        ref_audio,
+        ref_text,
+        enable_icl=True,
+        enable_x_vector=False,
+        ref_audio_max_seconds=30.0,
+    ):
         audio_tuple = load_audio_input(ref_audio)
 
         # Trim reference audio if too long to prevent generation hangs (-1 = no limit)
@@ -1441,9 +1469,25 @@ class Qwen3PromptMaker:
                 audio_tuple = (wav_data, audio_sr)
 
         try:
-            prompt = model.create_voice_clone_prompt(
+            # Generate initial prompt items
+            raw_prompt = model.create_voice_clone_prompt(
                 ref_audio=audio_tuple, ref_text=ref_text
             )
+
+            # Reconstruct items with user overrides
+            prompt = []
+            if raw_prompt:
+                for item in raw_prompt:
+                    # Create new VoiceClonePromptItem with overrides
+                    new_item = VoiceClonePromptItem(
+                        ref_code=item.ref_code,
+                        ref_spk_embedding=item.ref_spk_embedding,
+                        ref_text=item.ref_text,
+                        icl_mode=enable_icl,
+                        x_vector_only_mode=enable_x_vector,
+                    )
+                    prompt.append(new_item)
+
         except ValueError as e:
             msg = str(e)
             # Assumption: create_voice_clone_prompt might also be restricted to Base models?
@@ -1790,6 +1834,9 @@ class Qwen3AudioToDataset:
                     {"default": -40.0, "min": -100.0, "max": 0.0, "step": 1.0},
                 ),
             },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
     RETURN_TYPES = ("STRING",)
@@ -1806,11 +1853,15 @@ class Qwen3AudioToDataset:
         min_duration=0.8,
         max_duration=15.0,
         silence_threshold=-40.0,
+        unique_id=None,
     ):
         if not HAS_WHISPER_PYDUB:
             raise ImportError(
                 "Please install 'openai-whisper' and 'pydub' to use this node."
             )
+
+        if not audio_folder or not audio_folder.strip():
+            raise ValueError("Audio folder path is empty. Please select a valid folder.")
 
         audio_folder = fix_wsl_path(audio_folder)
         print(f"[Qwen3-TTS] AudioToDataset: Processing {audio_folder}")
@@ -1848,7 +1899,8 @@ class Qwen3AudioToDataset:
         if not files:
             raise ValueError(f"No .wav files found in {audio_folder}")
 
-        print(f"[Qwen3-TTS] Found {len(files)} files")
+        total_files = len(files)
+        print(f"[Qwen3-TTS] Found {total_files} files")
 
         total_clips = 0
 
@@ -1865,11 +1917,14 @@ class Qwen3AudioToDataset:
             except:
                 return audio_segment
 
-        for filename in files:
+        for idx, filename in enumerate(files):
+            if unique_id:
+                PromptServer.instance.send_progress(idx, total_files, unique_id)
+
             filepath = os.path.join(audio_folder, filename)
             base_name = os.path.splitext(filename)[0]
 
-            print(f"Processing: {filename}")
+            print(f"Processing [{idx+1}/{total_files}]: {filename}")
 
             try:
                 audio_full = AudioSegment.from_wav(filepath)
@@ -1970,6 +2025,9 @@ class Qwen3LoadDatasetAudio:
     CATEGORY = "Qwen3-TTS/Dataset"
 
     def load_audio(self, folder_path):
+        if not folder_path or not folder_path.strip():
+             raise ValueError("Folder path is empty. Please select a valid folder.")
+
         folder_path = folder_path.strip().strip('"')
         folder_path = fix_wsl_path(folder_path)
 
@@ -2019,6 +2077,10 @@ class Qwen3TranscribeWhisper:
                     "FLOAT",
                     {"default": -40.0, "min": -100.0, "max": 0.0, "step": 1.0},
                 ),
+                "segment_padding": (
+                    "FLOAT",
+                    {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Time in seconds to add before and after each segment to prevent cutting words too abruptly."},
+                ),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -2039,6 +2101,7 @@ class Qwen3TranscribeWhisper:
         min_duration=0.8,
         max_duration=60.0,
         silence_threshold=-40.0,
+        segment_padding=0.1,
         unique_id=None,
     ):
         if not HAS_WHISPER_PYDUB:
@@ -2095,8 +2158,8 @@ class Qwen3TranscribeWhisper:
                 tqdm(files, desc="Processing Audio", unit="file")
             ):
                 # Update progress
-                # if unique_id:
-                #    PromptServer.instance.send_progress(idx, total_files, unique_id)
+                if unique_id:
+                   PromptServer.instance.send_progress(idx, total_files, unique_id)
 
                 filepath = os.path.join(folder_path, filename)
                 base_name = os.path.splitext(filename)[0]
@@ -2123,8 +2186,11 @@ class Qwen3TranscribeWhisper:
 
                 file_count = 0
                 for segment in result["segments"]:
-                    start_ms = segment["start"] * 1000
-                    end_ms = segment["end"] * 1000
+                    # Apply padding logic
+                    pad_ms = int(segment_padding * 1000)
+                    start_ms = max(0, (segment["start"] * 1000) - pad_ms)
+                    end_ms = min(len(audio_full), (segment["end"] * 1000) + pad_ms)
+
                     text = segment["text"].strip()
 
                     chunk = audio_full[start_ms:end_ms]
@@ -2277,23 +2343,42 @@ class Qwen3AutoLabelEmotions:
             "sorpresa": "Male voice, surprised, shocked, high pitch.",
         }
 
-        # --- Helper: Gender Fix (Regex) ---
+        items_to_infer = []
+        total = len(dataset_items)
+
+        # Helper to apply gender override and fix repetition
         def apply_gender_fix(text, mode):
-            if mode == "Auto":
-                return text
-            # Clean existing tags
-            clean_text = re.sub(
-                r"\b\[?(?:fe)?male\]?(?:\s+voice)?\b", "", text, flags=re.IGNORECASE
-            )
-            # Clean punctuation
-            clean_text = re.sub(r"\s+,", ",", clean_text)
-            clean_text = re.sub(r",\s*,", ",", clean_text)
-            clean_text = clean_text.strip(" ,.")
-            # Prepend target
+            import re
+
+            # 1. Strict artifact cleaning (Fefefefemale loops)
+            # Removes strings like "Fefefemale", "Fefefefemale", "Mememale", etc.
+            text = re.sub(r'\b(Fe)+male\b', 'Female', text, flags=re.IGNORECASE)
+            text = re.sub(r'\b(Me)+male\b', 'Male', text, flags=re.IGNORECASE)
+
+            # 2. Remove existing gender tags if we are overriding or just to clean up before re-adding
+            if mode != "Auto":
+                # Remove "Male/Female voice" with optional comma/spaces
+                text = re.sub(r'\b(Male|Female)\s+voice,?\s*', '', text, flags=re.IGNORECASE)
+                # Remove "[Male]", "[Female]" tags
+                text = re.sub(r'\[\s*(Male|Female)\s*\]?,?\s*', '', text, flags=re.IGNORECASE)
+                # Remove standalone "Male," or "Female," at start
+                text = re.sub(r'^\s*(Male|Female),?\s+', '', text, flags=re.IGNORECASE)
+
+            # 3. Clean up formatting (double commas, spaces)
+            text = re.sub(r'\s{2,}', ' ', text) # Multiple spaces -> one
+            text = re.sub(r',\s*,', ',', text)  # Double commas -> one
+            text = text.strip().strip(",").strip()
+
+            # 4. Prepend the correct gender tag
             if mode == "Female":
-                return "Female voice, " + clean_text
+                text = "Female voice, " + text
             elif mode == "Male":
-                return "Male voice, " + clean_text
+                text = "Male voice, " + text
+
+            # 5. Capitalize first letter
+            if text:
+                text = text[0].upper() + text[1:]
+
             return text
 
         # --- PHASE 1: Pre-Scan (Cache & Keywords) ---
@@ -2373,10 +2458,15 @@ class Qwen3AutoLabelEmotions:
                 model, **model_kwargs
             )
 
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to load Qwen2-Audio: {e}. If using 4bit/8bit, make sure 'bitsandbytes' is installed."
-            )
+            total_infer = len(items_to_infer)
+            for idx, item in enumerate(
+                tqdm(items_to_infer, desc="Labeling Emotions", unit="item")
+            ):
+                if unique_id:
+                    PromptServer.instance.send_progress(idx, total_infer, unique_id)
+
+                file_path = item["audio_path"]
+                label_path = os.path.splitext(file_path)[0] + ".emotion.txt"
 
         # --- Batch Inference ---
         system_prompt = "You are a dataset tagger. Listen to the audio and output ONLY a short description. Format: [Gender], [Emotion], [Tone], [Speed], [Pitch]."
@@ -2510,10 +2600,8 @@ class Qwen3ExportJSONL:
         return {
             "required": {
                 "dataset_items": ("DATASET_ITEMS",),
-                "output_filename": (
-                    "STRING",
-                    {"default": "dataset.jsonl", "multiline": False},
-                ),
+                "output_filename": ("STRING", {"default": "dataset.jsonl", "multiline": False}),
+                "use_self_as_reference": ("BOOLEAN", {"default": True, "tooltip": "If True, sets 'ref_audio' to the same path as 'audio' for each item. This forces the model to learn the specific style/emotion of each individual clip (Standard for expressive Fine-Tuning)."}),
             }
         }
 
@@ -2523,7 +2611,7 @@ class Qwen3ExportJSONL:
     FUNCTION = "export"
     CATEGORY = "Qwen3-TTS/Dataset"
 
-    def export(self, dataset_items, output_filename):
+    def export(self, dataset_items, output_filename, use_self_as_reference=True):
         if not dataset_items:
             raise ValueError("No dataset items to export.")
 
@@ -2532,39 +2620,49 @@ class Qwen3ExportJSONL:
         output_dir = os.path.dirname(first_path)
         jsonl_path = os.path.join(output_dir, output_filename)
 
-        # Auto-detect reference
-        # Try to find 'ref.wav' in the same folder
-        ref_path = os.path.join(output_dir, "ref.wav")
-        if not os.path.exists(ref_path):
-            # Use first item
-            ref_path = first_path
-            print(f"Using auto-selected reference: {ref_path}")
+        # Logic for GLOBAL reference (only needed if NOT using self-reference)
+        global_ref_path = None
+        if not use_self_as_reference:
+            # Try to find 'ref.wav' in the same folder
+            ref_candidate = os.path.join(output_dir, "ref.wav")
+            if os.path.exists(ref_candidate):
+                global_ref_path = ref_candidate
+                print(f"[Qwen3-TTS] Found manual global reference: {global_ref_path}")
+            else:
+                # Fallback: Use first item as global reference
+                global_ref_path = first_path
+                print(f"[Qwen3-TTS] Global reference not found, using first item as anchor: {global_ref_path}")
 
-        full_ref_path = os.path.abspath(ref_path)
+            global_ref_path = os.path.abspath(global_ref_path)
 
         count = 0
-        with open(jsonl_path, "w", encoding="utf-8") as f:
+        print(f"[Qwen3-TTS] Exporting dataset. Mode: {'Self-Reference (Per-Clip Prompt)' if use_self_as_reference else 'Global Reference'}")
+
+        with open(jsonl_path, 'w', encoding='utf-8') as f:
             for item in dataset_items:
                 wav_path = os.path.abspath(item["audio_path"])
 
-                # Check reference
-                if wav_path == full_ref_path:
-                    pass
+                # DECISION: Self vs Global
+                if use_self_as_reference:
+                    # Each audio is its own prompt -> "Prompt Maker" style for every line
+                    current_ref = wav_path
+                else:
+                    current_ref = global_ref_path
 
                 entry = {
                     "audio": wav_path,
                     "text": item["text"],
-                    "ref_audio": full_ref_path,
+                    "ref_audio": current_ref
                 }
 
-                # Add instruction if present
+                # Add instruction if present (from Label Emotions node)
                 if "instruction" in item:
                     entry["instruction"] = item["instruction"]
 
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
                 count += 1
 
-        print(f"Exported {count} items to {jsonl_path}")
+        print(f"✅ Exported {count} items to {jsonl_path}")
         return (jsonl_path,)
 
 
@@ -2746,6 +2844,9 @@ class Qwen3DataPrep:
                 out_file.write(json.dumps(item, ensure_ascii=False) + "\n")
 
             for batch_idx, batch in enumerate(batched_jsonl_reader(jsonl_path, batch_size)):
+                if unique_id:
+                    PromptServer.instance.send_progress(batch_idx, total_batches, unique_id)
+
                 audio_paths = [b['audio'] for b in batch]
 
                 status_msg = f"Processing batch {batch_idx + 1}/{total_batches}..."
@@ -2860,10 +2961,10 @@ class Qwen3FineTune:
                 "epochs": (
                     "INT",
                     {
-                        "default": 3,
+                        "default": 50,  # UPDATED: Higher ceiling to allow target_loss to work
                         "min": 1,
                         "max": 1000,
-                        "tooltip": "Number of training epochs to run.",
+                        "tooltip": "Number of training epochs. Set high (e.g. 50) and let Target Loss stop it automatically.",
                     },
                 ),
                 "batch_size": (
@@ -2872,25 +2973,35 @@ class Qwen3FineTune:
                         "default": 2,
                         "min": 1,
                         "max": 64,
-                        "tooltip": "Number of samples per batch. Lower values use less VRAM.",
+                        "tooltip": "Number of samples per batch. Keep at 2 for 24GB VRAM cards.",
                     },
                 ),
                 "lr": (
                     "FLOAT",
                     {
-                        "default": 2e-6,
+                        "default": 2e-5, # UPDATED: The "Gasoline" setting
                         "step": 1e-7,
-                        "tooltip": "Learning rate. Qwen default (2e-5) is too aggressive for small batches, causing noise output. Defaults to 2e-6 for stability.",
+                        "tooltip": "Learning rate. Default 2e-5 is recommended when using Gradient Accumulation 8 and Warmup 0.1.",
                     },
                 ),
                 "target_loss": (
                     "FLOAT",
                     {
-                        "default": 0.0,
+                        "default": 7.2, # UPDATED: The "Sniper" setting
                         "min": 0.0,
                         "max": 100.0,
-                        "step": 0.1,
-                        "tooltip": "Detener entrenamiento si el Loss baja de este valor (0.0 = desactivado)",
+                        "step": 0.01,
+                        "tooltip": "Stop training immediately when Loss hits this value. 7.2 is usually the 'Sweet Spot' for high quality cloning.",
+                    },
+                ),
+                "save_loss_threshold": (
+                    "FLOAT",
+                    {
+                        "default": 7.5, # UPDATED: Safety backup
+                        "min": 0.0,
+                        "max": 100.0,
+                        "step": 0.01,
+                        "tooltip": "Save an extra checkpoint when Loss drops below this value (e.g. 7.5) without stopping.",
                     },
                 ),
                 "speaker_name": (
@@ -2934,7 +3045,7 @@ class Qwen3FineTune:
                         "default": 1,
                         "min": 0,
                         "max": 100,
-                        "tooltip": "Save checkpoint every N epochs. Set to 0 to only save final epoch. Ignored if save_every_steps > 0.",
+                        "tooltip": "Save checkpoint every N epochs. Set to 0 to only save final epoch.",
                     },
                 ),
                 "save_every_steps": (
@@ -2957,10 +3068,10 @@ class Qwen3FineTune:
                 "gradient_accumulation": (
                     "INT",
                     {
-                        "default": 4,
+                        "default": 8, # UPDATED: Higher stability for small batch size
                         "min": 1,
                         "max": 32,
-                        "tooltip": "Accumulate gradients over N steps before updating. Effective batch size = batch_size * gradient_accumulation.",
+                        "tooltip": "Accumulate gradients over N steps. Default 8 simulates Batch Size 16 (8*2) for stability.",
                     },
                 ),
                 "gradient_checkpointing": (
@@ -3005,17 +3116,17 @@ class Qwen3FineTune:
                         "default": 0,
                         "min": 0,
                         "max": 10000,
-                        "tooltip": "Number of warmup steps. Set to 0 to disable warmup. Recommended: 5-10% of total steps.",
+                        "tooltip": "Number of warmup steps. Ignored if warmup_ratio > 0.",
                     },
                 ),
                 "warmup_ratio": (
                     "FLOAT",
                     {
-                        "default": 0.0,
+                        "default": 0.1, # UPDATED: Critical for higher LR
                         "min": 0.0,
                         "max": 0.5,
                         "step": 0.01,
-                        "tooltip": "Warmup as ratio of total steps. Ignored if warmup_steps > 0. E.g., 0.1 = 10% warmup.",
+                        "tooltip": "Warmup as ratio of total steps. 0.1 (10%) prevents model shock at start.",
                     },
                 ),
                 "save_optimizer_state": (
@@ -3047,6 +3158,7 @@ class Qwen3FineTune:
         batch_size,
         lr,
         target_loss,
+        save_loss_threshold,
         speaker_name,
         seed,
         mixed_precision="bf16",
@@ -3444,6 +3556,10 @@ class Qwen3FineTune:
                 # Helper function to save a training checkpoint (also inference-ready)
                 def save_training_checkpoint(checkpoint_name, current_epoch, current_step):
                     """Save checkpoint for resuming training. Also inference-ready."""
+                    accelerator.wait_for_everyone()
+                    if not accelerator.is_main_process:
+                        return None
+
                     ckpt_path = os.path.join(full_output_dir, checkpoint_name)
                     os.makedirs(ckpt_path, exist_ok=True)
 
@@ -3453,9 +3569,15 @@ class Qwen3FineTune:
 
                     # Inject speaker embedding at index 3000 (for inference)
                     if target_speaker_embedding is not None:
+                        # Validate embedding shape
+                        if target_speaker_embedding.dim() > 1:
+                             emb_to_save = target_speaker_embedding[0]
+                        else:
+                             emb_to_save = target_speaker_embedding
+
                         weight = state_dict["talker.model.codec_embedding.weight"]
                         state_dict["talker.model.codec_embedding.weight"][3000] = (
-                            target_speaker_embedding[0].detach().cpu().to(weight.dtype)
+                            emb_to_save.detach().cpu().to(weight.dtype)
                         )
 
                     torch.save(state_dict, os.path.join(ckpt_path, "pytorch_model.bin"))
@@ -3504,6 +3626,10 @@ class Qwen3FineTune:
                 # Helper function to save final inference-ready model
                 def save_final_model(checkpoint_name, current_epoch, current_step):
                     """Save complete model ready for inference and resume."""
+                    accelerator.wait_for_everyone()
+                    if not accelerator.is_main_process:
+                        return None
+
                     ckpt_path = os.path.join(full_output_dir, checkpoint_name)
 
                     # Copy config files only (exclude speech_tokenizer, model files)
@@ -3544,9 +3670,15 @@ class Qwen3FineTune:
 
                     # Inject speaker embedding at index 3000 (for inference)
                     if target_speaker_embedding is not None:
+                        # Validate embedding shape
+                        if target_speaker_embedding.dim() > 1:
+                             emb_to_save = target_speaker_embedding[0]
+                        else:
+                             emb_to_save = target_speaker_embedding
+
                         weight = state_dict["talker.model.codec_embedding.weight"]
                         state_dict["talker.model.codec_embedding.weight"][3000] = (
-                            target_speaker_embedding[0].detach().cpu().to(weight.dtype)
+                            emb_to_save.detach().cpu().to(weight.dtype)
                         )
 
                     # Save as pytorch_model.bin (works for both inference and resume)
@@ -3739,37 +3871,75 @@ class Qwen3FineTune:
                             epoch_loss += loss.item()
                             steps += 1
 
-                            # --- LOGICA DE TARGET LOSS ---
-                            if target_loss > 0 and loss.item() <= target_loss:
-                                print(
-                                    f"\n🎯 [Qwen3-TTS] OBJETIVO ALCANZADO: Loss {loss.item():.4f} <= {target_loss}"
-                                )
-                                send_status(
-                                    f"🎯 Target Loss reached: {loss.item():.4f}"
-                                )
-                                print(f"💾 Guardando checkpoint final y deteniendo...")
+                            # Check for NaN loss
+                            if math.isnan(loss.item()):
+                                print(f"\n❌ [Qwen3-TTS] ERROR: Loss is NaN at epoch {epoch+1}, step {global_step}. Aborting training.")
+                                send_status("❌ Training aborted: Loss is NaN")
+                                accelerator.free_memory()
+                                del model, optimizer, train_dataloader, qwen3tts
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                raise ValueError("Training Aborted: Loss became NaN (diverged). Try lowering learning rate or increasing batch size.")
+
+                            current_loss_val = loss.item()
+
+                            # --- LOGICA DE TARGET LOSS (STOP) ---
+                            if target_loss > 0 and current_loss_val <= target_loss:
+                                if accelerator.is_main_process:
+                                    print(f"\n🎯 [Qwen3-TTS] OBJETIVO ALCANZADO: Loss {current_loss_val:.4f} <= {target_loss}")
+                                    send_status(f"🎯 Target Loss reached: {current_loss_val:.4f}")
+                                    print(f"💾 Guardando checkpoint final y deteniendo...")
 
                                 final_path = save_final_model(
-                                    f"target_reached_loss_{loss.item():.4f}", epoch, global_step
+                                    f"target_reached_loss_{current_loss_val:.4f}", epoch, global_step
                                 )
 
-                                # Clean up and exit
+                                # Only the main process returns a path, others might return None from save_final_model
+                                # But we need to sync exit.
+                                accelerator.wait_for_everyone()
+
                                 accelerator.free_memory()
                                 del model, optimizer, train_dataloader, qwen3tts
                                 if torch.cuda.is_available():
                                     torch.cuda.synchronize()
                                     torch.cuda.empty_cache()
 
-                                print(
-                                    f"Fine-tuning complete (Target Reached). Model saved to {final_path}"
-                                )
-                                send_status("Training complete (Target Reached)!")
-                                return (final_path, speaker_name)
+                                if accelerator.is_main_process:
+                                    print(f"Fine-tuning complete (Target Reached). Model saved to {final_path}")
+                                    send_status("Training complete (Target Reached)!")
+                                    return (final_path, speaker_name)
+                                else:
+                                    # Non-main processes just exit gracefully (return empty/dummy)
+                                    return ("", "")
+                            # -----------------------------
+
+                            # --- LOGICA DE SAVE LOSS THRESHOLD (CHECKPOINT) ---
+                            if save_loss_threshold > 0 and current_loss_val <= save_loss_threshold:
+                                # We need a flag to prevent saving repeatedly for the same drop event?
+                                # Or just save every time it's below? Saving 100 times per epoch is bad.
+                                # Let's save only if it's the *first time* in this run or significantly lower?
+                                # Simple approach: Save as ckpt_loss_X.XX. If file exists, skip.
+                                # This naturally limits frequency unless loss changes slightly.
+
+                                # Round to 3 decimals to avoid excessive saving for tiny fluctuations
+                                loss_str = f"{current_loss_val:.3f}"
+                                ckpt_name = f"ckpt_loss_{loss_str}"
+                                ckpt_full_path = os.path.join(full_output_dir, ckpt_name)
+
+                                if not os.path.exists(ckpt_full_path):
+                                     if accelerator.is_main_process:
+                                         print(f"\n💾 [Qwen3-TTS] Loss Threshold Reached: {current_loss_val:.4f} <= {save_loss_threshold}")
+                                         send_status(f"Saving checkpoint (Loss {current_loss_val:.3f})...")
+
+                                     save_training_checkpoint(ckpt_name, epoch, global_step)
                             # -----------------------------
 
                             # Only count optimizer steps (after gradient accumulation completes)
                             if accelerator.sync_gradients:
                                 global_step += 1
+
+                                if unique_id:
+                                    PromptServer.instance.send_progress(global_step, total_optimizer_steps, unique_id)
 
                                 # Show step progress periodically
                                 if (
@@ -3941,6 +4111,9 @@ class Qwen3LoadAudioFolder:
     CATEGORY = "Qwen3-TTS/Utils"
 
     def load_folder(self, folder_path):
+        if not folder_path or not folder_path.strip():
+             raise ValueError("Folder path is empty. Please select a valid folder.")
+
         folder_path = fix_wsl_path(folder_path)
         if not os.path.exists(folder_path):
             raise ValueError(f"Folder not found: {folder_path}")
@@ -3985,113 +4158,75 @@ class Qwen3LoadAudioFolder:
         return (output_list,)
 
 
-class Qwen3LoadVideoFromPath:
+
+
+class Qwen3VideoToAudio:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "video_path": ("STRING", {"default": "", "multiline": False}),
-            }
+                "video_folder": ("STRING", {"default": "", "multiline": False}),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
-    RETURN_TYPES = ("AUDIO",)
-    FUNCTION = "load_video"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("audio_folder_path",)
+    OUTPUT_NODE = True
+    FUNCTION = "convert"
     CATEGORY = "Qwen3-TTS/Utils"
 
-    def load_video(self, video_path):
+    def convert(self, video_folder, unique_id=None):
         if not HAS_WHISPER_PYDUB:
-            raise ImportError(
-                "Please install 'pydub' (and ffmpeg) to use video loading nodes."
-            )
+            raise ImportError("Please install 'pydub' (and ffmpeg) to use this node.")
 
-        video_path = fix_wsl_path(video_path)
-        if not os.path.exists(video_path):
-            raise ValueError(f"Video file not found: {video_path}")
+        if not video_folder or not video_folder.strip():
+             raise ValueError("Video folder path is empty. Please select a valid folder.")
 
-        try:
-            audio = AudioSegment.from_file(video_path)
-            # Convert to float32 numpy
-            samples = np.array(audio.get_array_of_samples())
-            if audio.channels > 1:
-                samples = samples.reshape((-1, audio.channels)).T
-            else:
-                samples = samples.reshape((1, -1))
+        video_folder = fix_wsl_path(video_folder)
+        if not os.path.exists(video_folder):
+            raise ValueError(f"Video folder not found: {video_folder}")
 
-            # Normalize to -1.0 ... 1.0 (pydub gives int)
-            samples = samples.astype(np.float32) / (1 << (8 * audio.sample_width - 1))
+        # Create temp folder
+        temp_dir = folder_paths.get_temp_directory()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = os.path.join(temp_dir, f"qwen3_extracted_{timestamp}")
+        os.makedirs(output_dir, exist_ok=True)
 
-            return (convert_audio(samples, audio.frame_rate),)
-
-        except Exception as e:
-            raise RuntimeError(f"Error extracting audio from video: {e}")
-
-
-class Qwen3LoadVideoFolder:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "folder_path": ("STRING", {"default": "", "multiline": False}),
-            }
-        }
-
-    RETURN_TYPES = ("AUDIO",)
-    OUTPUT_IS_LIST = (True,)
-    FUNCTION = "load_folder"
-    CATEGORY = "Qwen3-TTS/Utils"
-
-    def load_folder(self, folder_path):
-        if not HAS_WHISPER_PYDUB:
-            raise ImportError(
-                "Please install 'pydub' (and ffmpeg) to use video loading nodes."
-            )
-
-        folder_path = fix_wsl_path(folder_path)
-        if not os.path.exists(folder_path):
-            raise ValueError(f"Folder not found: {folder_path}")
-
-        files = sorted(
-            [
-                f
-                for f in os.listdir(folder_path)
-                if f.lower().endswith((".mp4", ".mkv", ".avi", ".mov", ".webm"))
-            ]
-        )
+        files = [
+            f for f in os.listdir(video_folder)
+            if f.lower().endswith((".mp4", ".mkv", ".avi", ".mov", ".webm"))
+        ]
 
         if not files:
-            raise ValueError(f"No video files found in {folder_path}")
+            raise ValueError(f"No video files found in {video_folder}")
 
-        output_list = []
+        total_files = len(files)
+        print(f"[Qwen3-TTS] Extracting audio from {total_files} videos to {output_dir}...")
 
-        print(f"[Qwen3-TTS] Processing {len(files)} video files...")
+        count = 0
+        for idx, fname in enumerate(tqdm(files, desc="Extracting Audio")):
+            if unique_id:
+                PromptServer.instance.send_progress(idx, total_files, unique_id)
 
-        for fname in files:
-            p = os.path.join(folder_path, fname)
+            video_path = os.path.join(video_folder, fname)
+            wav_name = os.path.splitext(fname)[0] + ".wav"
+            wav_path = os.path.join(output_dir, wav_name)
+
             try:
-                audio = AudioSegment.from_file(p)
-
-                samples = np.array(audio.get_array_of_samples())
-                if audio.channels > 1:
-                    samples = samples.reshape((-1, audio.channels)).T
-                else:
-                    samples = samples.reshape((1, -1))  # (Channels, Samples)
-
-                samples = samples.astype(np.float32) / (
-                    1 << (8 * audio.sample_width - 1)
-                )
-                samples_tensor = torch.from_numpy(samples).unsqueeze(0)  # [1, C, T]
-
-                output_list.append(
-                    {"waveform": samples_tensor, "sample_rate": audio.frame_rate}
-                )
-
+                audio = AudioSegment.from_file(video_path)
+                # Export as standard 44.1kHz mono/stereo WAV (downstream nodes handle resampling)
+                audio.export(wav_path, format="wav")
+                count += 1
             except Exception as e:
-                print(f"Error processing {fname}: {e}")
+                print(f"Error converting {fname}: {e}")
 
-        if not output_list:
-            raise ValueError("Failed to process any video files.")
+        print(f"[Qwen3-TTS] Successfully extracted {count} audio files.")
+        return (output_dir,)
 
-        return (output_list,)
+
 
 
 class Qwen3AudioCompare:
@@ -4483,8 +4618,7 @@ NODE_CLASS_MAPPINGS = {
     "Qwen3SaveAudio": Qwen3SaveAudio,
     "Qwen3LoadAudioFromPath": Qwen3LoadAudioFromPath,
     "Qwen3LoadAudioFolder": Qwen3LoadAudioFolder,
-    "Qwen3LoadVideoFromPath": Qwen3LoadVideoFromPath,
-    "Qwen3LoadVideoFolder": Qwen3LoadVideoFolder,
+    "Qwen3VideoToAudio": Qwen3VideoToAudio,
     "Qwen3AudioCompare": Qwen3AudioCompare,
     "Qwen3AudioToDataset": Qwen3AudioToDataset,
     "Qwen3TranscribeSingle": Qwen3TranscribeSingle,
@@ -4508,8 +4642,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Qwen3SaveAudio": "📁 Qwen3-TTS Save Audio",
     "Qwen3LoadAudioFromPath": "📁 Qwen3-TTS Load Audio (Path)",
     "Qwen3LoadAudioFolder": "📁 Qwen3-TTS Load Audio Folder (Path)",
-    "Qwen3LoadVideoFromPath": "🎥 Qwen3-TTS Load Video (Path)",
-    "Qwen3LoadVideoFolder": "🎥 Qwen3-TTS Load Video Folder (Path)",
+    "Qwen3VideoToAudio": "🎞️➡️🎵 Qwen3-TTS Video Folder to Audio",
     "Qwen3AudioCompare": "📊 Qwen3-TTS Audio Compare",
     "Qwen3AudioToDataset": "📁 Qwen3-TTS Dataset Maker",
     "Qwen3TranscribeSingle": "🎙️ Qwen3-TTS Whisper Transcribe (Single)",
