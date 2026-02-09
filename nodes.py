@@ -3161,7 +3161,7 @@ class Qwen3FineTune:
                         found_loss = float(loss_str)
 
                         if found_loss <= target_loss:
-                            print(f"✅ [Smart Skip] Found existing model meeting target loss: {item} (Loss {found_loss} <= {target_loss})")
+                            print(f"✅ [Smart Skip] Found finished model: {item}")
                             print("Skipping training session.")
                             existing_model_path = os.path.join(full_output_dir, item)
                             return (existing_model_path, speaker_name)
@@ -3828,11 +3828,10 @@ class Qwen3FineTune:
                             current_loss_val = loss.item()
 
                             # --- LOGICA DE TARGET LOSS (STOP) ---
-                            if target_loss > 0 and current_loss_val <= target_loss:
+                            if target_loss > 0 and current_loss_val <= target_loss and global_step > actual_warmup_steps:
                                 if accelerator.is_main_process:
-                                    print(f"\n🎯 [Qwen3-TTS] OBJETIVO ALCANZADO: Loss {current_loss_val:.4f} <= {target_loss}")
+                                    print(f"🎯 Target Reached (Loss {current_loss_val:.4f}). Saving and exiting.")
                                     send_status(f"🎯 Target Loss reached: {current_loss_val:.4f}")
-                                    print(f"💾 Guardando checkpoint final y deteniendo...")
 
                                 final_path = save_final_model(
                                     f"target_reached_loss_{current_loss_val:.4f}", epoch, global_step
