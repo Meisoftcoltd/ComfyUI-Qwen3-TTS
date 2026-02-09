@@ -2332,24 +2332,35 @@ class Qwen3AutoLabelEmotions:
         }
 
         # --- Helper: Gender Fix (Regex) ---
-        def apply_gender_fix(text, mode):
-            # 1. Remove specific artifacts
-            text = text.replace("[]", "").replace("[,]", "").replace("()", "")
-
-            # 2. Handle Gender Mode
+    def apply_gender_fix(text, mode):
+            # 1. Handle Gender Removal FIRST (so we can clean up the mess later)
             if mode != "Auto":
-                # Remove existing gender tags
-                text = re.sub(r"\b\[?(?:fe)?male\]?(?:\s+voice)?\b", "", text, flags=re.IGNORECASE)
+                # Remove gender tags. 
+                # Matches: "Female", "[Female]", "Male voice", "[Male voice]"
+                # The regex tries to consume the brackets if they are attached to the word.
+                text = re.sub(r"\[?\b(?:fe)?male(?:\s+voice)?\b\]?", "", text, flags=re.IGNORECASE)
             
-            # 3. Clean Punctuation (Aggressive)
-            # Collapse multiple commas/spaces
-            text = re.sub(r"\s*,\s*", ", ", text)
-            # Remove leading/trailing punctuation
-            text = text.strip(" ,.")
-            # Remove double spaces
+            # 2. Aggressive Artifact Removal (Catches empty brackets left behind)
+            # Matches [] with zero or more spaces inside: [], [ ], [  ]
+            text = re.sub(r"\[\s*\]", "", text)
+            # Matches () with zero or more spaces inside
+            text = re.sub(r"\(\s*\)", "", text)
+            # Matches specific artifact [,] or , ,
+            text = text.replace("[,]", "")
+            
+            # 3. Clean Punctuation & Formatting
+            # Replace multiple spaces with single space
             text = re.sub(r"\s+", " ", text)
+            # Fix comma spacing (remove space before, ensure space after)
+            text = re.sub(r"\s+,", ",", text)
+            # Collapse multiple commas ",,," -> ","
+            text = re.sub(r",+", ",", text)
+            # Fix ", ," sequence if generated
+            text = text.replace(", ,", ", ")
+            # Final strip of edges
+            text = text.strip(" ,.")
             
-            # 4. Prepend Target Gender
+            # 4. Prepend Target Gender (Cleanly)
             if mode == "Female":
                 return "Female voice, " + text
             elif mode == "Male":
