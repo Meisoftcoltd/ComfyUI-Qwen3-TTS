@@ -1919,7 +1919,7 @@ class Qwen3AudioToDataset:
 
         for idx, filename in enumerate(files):
             if unique_id:
-                PromptServer.instance.send_progress(idx, total_files, unique_id)
+                PromptServer.instance.send_sync("progress", {"value": idx, "max": total_files}, unique_id)
 
             filepath = os.path.join(audio_folder, filename)
             base_name = os.path.splitext(filename)[0]
@@ -2159,7 +2159,7 @@ class Qwen3TranscribeWhisper:
             ):
                 # Update progress
                 if unique_id:
-                   PromptServer.instance.send_progress(idx, total_files, unique_id)
+                   PromptServer.instance.send_sync("progress", {"value": idx, "max": total_files}, unique_id)
 
                 filepath = os.path.join(folder_path, filename)
                 base_name = os.path.splitext(filename)[0]
@@ -2438,7 +2438,7 @@ class Qwen3AutoLabelEmotions:
                 for i in range(0, total_infer, batch_size):
                     # Progress bar update for ComfyUI
                     if unique_id:
-                        PromptServer.instance.send_progress(i, total_infer, unique_id)
+                        PromptServer.instance.send_sync("progress", {"value": i, "max": total_infer}, unique_id)
 
                     batch_items = items_to_infer[i : i + batch_size]
                     
@@ -2780,7 +2780,7 @@ class Qwen3DataPrep:
 
             for batch_idx, batch in enumerate(batched_jsonl_reader(jsonl_path, batch_size)):
                 if unique_id:
-                    PromptServer.instance.send_progress(batch_idx, total_batches, unique_id)
+                    PromptServer.instance.send_sync("progress", {"value": batch_idx, "max": total_batches}, unique_id)
 
                 audio_paths = [b['audio'] for b in batch]
 
@@ -3874,7 +3874,7 @@ class Qwen3FineTune:
                                 global_step += 1
 
                                 if unique_id:
-                                    PromptServer.instance.send_progress(global_step, total_optimizer_steps, unique_id)
+                                    PromptServer.instance.send_sync("progress", {"value": global_step, "max": total_optimizer_steps}, unique_id)
 
                                 # Show step progress periodically
                                 if (
@@ -4144,7 +4144,7 @@ class Qwen3VideoToAudio:
         count = 0
         for idx, fname in enumerate(tqdm(files, desc="Extracting Audio")):
             if unique_id:
-                PromptServer.instance.send_progress(idx, total_files, unique_id)
+                PromptServer.instance.send_sync("progress", {"value": idx, "max": total_files}, unique_id)
 
             video_path = os.path.join(video_folder, fname)
             wav_name = os.path.splitext(fname)[0] + ".wav"
