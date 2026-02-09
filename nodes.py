@@ -4042,99 +4042,6 @@ class Qwen3LoadAudioFolder:
         return (output_list,)
 
 
-class Qwen3LoadVideoFromPath:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "video_path": ("STRING", {"default": "", "multiline": False}),
-            },
-            "optional": {
-                "force_rate": ("INT", {"default": 0, "min": 0, "max": 60, "tooltip": "Force frame rate (0 = original)."}),
-                "frame_limit": ("INT", {"default": 0, "min": 0, "max": 10000, "tooltip": "Limit number of frames to load (0 = all)."}),
-            }
-        }
-
-    RETURN_TYPES = ("AUDIO", "IMAGE", "DICT")
-    RETURN_NAMES = ("audio", "images", "video_info")
-    FUNCTION = "load_video"
-    CATEGORY = "Qwen3-TTS/Utils"
-
-    def load_video(self, video_path, force_rate=0, frame_limit=0):
-        if not HAS_WHISPER_PYDUB:
-            raise ImportError(
-                "Please install 'pydub' (and ffmpeg) to use video loading nodes."
-            )
-        if not HAS_CV2:
-            raise ImportError("Please install 'opencv-python' to use video loading nodes.")
-
-        video_path = fix_wsl_path(video_path)
-        if not os.path.exists(video_path):
-            raise ValueError(f"Video file not found: {video_path}")
-
-        # 1. Load Audio
-        try:
-            audio = AudioSegment.from_file(video_path)
-            samples = np.array(audio.get_array_of_samples())
-            if audio.channels > 1:
-                samples = samples.reshape((-1, audio.channels)).T
-            else:
-                samples = samples.reshape((1, -1))
-            samples = samples.astype(np.float32) / (1 << (8 * audio.sample_width - 1))
-            audio_out = convert_audio(samples, audio.frame_rate)
-        except Exception as e:
-            print(f"[Qwen3-TTS] Warning: Could not extract audio from video: {e}")
-            raise RuntimeError(f"Error extracting audio from video: {e}")
-
-        # 2. Load Video Frames
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-             raise ValueError(f"Could not open video file: {video_path}")
-
-        # Metadata extraction
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = total_frames / fps if fps > 0 else 0
-
-        video_info = {
-            "width": width,
-            "height": height,
-            "fps": fps,
-            "frame_count": total_frames,
-            "duration": duration,
-            "path": video_path
-        }
-
-        frames = []
-        count = 0
-
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            # BGR to RGB
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            # Normalize 0-1
-            frame = frame.astype(np.float32) / 255.0
-            frames.append(torch.from_numpy(frame))
-
-            count += 1
-            if frame_limit > 0 and count >= frame_limit:
-                break
-
-        cap.release()
-
-        if not frames:
-             raise ValueError("No frames could be read from video.")
-
-        # Stack frames: [T, H, W, C]
-        video_out = torch.stack(frames)
-
-        print(f"[Qwen3-TTS] Loaded video: {count} frames, {width}x{height} @ {fps:.2f}fps. Audio: {len(audio)/1000:.2f}s")
-        return (audio_out, video_out, video_info)
 
 
 class Qwen3VideoToAudio:
@@ -4197,46 +4104,6 @@ class Qwen3VideoToAudio:
         return (output_dir,)
 
 
-class Qwen3LoadVideoFolder:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "folder_path": ("STRING", {"default": "", "multiline": False}),
-            }
-        }
-
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("video_paths", "paths_info")
-    OUTPUT_IS_LIST = (True, True)
-    FUNCTION = "load_folder"
-    CATEGORY = "Qwen3-TTS/Utils"
-
-    def load_folder(self, folder_path):
-        if not folder_path or not folder_path.strip():
-             raise ValueError("Folder path is empty. Please select a valid folder.")
-
-        folder_path = fix_wsl_path(folder_path)
-        if not os.path.exists(folder_path):
-            raise ValueError(f"Folder not found: {folder_path}")
-
-        files = sorted(
-            [
-                f
-                for f in os.listdir(folder_path)
-                if f.lower().endswith((".mp4", ".mkv", ".avi", ".mov", ".webm"))
-            ]
-        )
-
-        if not files:
-            raise ValueError(f"No video files found in {folder_path}")
-
-        # Just return list of paths to avoid OOM
-        # Downstream node (Qwen3LoadVideoFromPath) will load them one by one
-        full_paths = [os.path.join(folder_path, f) for f in files]
-        print(f"[Qwen3-TTS] Found {len(full_paths)} video files in {folder_path}. Passing paths only.")
-
-        return (full_paths, full_paths)
 
 
 class Qwen3AudioCompare:
@@ -4628,8 +4495,6 @@ NODE_CLASS_MAPPINGS = {
     "Qwen3SaveAudio": Qwen3SaveAudio,
     "Qwen3LoadAudioFromPath": Qwen3LoadAudioFromPath,
     "Qwen3LoadAudioFolder": Qwen3LoadAudioFolder,
-    "Qwen3LoadVideoFromPath": Qwen3LoadVideoFromPath,
-    "Qwen3LoadVideoFolder": Qwen3LoadVideoFolder,
     "Qwen3VideoToAudio": Qwen3VideoToAudio,
     "Qwen3AudioCompare": Qwen3AudioCompare,
     "Qwen3AudioToDataset": Qwen3AudioToDataset,
@@ -4654,8 +4519,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Qwen3SaveAudio": "📁 Qwen3-TTS Save Audio",
     "Qwen3LoadAudioFromPath": "📁 Qwen3-TTS Load Audio (Path)",
     "Qwen3LoadAudioFolder": "📁 Qwen3-TTS Load Audio Folder (Path)",
-    "Qwen3LoadVideoFromPath": "🎥 Qwen3-TTS Load Video (Path)",
-    "Qwen3LoadVideoFolder": "🎥 Qwen3-TTS Load Video Folder (Path)",
     "Qwen3VideoToAudio": "🎞️➡️🎵 Qwen3-TTS Video Folder to Audio",
     "Qwen3AudioCompare": "📊 Qwen3-TTS Audio Compare",
     "Qwen3AudioToDataset": "📁 Qwen3-TTS Dataset Maker",
