@@ -2537,7 +2537,10 @@ class Qwen3ExportJSONL:
                 "dataset_items": ("DATASET_ITEMS",),
                 "output_filename": ("STRING", {"default": "dataset.jsonl", "multiline": False}),
                 "use_self_as_reference": ("BOOLEAN", {"default": True, "tooltip": "If True, sets 'ref_audio' to the same path as 'audio' for each item. This forces the model to learn the specific style/emotion of each individual clip (Standard for expressive Fine-Tuning)."}),
-            }
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
     RETURN_TYPES = ("STRING",)
@@ -2546,7 +2549,7 @@ class Qwen3ExportJSONL:
     FUNCTION = "export"
     CATEGORY = "Qwen3-TTS/Dataset"
 
-    def export(self, dataset_items, output_filename, use_self_as_reference=True):
+    def export(self, dataset_items, output_filename, use_self_as_reference=True, unique_id=None):
         if not dataset_items:
             raise ValueError("No dataset items to export.")
 
@@ -2571,10 +2574,14 @@ class Qwen3ExportJSONL:
             global_ref_path = os.path.abspath(global_ref_path)
 
         count = 0
+        total_items = len(dataset_items)
         print(f"[Qwen3-TTS] Exporting dataset. Mode: {'Self-Reference (Per-Clip Prompt)' if use_self_as_reference else 'Global Reference'}")
 
         with open(jsonl_path, 'w', encoding='utf-8') as f:
-            for item in dataset_items:
+            for i, item in enumerate(dataset_items):
+                if unique_id:
+                    PromptServer.instance.send_sync("progress", {"value": i, "max": total_items}, unique_id)
+
                 wav_path = os.path.abspath(item["audio_path"])
 
                 # DECISION: Self vs Global
@@ -2660,7 +2667,8 @@ class Qwen3DataPrep:
         # Helper to send progress text to UI
         def send_status(text):
             if unique_id:
-                PromptServer.instance.send_progress_text(text, unique_id)
+                # PromptServer.instance.send_progress_text(text, unique_id)
+                pass
 
         device = mm.get_torch_device()
         print(f"[Qwen3-TTS DEBUG] Using device: {device}")
@@ -3125,7 +3133,8 @@ class Qwen3FineTune:
         # Helper to send progress text to UI
         def send_status(text):
             if unique_id:
-                PromptServer.instance.send_progress_text(text, unique_id)
+                # PromptServer.instance.send_progress_text(text, unique_id)
+                pass
 
         # Setup output directory
         # Fix path resolution: if relative, anchor to ComfyUI base path
