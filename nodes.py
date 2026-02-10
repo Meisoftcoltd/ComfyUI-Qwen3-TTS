@@ -2332,7 +2332,7 @@ class Qwen3AutoLabelEmotions:
         }
 
         # --- Helper: Gender Fix (Regex) ---
-    def apply_gender_fix(text, mode):
+        def apply_gender_fix(text, mode):
             # 1. Handle Gender Removal FIRST (so we can clean up the mess later)
             if mode != "Auto":
                 # Remove gender tags. 
@@ -2963,6 +2963,16 @@ class Qwen3FineTune:
                         "tooltip": "Save an extra checkpoint when Loss drops below this value (e.g. 7.5) without stopping.",
                     },
                 ),
+                "save_loss_buffer": (
+                    "FLOAT",
+                    {
+                        "default": 0.1,
+                        "min": 0.01,
+                        "max": 5.0,
+                        "step": 0.01,
+                        "tooltip": "Minimum improvement required to save a new checkpoint when loss is below threshold. (e.g. 0.1 means if 7.50 is saved, next save happens at 7.40).",
+                    },
+                ),
                 "speaker_name": (
                     "STRING",
                     {
@@ -3140,6 +3150,7 @@ class Qwen3FineTune:
         lr,
         target_loss,
         save_loss_threshold,
+        save_loss_buffer,
         speaker_name,
         seed,
         mixed_precision="bf16",
@@ -3187,6 +3198,18 @@ class Qwen3FineTune:
         full_output_dir = os.path.join(base_output_dir, speaker_name)
         os.makedirs(full_output_dir, exist_ok=True)
         print(f"[Qwen3-TTS DEBUG] Full output directory: {full_output_dir}")
+
+        # --- TRACKER: Initialize best saved loss from existing files ---
+        min_saved_loss = 999.0
+        if os.path.exists(full_output_dir):
+            for d in os.listdir(full_output_dir):
+                if d.startswith("ckpt_loss_"):
+                    try:
+                        val = float(d.split("_")[-1])
+                        if val < min_saved_loss:
+                            min_saved_loss = val
+                    except: pass
+        print(f"[Qwen3-TTS] Loss Tracker Initialized. Best saved loss: {min_saved_loss}")
 
         # --- SMART SKIP: Check if target already reached ---
         if target_loss > 0 and os.path.exists(full_output_dir):
@@ -3897,23 +3920,19 @@ class Qwen3FineTune:
 
                             # --- LOGICA DE SAVE LOSS THRESHOLD (CHECKPOINT) ---
                             if save_loss_threshold > 0 and current_loss_val <= save_loss_threshold:
-                                # We need a flag to prevent saving repeatedly for the same drop event?
-                                # Or just save every time it's below? Saving 100 times per epoch is bad.
-                                # Let's save only if it's the *first time* in this run or significantly lower?
-                                # Simple approach: Save as ckpt_loss_X.XX. If file exists, skip.
-                                # This naturally limits frequency unless loss changes slightly.
+                                # Check if improvement exceeds the user-defined buffer
+                                if current_loss_val < (min_saved_loss - save_loss_buffer):
+                                    loss_str = f"{current_loss_val:.3f}"
+                                    ckpt_name = f"ckpt_loss_{loss_str}"
 
-                                # Round to 3 decimals to avoid excessive saving for tiny fluctuations
-                                loss_str = f"{current_loss_val:.3f}"
-                                ckpt_name = f"ckpt_loss_{loss_str}"
-                                ckpt_full_path = os.path.join(full_output_dir, ckpt_name)
+                                    if accelerator.is_main_process:
+                                        print(f"\n💾 [Qwen3-TTS] Loss Milestone: {current_loss_val:.4f} (Improved by >{save_loss_buffer} over {min_saved_loss})")
+                                        send_status(f"Saving milestone (Loss {current_loss_val:.3f})...")
 
-                                if not os.path.exists(ckpt_full_path):
-                                     if accelerator.is_main_process:
-                                         print(f"\n💾 [Qwen3-TTS] Loss Threshold Reached: {current_loss_val:.4f} <= {save_loss_threshold}")
-                                         send_status(f"Saving checkpoint (Loss {current_loss_val:.3f})...")
+                                    save_training_checkpoint(ckpt_name, epoch, global_step)
 
-                                     save_training_checkpoint(ckpt_name, epoch, global_step)
+                                    # Update tracker
+                                    min_saved_loss = current_loss_val
                             # -----------------------------
 
                             # Only count optimizer steps (after gradient accumulation completes)
