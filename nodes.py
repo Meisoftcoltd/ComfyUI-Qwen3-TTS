@@ -2446,7 +2446,16 @@ class Qwen3AutoLabelEmotions:
             except Exception as e:
                 raise RuntimeError(f"Failed to load Qwen2-Audio: {e}. If using 4bit/8bit, make sure 'bitsandbytes' is installed.")
 
-            system_prompt = "You are a dataset tagger. Listen to the audio and output ONLY a short description. Format: [Gender], [Emotion], [Tone], [Speed], [Pitch]."
+            system_prompt = (
+                "You are a dramatic acting coach. Listen to the audio and describe the speaking style concisely. "
+                "Strictly IGNORE technical details like Hz, BPM, pitch values, or recording quality. "
+                "Focus ONLY on: "
+                "1. Emotion (e.g., cheerful, depressed, anxious, seductive, angry). "
+                "2. Delivery (e.g., whispering, shouting, trembling, breathless, laughing). "
+                "3. Pacing (e.g., rapid-fire, hesitant, slow and deliberate). "
+                "Output a single natural sentence, for example: 'Female voice, speaking with a sarcastic tone and a hint of amusement, fast pace.' "
+                "Do NOT use brackets [] or lists."
+            )
             
             total_infer = len(items_to_infer)
             
@@ -3011,7 +3020,7 @@ class Qwen3FineTune:
                 "save_every_epochs": (
                     "INT",
                     {
-                        "default": 1,
+                        "default": 0,
                         "min": 0,
                         "max": 100,
                         "tooltip": "Save checkpoint every N epochs. Set to 0 to only save final epoch.",
@@ -3212,22 +3221,22 @@ class Qwen3FineTune:
         print(f"[Qwen3-TTS] Loss Tracker Initialized. Best saved loss: {min_saved_loss}")
 
         # --- SMART SKIP: Check if target already reached ---
-        if target_loss > 0 and os.path.exists(full_output_dir):
-            print(f"[Qwen3-TTS] Checking for existing finished models in {full_output_dir}...")
-            for item in os.listdir(full_output_dir):
-                if item.startswith("target_reached_loss_") and os.path.isdir(os.path.join(full_output_dir, item)):
-                    try:
-                        # Extract loss value from folder name
-                        loss_str = item.split("_")[-1]
-                        found_loss = float(loss_str)
+        # if target_loss > 0 and os.path.exists(full_output_dir):
+        #     print(f"[Qwen3-TTS] Checking for existing finished models in {full_output_dir}...")
+        #     for item in os.listdir(full_output_dir):
+        #         if item.startswith("target_reached_loss_") and os.path.isdir(os.path.join(full_output_dir, item)):
+        #             try:
+        #                 # Extract loss value from folder name
+        #                 loss_str = item.split("_")[-1]
+        #                 found_loss = float(loss_str)
 
-                        if found_loss <= target_loss:
-                            print(f"✅ [Smart Skip] Found finished model: {item}")
-                            print("Skipping training session.")
-                            existing_model_path = os.path.join(full_output_dir, item)
-                            return (existing_model_path, speaker_name)
-                    except ValueError:
-                        continue
+        #                 if found_loss <= target_loss:
+        #                     print(f"✅ [Smart Skip] Found finished model: {item}")
+        #                     print("Skipping training session.")
+        #                     existing_model_path = os.path.join(full_output_dir, item)
+        #                     return (existing_model_path, speaker_name)
+        #             except ValueError:
+        #                 continue
         # ---------------------------------------------------
 
         # Check for resume checkpoint
