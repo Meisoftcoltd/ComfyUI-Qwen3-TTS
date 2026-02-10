@@ -783,8 +783,7 @@ class Qwen3LoadFineTuned:
             os.path.join(folder_paths.models_dir, "Qwen3-TTS", "finetuned_model"),
         ]
 
-        speakers = []
-        versions = []
+        model_list = []
 
         for base_path in scan_paths:
             if os.path.exists(base_path):
@@ -792,19 +791,18 @@ class Qwen3LoadFineTuned:
                 for item in os.listdir(base_path):
                     item_path = os.path.join(base_path, item)
                     if os.path.isdir(item_path):
-                        speakers.append(item)
                         # Scan versions (subdirectories)
                         for v in os.listdir(item_path):
                             if os.path.isdir(os.path.join(item_path, v)):
-                                versions.append(v)
+                                # Construct combined name: Speaker/Version
+                                name = f"{item}/{v}"
+                                if name not in model_list:
+                                    model_list.append(name)
 
-        speakers = sorted(list(set(speakers)))
-        versions = sorted(list(set(versions)))
+        model_list = sorted(list(set(model_list)))
 
-        if not speakers:
-            speakers = ["No fine-tuned speakers found"]
-        if not versions:
-            versions = ["No versions found"]
+        if not model_list:
+            model_list = ["No fine-tuned models found"]
 
         # Base models list
         base_models = [k for k in QWEN3_TTS_MODELS.keys() if "Base" in k]
@@ -820,8 +818,7 @@ class Qwen3LoadFineTuned:
                     base_models,
                     {"default": "Qwen/Qwen3-TTS-12Hz-1.7B-Base"},
                 ),
-                "speaker_name": (speakers,),
-                "version": (versions,),
+                "fine_tuned_model": (model_list,),
                 "precision": (["fp16", "bf16", "fp32"], {"default": "bf16"}),
                 "attention": (
                     ["auto", "flash_attention_2", "sdpa", "eager"],
@@ -835,11 +832,21 @@ class Qwen3LoadFineTuned:
     FUNCTION = "load_model"
     CATEGORY = "Qwen3-TTS/Loader"
 
-    def load_model(self, base_model, speaker_name, version, precision, attention):
-        if speaker_name == "No fine-tuned speakers found":
+    def load_model(self, base_model, fine_tuned_model, precision, attention):
+        if fine_tuned_model == "No fine-tuned models found":
             raise ValueError(
                 "No fine-tuned models found. Please train a model first or check models/tts/finetuned_model."
             )
+
+        # Parse Speaker/Version
+        if "/" in fine_tuned_model:
+            speaker_name, version = fine_tuned_model.split("/", 1)
+        elif "\\" in fine_tuned_model:
+            speaker_name, version = fine_tuned_model.split("\\", 1)
+        else:
+            # Fallback if somehow single name passed (shouldn't happen with dropdown)
+            speaker_name = fine_tuned_model
+            version = ""
 
         # Resolve paths
         scan_paths = [
@@ -856,7 +863,7 @@ class Qwen3LoadFineTuned:
 
         if not checkpoint_path:
             raise FileNotFoundError(
-                f"Checkpoint not found for speaker '{speaker_name}' version '{version}'. Checked paths: {[os.path.join(p, speaker_name, version) for p in scan_paths]}"
+                f"Checkpoint not found for '{fine_tuned_model}'. Checked paths: {[os.path.join(p, speaker_name, version) for p in scan_paths]}"
             )
 
         print(f"[Qwen3-TTS] Loading Fine-Tuned Checkpoint: {checkpoint_path}")
