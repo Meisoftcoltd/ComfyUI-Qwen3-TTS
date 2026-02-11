@@ -2961,7 +2961,7 @@ class Qwen3FineTune:
                     {
                         "default": 2e-5, # UPDATED: The "Gasoline" setting
                         "step": 1e-7,
-                        "tooltip": "Learning rate. Default 2e-5 is recommended when using Gradient Accumulation 8 and Warmup 0.1.",
+                        "tooltip": "Learning rate. Default 2e-6 is recommended when using Gradient Accumulation 8 and Warmup 0.1.",
                     },
                 ),
                 "target_loss": (
@@ -3168,12 +3168,12 @@ class Qwen3FineTune:
         output_dir,
         epochs,
         batch_size,
-        lr,
+        lr=0.000002,
         target_loss,
         save_loss_threshold,
         save_loss_buffer,
         speaker_name,
-        seed,
+        seed=42,
         mixed_precision="bf16",
         resume_training=False,
         log_every_steps=10,
@@ -3185,7 +3185,7 @@ class Qwen3FineTune:
         weight_decay=0.01,
         max_grad_norm=1.0,
         warmup_steps=0,
-        warmup_ratio=0.0,
+        warmup_ratio=0.10,
         save_optimizer_state=False,
         unique_id=None,
     ):
