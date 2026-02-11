@@ -3091,10 +3091,10 @@ class Qwen3FineTune:
                     "FLOAT",
                     {
                         "default": 1.0,
-                        "min": 0.1,
+                        "min": 0.0,
                         "max": 10.0,
                         "step": 0.1,
-                        "tooltip": "Gradient clipping threshold to prevent exploding gradients.",
+                        "tooltip": "Gradient clipping threshold to prevent exploding gradients. Set to 0.0 to disable.",
                     },
                 ),
                 # Learning Rate Schedule
@@ -3862,9 +3862,10 @@ class Qwen3FineTune:
                             accelerator.backward(loss)
 
                             if accelerator.sync_gradients:
-                                accelerator.clip_grad_norm_(
-                                    model.parameters(), max_grad_norm
-                                )
+                                if max_grad_norm > 0:
+                                    accelerator.clip_grad_norm_(
+                                        model.parameters(), max_grad_norm
+                                    )
 
                             optimizer.step()
                             if scheduler:
