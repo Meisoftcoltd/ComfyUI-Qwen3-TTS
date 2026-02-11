@@ -2806,9 +2806,14 @@ class Qwen3DataPrep:
                 # Optional: keep audio_codes for reference
                 item["audio_codes"] = audio_tokens
 
-                # OPTIMIZATION: Pre-compute text_ids for TTSDataset (to avoid re-tokenization during training)
-                # TTSDataset expects: <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
-                tts_text = f"<|im_start|>assistant\n{text_content}<|im_end|>\n<|im_start|>assistant\n"
+                # OPTIMIZATION: Pre-compute text_ids for TTSDataset
+                # We MUST inject the instruction as a user prompt so the LLM learns to condition audio on it
+                instruction_text = item.get("instruction", "").strip()
+
+                if instruction_text:
+                    tts_text = f"<|im_start|>user\n{instruction_text}<|im_end|>\n<|im_start|>assistant\n{text_content}<|im_end|>\n<|im_start|>assistant\n"
+                else:
+                    tts_text = f"<|im_start|>assistant\n{text_content}<|im_end|>\n<|im_start|>assistant\n"
                 # Use standard encoding. dataset.py uses processor(text=...) which defaults to adding special tokens.
                 # However, for Qwen, manually constructing the template implies we might want to be careful.
                 # But dataset.py uses processor() on the constructed string, so we should do the same.
