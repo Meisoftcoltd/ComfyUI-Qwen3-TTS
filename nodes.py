@@ -2039,7 +2039,10 @@ class Qwen3LoadDatasetAudio:
         return {
             "required": {
                 "folder_path": ("STRING", {"default": "", "multiline": False}),
-            }
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
     RETURN_TYPES = ("DATASET_AUDIO_LIST",)
@@ -2047,7 +2050,10 @@ class Qwen3LoadDatasetAudio:
     FUNCTION = "load_audio"
     CATEGORY = "Qwen3-TTS/Dataset"
 
-    def load_audio(self, folder_path):
+    def load_audio(self, folder_path, unique_id=None):
+        if not HAS_WHISPER_PYDUB:
+             raise ImportError("Please install 'pydub' to use this node.")
+
         if not folder_path or not folder_path.strip():
              raise ValueError("Folder path is empty. Please select a valid folder.")
 
@@ -2069,7 +2075,50 @@ class Qwen3LoadDatasetAudio:
             raise ValueError(f"No supported audio files found (.wav, .ogg, .mp3, .flac, .m4a) in {folder_path}")
 
         print(f"[Qwen3-TTS] Found {len(files)} audio files in {folder_path}")
-        return ({"folder_path": folder_path, "files": files},)
+
+        # Create Normalized Folder
+        norm_folder = os.path.join(folder_path, "normalized")
+        os.makedirs(norm_folder, exist_ok=True)
+        print(f"[Qwen3-TTS] normalization target: {norm_folder}")
+
+        processed_files = []
+        total_files = len(files)
+
+        for idx, filename in enumerate(files):
+            if unique_id:
+                PromptServer.instance.send_sync("progress", {"value": idx, "max": total_files}, unique_id)
+
+            src_path = os.path.join(folder_path, filename)
+
+            # Construct destination path (ensure wav extension for consistency)
+            base_name = os.path.splitext(filename)[0]
+            dst_filename = f"{base_name}.wav"
+            dst_path = os.path.join(norm_folder, dst_filename)
+
+            try:
+                # Load
+                audio = AudioSegment.from_file(src_path)
+
+                # Check Peak
+                peak_db = audio.max_dBFS
+
+                if peak_db > -0.5:
+                    print(f"   [Auto-Norm] {filename}: Peak {peak_db:.2f}dB > -0.5dB. Normalizing to -1.0dB...")
+                    # Normalize to -1.0 dB
+                    audio = effects.normalize(audio, headroom=1.0)
+
+                # Export to normalized folder (always export to ensure format consistency)
+                audio.export(dst_path, format="wav")
+                processed_files.append(dst_filename)
+
+            except Exception as e:
+                print(f"[Qwen3-TTS] Error processing {filename}: {e}")
+                continue
+
+        # Update return to point to new folder
+        print(f"[Qwen3-TTS] Auto-Normalization complete. Output folder: {norm_folder}")
+
+        return ({"folder_path": norm_folder, "files": processed_files},)
 
 
 class Qwen3TranscribeWhisper:
@@ -4469,87 +4518,6 @@ Audio Details:
         return (report,)
 
 
-class Qwen3NormalizeAudio:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "audio": ("AUDIO",),
-                "target_db": ("FLOAT", {"default": -1.0, "min": -30.0, "max": 0.0, "step": 0.1}),
-                "method": (["Peak Normalization", "Dynamic Compression"], {"default": "Dynamic Compression"}),
-            }
-        }
-
-    RETURN_TYPES = ("AUDIO",)
-    FUNCTION = "normalize"
-    CATEGORY = "Qwen3-TTS/Utils"
-
-    def normalize(self, audio, target_db, method):
-        if not HAS_WHISPER_PYDUB:
-             raise ImportError("Please install 'pydub' to use this node.")
-
-        waveform = audio["waveform"]
-        sr = audio["sample_rate"]
-
-        output_waveforms = []
-
-        if waveform.dim() == 2:
-            waveform = waveform.unsqueeze(0)
-
-        batch_size = waveform.shape[0]
-
-        for i in range(batch_size):
-            wav_tensor = waveform[i]
-            wav_np = wav_tensor.cpu().numpy()
-
-            # Check shape: [Channels, Samples] is standard ComfyUI
-            if wav_np.shape[0] < wav_np.shape[1]:
-                wav_np = wav_np.transpose(1, 0) # [T, C]
-
-            # Convert to int16 (clip to avoid wrap-around artifacts)
-            wav_np = np.clip(wav_np, -1.0, 1.0)
-            wav_int16 = (wav_np * 32767).astype(np.int16)
-
-            channels = wav_np.shape[1] if wav_np.ndim > 1 else 1
-
-            # Create AudioSegment
-            seg = AudioSegment(
-                wav_int16.tobytes(),
-                frame_rate=sr,
-                sample_width=2,
-                channels=channels
-            )
-
-            # Apply
-            headroom = -target_db
-
-            if method == "Dynamic Compression":
-                # 1. Normalize to 0dB to maximize dynamic range for compressor
-                seg = effects.normalize(seg, headroom=0.1)
-                # 2. Apply standard voice compression settings
-                seg = effects.compress_dynamic_range(seg, threshold=-20.0, ratio=4.0, attack=5.0, release=50.0)
-
-            # Final Normalization to target dB
-            seg = effects.normalize(seg, headroom=headroom)
-
-            # Convert back
-            samples = np.array(seg.get_array_of_samples())
-
-            if seg.channels > 1:
-                samples = samples.reshape((-1, seg.channels))
-
-            samples_float = samples.astype(np.float32) / 32768.0
-
-            if samples_float.ndim == 1:
-                samples_float = samples_float[np.newaxis, :] # [1, T]
-            else:
-                samples_float = samples_float.transpose(1, 0) # [C, T]
-
-            output_waveforms.append(torch.from_numpy(samples_float))
-
-        output_tensor = torch.stack(output_waveforms)
-
-        return ({"waveform": output_tensor, "sample_rate": sr},)
 
 
 class Qwen3TranscribeSingle:
@@ -4936,7 +4904,6 @@ NODE_CLASS_MAPPINGS = {
     "Qwen3AudioCompare": Qwen3AudioCompare,
     "Qwen3AudioToDataset": Qwen3AudioToDataset,
     "Qwen3TranscribeSingle": Qwen3TranscribeSingle,
-    "Qwen3NormalizeAudio": Qwen3NormalizeAudio,
     "Qwen3ASRTranscribeDataset": Qwen3ASRTranscribeDataset,
     "Qwen3ASRTranscribeSingle": Qwen3ASRTranscribeSingle,
 }
@@ -4963,7 +4930,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Qwen3AudioCompare": "📊 Qwen3-TTS Audio Compare",
     "Qwen3AudioToDataset": "📁 Qwen3-TTS Dataset Maker",
     "Qwen3TranscribeSingle": "🎙️ Qwen3-TTS Whisper Transcribe (Single)",
-    "Qwen3NormalizeAudio": "🎚️ Qwen3-TTS Normalize Audio",
     "Qwen3ASRTranscribeDataset": "🎙️ Qwen3-TTS Step 2: Transcribe (Qwen3-ASR Local)",
     "Qwen3ASRTranscribeSingle": "🎙️ Qwen3-TTS Qwen3-ASR Transcribe (Single)",
 }
