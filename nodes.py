@@ -1898,13 +1898,13 @@ class Qwen3AudioToDataset:
         files = [
             f
             for f in os.listdir(audio_folder)
-            if f.lower().endswith(".wav")
+            if f.lower().endswith((".wav", ".ogg", ".mp3", ".flac", ".m4a"))
             and os.path.isfile(os.path.join(audio_folder, f))
         ]
         files.sort()
 
         if not files:
-            raise ValueError(f"No .wav files found in {audio_folder}")
+            raise ValueError(f"No supported audio files found (.wav, .ogg, .mp3, .flac, .m4a) in {audio_folder}")
 
         total_files = len(files)
         print(f"[Qwen3-TTS] Found {total_files} files")
@@ -1934,7 +1934,7 @@ class Qwen3AudioToDataset:
             print(f"Processing [{idx+1}/{total_files}]: {filename}")
 
             try:
-                audio_full = AudioSegment.from_wav(filepath)
+                audio_full = AudioSegment.from_file(filepath)
             except Exception as e:
                 print(f"Error reading {filename}: {e}")
                 continue
@@ -2044,15 +2044,15 @@ class Qwen3LoadDatasetAudio:
         files = [
             f
             for f in os.listdir(folder_path)
-            if f.lower().endswith(".wav")
+            if f.lower().endswith((".wav", ".ogg", ".mp3", ".flac", ".m4a"))
             and os.path.isfile(os.path.join(folder_path, f))
         ]
         files.sort()
 
         if not files:
-            raise ValueError(f"No .wav files found in {folder_path}")
+            raise ValueError(f"No supported audio files found (.wav, .ogg, .mp3, .flac, .m4a) in {folder_path}")
 
-        print(f"[Qwen3-TTS] Found {len(files)} .wav files in {folder_path}")
+        print(f"[Qwen3-TTS] Found {len(files)} audio files in {folder_path}")
         return ({"folder_path": folder_path, "files": files},)
 
 
@@ -2174,7 +2174,7 @@ class Qwen3TranscribeWhisper:
                 print(f"--- Processing [{idx+1}/{total_files}]: {filename} ---")
 
                 try:
-                    audio_full = AudioSegment.from_wav(filepath)
+                    audio_full = AudioSegment.from_file(filepath)
                 except Exception as e:
                     print(f"   [Error reading audio] {e}")
                     continue
@@ -3029,24 +3029,6 @@ class Qwen3FineTune:
                         "tooltip": "Log training progress every N steps.",
                     },
                 ),
-                "save_every_epochs": (
-                    "INT",
-                    {
-                        "default": 0,
-                        "min": 0,
-                        "max": 100,
-                        "tooltip": "Save checkpoint every N epochs. Set to 0 to only save final epoch.",
-                    },
-                ),
-                "save_every_steps": (
-                    "INT",
-                    {
-                        "default": 0,
-                        "min": 0,
-                        "max": 100000,
-                        "tooltip": "Save checkpoint every N steps. Set to 0 to use epoch-based saving instead.",
-                    },
-                ),
                 # VRAM Optimizations
                 "mixed_precision": (
                     ["bf16", "fp32"],
@@ -3169,16 +3151,14 @@ class Qwen3FineTune:
         epochs,
         batch_size,
         lr=0.000002,
-        target_loss,
-        save_loss_threshold,
-        save_loss_buffer,
-        speaker_name,
+        target_loss=7.2,
+        save_loss_threshold=7.5,
+        save_loss_buffer=0.1,
+        speaker_name="my_speaker",
         seed=42,
         mixed_precision="bf16",
         resume_training=False,
         log_every_steps=10,
-        save_every_epochs=1,
-        save_every_steps=0,
         gradient_accumulation=4,
         gradient_checkpointing=True,
         use_8bit_optimizer=True,
@@ -3231,25 +3211,6 @@ class Qwen3FineTune:
                             min_saved_loss = val
                     except: pass
         print(f"[Qwen3-TTS] Loss Tracker Initialized. Best saved loss: {min_saved_loss}")
-
-        # --- SMART SKIP: Check if target already reached ---
-        # if target_loss > 0 and os.path.exists(full_output_dir):
-        #     print(f"[Qwen3-TTS] Checking for existing finished models in {full_output_dir}...")
-        #     for item in os.listdir(full_output_dir):
-        #         if item.startswith("target_reached_loss_") and os.path.isdir(os.path.join(full_output_dir, item)):
-        #             try:
-        #                 # Extract loss value from folder name
-        #                 loss_str = item.split("_")[-1]
-        #                 found_loss = float(loss_str)
-
-        #                 if found_loss <= target_loss:
-        #                     print(f"✅ [Smart Skip] Found finished model: {item}")
-        #                     print("Skipping training session.")
-        #                     existing_model_path = os.path.join(full_output_dir, item)
-        #                     return (existing_model_path, speaker_name)
-        #             except ValueError:
-        #                 continue
-        # ---------------------------------------------------
 
         # Check for resume checkpoint
         start_epoch = 0
@@ -3973,30 +3934,9 @@ class Qwen3FineTune:
                                     print(status)
                                     send_status(status)
 
-                                # Step-based saving: only lightweight checkpoints during training
-                                # (final model is always saved as epoch_N after training loop)
-                                if (
-                                    save_every_steps > 0
-                                    and global_step % save_every_steps == 0
-                                ):
-                                    send_status(
-                                        f"Saving checkpoint step {global_step}..."
-                                    )
-                                    save_training_checkpoint(f"ckpt_step_{global_step}", epoch, global_step)
-
                     avg_loss = epoch_loss / steps if steps > 0 else 0
                     print(f"Epoch {epoch + 1}/{end_epoch} - Avg Loss: {avg_loss}")
                     send_status(f"Epoch {epoch + 1}/{end_epoch} - Loss: {avg_loss:.4f}")
-
-                    # Epoch-based saving: intermediate checkpoints only (final saved after loop)
-                    if save_every_steps == 0 and save_every_epochs > 0:
-                        is_final_epoch = (epoch + 1) == end_epoch
-                        should_save_checkpoint = (
-                            (epoch + 1) % save_every_epochs == 0
-                        ) and not is_final_epoch
-                        if should_save_checkpoint:
-                            send_status(f"Saving checkpoint epoch {epoch + 1}...")
-                            save_training_checkpoint(f"ckpt_epoch_{epoch + 1}", epoch + 1, global_step)
 
                 # Always save final model as epoch_N for consistent resume
                 send_status(f"Saving final model epoch {end_epoch}...")
