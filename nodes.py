@@ -75,6 +75,13 @@ try:
     HAS_BNB = True
 except ImportError:
     HAS_BNB = False
+try:
+    from qwen_asr import Qwen3ASRModel, ForcedAligner
+
+    HAS_QWEN_ASR = True
+except ImportError:
+    HAS_QWEN_ASR = False
+
 from torch.utils.data import DataLoader, Dataset
 from transformers import (
     AutoConfig,
@@ -95,6 +102,11 @@ TTS_MODELS_DIR = os.path.join(folder_paths.models_dir, "tts")
 OLD_QWEN3_TTS_MODELS_DIR = os.path.join(folder_paths.models_dir, "Qwen3-TTS")
 
 os.makedirs(TTS_MODELS_DIR, exist_ok=True)
+
+# Register ASR models folder
+ASR_MODELS_DIR = os.path.join(folder_paths.models_dir, "asr")
+os.makedirs(ASR_MODELS_DIR, exist_ok=True)
+folder_paths.add_model_folder_path("asr", ASR_MODELS_DIR)
 
 # Primary directory is now models/tts
 QWEN3_TTS_MODELS_DIR = TTS_MODELS_DIR
@@ -346,9 +358,13 @@ def migrate_cached_model(repo_id: str, target_path: str) -> bool:
     return False
 
 
-def download_model_to_comfyui(repo_id: str, source: str) -> str:
+def download_model_to_comfyui(repo_id: str, source: str, target_dir: str = None) -> str:
     """Download a model directly to ComfyUI's models folder."""
-    target_path = get_local_model_path(repo_id)
+    if target_dir:
+        folder_name = repo_id.split("/")[-1]
+        target_path = os.path.join(target_dir, folder_name)
+    else:
+        target_path = get_local_model_path(repo_id)
 
     # First check if we can migrate from cache
     if migrate_cached_model(repo_id, target_path):
@@ -2941,7 +2957,7 @@ class Qwen3FineTune:
                 "epochs": (
                     "INT",
                     {
-                        "default": 50,  # UPDATED: Higher ceiling to allow target_loss to work
+                        "default": 50,
                         "min": 1,
                         "max": 1000,
                         "tooltip": "Number of training epochs. Set high (e.g. 50) and let Target Loss stop it automatically.",
@@ -2959,7 +2975,7 @@ class Qwen3FineTune:
                 "lr": (
                     "FLOAT",
                     {
-                        "default": 2e-5, # UPDATED: The "Gasoline" setting
+                        "default": 2e-6,
                         "step": 1e-7,
                         "tooltip": "Learning rate. Default 2e-6 is recommended when using Gradient Accumulation 8 and Warmup 0.1.",
                     },
@@ -2967,7 +2983,7 @@ class Qwen3FineTune:
                 "target_loss": (
                     "FLOAT",
                     {
-                        "default": 7.2, # UPDATED: The "Sniper" setting
+                        "default": 7.2,
                         "min": 0.0,
                         "max": 100.0,
                         "step": 0.01,
@@ -2977,21 +2993,21 @@ class Qwen3FineTune:
                 "save_loss_threshold": (
                     "FLOAT",
                     {
-                        "default": 7.5, # UPDATED: Safety backup
+                        "default": 8.20,
                         "min": 0.0,
                         "max": 100.0,
                         "step": 0.01,
-                        "tooltip": "Save an extra checkpoint when Loss drops below this value (e.g. 7.5) without stopping.",
+                        "tooltip": "Save an extra checkpoint when Loss drops below this value (e.g. 8.20) without stopping.",
                     },
                 ),
                 "save_loss_buffer": (
                     "FLOAT",
                     {
-                        "default": 0.1,
+                        "default": 0.20,
                         "min": 0.01,
                         "max": 5.0,
                         "step": 0.01,
-                        "tooltip": "Minimum improvement required to save a new checkpoint when loss is below threshold. (e.g. 0.1 means if 7.50 is saved, next save happens at 7.40).",
+                        "tooltip": "Minimum improvement required to save a new checkpoint when loss is below threshold. (e.g. 0.2 means if 8.20 is saved, next save happens at 8.00).",
                     },
                 ),
                 "speaker_name": (
@@ -3040,7 +3056,7 @@ class Qwen3FineTune:
                 "gradient_accumulation": (
                     "INT",
                     {
-                        "default": 8, # UPDATED: Higher stability for small batch size
+                        "default": 8,
                         "min": 1,
                         "max": 32,
                         "tooltip": "Accumulate gradients over N steps. Default 8 simulates Batch Size 16 (8*2) for stability.",
@@ -3150,23 +3166,23 @@ class Qwen3FineTune:
         output_dir,
         epochs,
         batch_size,
-        lr=0.000002,
+        lr=2e-6,
         target_loss=7.2,
-        save_loss_threshold=7.5,
-        save_loss_buffer=0.1,
+        save_loss_threshold=8.2,
+        save_loss_buffer=0.2,
         speaker_name="my_speaker",
         seed=42,
         mixed_precision="bf16",
         resume_training=False,
         log_every_steps=10,
-        gradient_accumulation=4,
+        gradient_accumulation=8,
         gradient_checkpointing=True,
         use_8bit_optimizer=True,
         weight_decay=0.01,
         max_grad_norm=1.0,
         warmup_steps=0,
-        warmup_ratio=0.10,
-        save_optimizer_state=False,
+        warmup_ratio=0.1,
+        save_optimizer_state=True,
         unique_id=None,
     ):
         train_jsonl = fix_wsl_path(train_jsonl)
@@ -4645,6 +4661,257 @@ class Qwen3TranscribeSingle:
         return (text,)
 
 
+class Qwen3ASRTranscribeDataset:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "audio_list": ("DATASET_AUDIO_LIST",),
+            },
+            "optional": {
+                "output_dataset_folder": (
+                    "STRING",
+                    {"default": "dataset_final", "multiline": False},
+                ),
+                "min_duration": (
+                    "FLOAT",
+                    {"default": 0.8, "min": 0.1, "max": 10.0, "step": 0.1},
+                ),
+                "max_duration": (
+                    "FLOAT",
+                    {"default": 60.0, "min": 1.0, "max": 120.0, "step": 0.5},
+                ),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
+        }
+
+    RETURN_TYPES = ("DATASET_ITEMS",)
+    RETURN_NAMES = ("dataset_items",)
+    OUTPUT_NODE = True
+    FUNCTION = "process"
+    CATEGORY = "Qwen3-TTS/Dataset"
+
+    def process(
+        self,
+        audio_list,
+        output_dataset_folder="dataset_final",
+        min_duration=0.8,
+        max_duration=60.0,
+        unique_id=None,
+    ):
+        if not HAS_QWEN_ASR:
+            raise ImportError(
+                "Please install 'qwen-asr' to use this node (add to requirements.txt)."
+            )
+
+        folder_path = audio_list["folder_path"]
+        files = audio_list["files"]
+
+        # Ensure models are available
+        device = mm.get_torch_device()
+        print(f"[Qwen3-ASR] Checking models in {ASR_MODELS_DIR}...")
+
+        asr_repo = "Qwen/Qwen3-ASR-1.7B"
+        aligner_repo = "Qwen/Qwen3-ForcedAligner-0.6B"
+
+        asr_path = download_model_to_comfyui(asr_repo, "HuggingFace", target_dir=ASR_MODELS_DIR)
+        aligner_path = download_model_to_comfyui(aligner_repo, "HuggingFace", target_dir=ASR_MODELS_DIR)
+
+        print(f"[Qwen3-ASR] Loading ASR model: {asr_path}")
+        asr_model = Qwen3ASRModel.from_pretrained(asr_path, device_map=device)
+
+        print(f"[Qwen3-ASR] Loading Aligner: {aligner_path}")
+        aligner = ForcedAligner.from_pretrained(aligner_path, device_map=device)
+
+        # Output dir
+        processed_dir = os.path.join(folder_path, output_dataset_folder)
+        os.makedirs(processed_dir, exist_ok=True)
+
+        total_files = len(files)
+        print(f"[Qwen3-ASR] Processing {total_files} files...")
+
+        # Process
+        for idx, filename in enumerate(tqdm(files, desc="Processing Audio", unit="file")):
+            if unique_id:
+                PromptServer.instance.send_sync("progress", {"value": idx, "max": total_files}, unique_id)
+
+            filepath = os.path.join(folder_path, filename)
+            base_name = os.path.splitext(filename)[0]
+
+            print(f"--- Processing [{idx+1}/{total_files}]: {filename} ---")
+
+            try:
+                # Transcribe
+                # Assuming model accepts path or waveform. Using path for simplicity if supported.
+                # If Qwen3ASRModel expects specific input, we might need to load with librosa/torchaudio.
+                # Standard assumption: accepts path.
+                text = asr_model.transcribe(filepath)
+
+                if not text or not text.strip():
+                    continue
+
+                # Align
+                # Returns list of {text, start, end}
+                alignment = aligner.align(filepath, text)
+
+            except Exception as e:
+                print(f"   [Error processing {filename}] {e}")
+                continue
+
+            if not alignment:
+                continue
+
+            # Grouping Algorithm
+            segments = []
+            current_segment_words = []
+
+            for i, word_info in enumerate(alignment):
+                word = word_info['text']
+                start = word_info['start']
+                end = word_info['end']
+
+                current_segment_words.append(word_info)
+
+                should_break = False
+
+                # 1. Punctuation check
+                if any(p in word for p in ['.', '?', '!', '。', '？', '！']):
+                    should_break = True
+
+                # 2. Silence gap check (look ahead)
+                if not should_break and i < len(alignment) - 1:
+                    next_start = alignment[i+1]['start']
+                    if (next_start - end) > 0.6:
+                        should_break = True
+
+                if should_break:
+                    segments.append(current_segment_words)
+                    current_segment_words = []
+
+            # Append remaining
+            if current_segment_words:
+                segments.append(current_segment_words)
+
+            # Export Segments
+            audio_full = AudioSegment.from_file(filepath)
+
+            file_count = 0
+            for seg_words in segments:
+                if not seg_words:
+                    continue
+
+                seg_start = seg_words[0]['start']
+                seg_end = seg_words[-1]['end']
+                seg_text = "".join([w['text'] for w in seg_words]) # Qwen ASR might output spaces or not, assume raw text glueing for now
+                # Actually ASR usually outputs words with spaces if needed?
+                # If alignment['text'] has leading spaces, simple join is fine.
+                # If not, we might need space joining for non-CJK.
+                # Let's check typical aligner output. Often it preserves spacing or we join with space if needed.
+                # For safety with CJK/English mix, simple join is risky if spaces missing.
+                # But simple join is safest if tokens include spaces.
+                # Let's try simple join.
+
+                duration = seg_end - seg_start
+                if duration < min_duration or duration > max_duration:
+                    continue
+
+                # Extract Audio (pydub uses ms)
+                start_ms = int(seg_start * 1000)
+                end_ms = int(seg_end * 1000)
+                chunk = audio_full[start_ms:end_ms]
+
+                chunk_name = f"{base_name}_{file_count:04d}"
+                wav_path = os.path.join(processed_dir, f"{chunk_name}.wav")
+                txt_path = os.path.join(processed_dir, f"{chunk_name}.txt")
+
+                # Save: Mono, 22050Hz
+                chunk.set_frame_rate(22050).set_channels(1).export(wav_path, format="wav")
+
+                with open(txt_path, "w", encoding="utf-8") as f:
+                    f.write(seg_text.strip())
+
+                file_count += 1
+
+        # Collect items for output
+        items = []
+        processed_wavs = [f for f in os.listdir(processed_dir) if f.lower().endswith(".wav")]
+        for wav_file in processed_wavs:
+            base_name = os.path.splitext(wav_file)[0]
+            txt_path = os.path.join(processed_dir, f"{base_name}.txt")
+            if os.path.exists(txt_path):
+                with open(txt_path, "r", encoding="utf-8") as f:
+                    text = f.read().strip()
+                if text:
+                    items.append({"audio_path": os.path.join(processed_dir, wav_file), "text": text})
+
+        # Clean VRAM
+        del asr_model, aligner
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return (items,)
+
+
+class Qwen3ASRTranscribeSingle:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    FUNCTION = "transcribe"
+    CATEGORY = "Qwen3-TTS/Utils"
+
+    def transcribe(self, audio):
+        if not HAS_QWEN_ASR:
+            raise ImportError(
+                "Please install 'qwen-asr' to use this node."
+            )
+
+        device = mm.get_torch_device()
+        asr_repo = "Qwen/Qwen3-ASR-1.7B"
+        asr_path = download_model_to_comfyui(asr_repo, "HuggingFace", target_dir=ASR_MODELS_DIR)
+
+        # Load (Optimization: maybe cache this class-level?)
+        # For now load on demand to save VRAM when not in use
+        model = Qwen3ASRModel.from_pretrained(asr_path, device_map=device)
+
+        # Convert Audio to path or acceptable format
+        # Qwen3ASRModel likely accepts a file path or numpy array.
+        # ComfyUI audio is tensor. Let's save to temp file to be safe and compatible.
+
+        temp_dir = folder_paths.get_temp_directory()
+        temp_wav = os.path.join(temp_dir, "temp_asr_single.wav")
+
+        # Save temp wav
+        waveform = audio["waveform"]
+        sr = audio["sample_rate"]
+        # Extract first batch item
+        if waveform.dim() == 2: waveform = waveform.unsqueeze(0)
+        wav = waveform[0]
+        wav_np = wav.cpu().numpy()
+        if wav_np.shape[0] < wav_np.shape[1]: wav_np = wav_np.transpose(1, 0)
+        sf.write(temp_wav, wav_np, sr)
+
+        try:
+            text = model.transcribe(temp_wav)
+        finally:
+            if os.path.exists(temp_wav):
+                os.remove(temp_wav)
+            # Cleanup
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        return (text,)
+
+
 # Node Mappings
 NODE_CLASS_MAPPINGS = {
     "Qwen3Loader": Qwen3Loader,
@@ -4669,6 +4936,8 @@ NODE_CLASS_MAPPINGS = {
     "Qwen3AudioToDataset": Qwen3AudioToDataset,
     "Qwen3TranscribeSingle": Qwen3TranscribeSingle,
     "Qwen3NormalizeAudio": Qwen3NormalizeAudio,
+    "Qwen3ASRTranscribeDataset": Qwen3ASRTranscribeDataset,
+    "Qwen3ASRTranscribeSingle": Qwen3ASRTranscribeSingle,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -4694,4 +4963,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Qwen3AudioToDataset": "📁 Qwen3-TTS Dataset Maker",
     "Qwen3TranscribeSingle": "🎙️ Qwen3-TTS Whisper Transcribe (Single)",
     "Qwen3NormalizeAudio": "🎚️ Qwen3-TTS Normalize Audio",
+    "Qwen3ASRTranscribeDataset": "🎙️ Qwen3-TTS Step 2: Transcribe (Qwen3-ASR Local)",
+    "Qwen3ASRTranscribeSingle": "🎙️ Qwen3-TTS Qwen3-ASR Transcribe (Single)",
 }
