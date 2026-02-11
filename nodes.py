@@ -86,6 +86,7 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import (
     AutoConfig,
     get_linear_schedule_with_warmup,
+    get_constant_schedule_with_warmup,
     AutoProcessor,
     Qwen2AudioForConditionalGeneration,
     AutoTokenizer,
@@ -2095,6 +2096,11 @@ class Qwen3LoadDatasetAudio:
             dst_filename = f"{base_name}.wav"
             dst_path = os.path.join(norm_folder, dst_filename)
 
+            # Check if already exists (Skip optimization)
+            if os.path.exists(dst_path):
+                processed_files.append(dst_filename)
+                continue
+
             try:
                 # Load
                 audio = AudioSegment.from_file(src_path)
@@ -3166,6 +3172,18 @@ class Qwen3FineTune:
                         "tooltip": "Warmup as ratio of total steps. 0.1 (10%) prevents model shock at start.",
                     },
                 ),
+                "scheduler_type": (
+                    ["constant", "linear"],
+                    {"default": "constant", "tooltip": "Learning rate scheduler type. 'Constant' keeps LR steady (good for fine-tuning), 'Linear' decays it."},
+                ),
+                "early_stopping_patience": (
+                    "INT",
+                    {"default": 20, "min": 0, "max": 100, "tooltip": "Stop training if loss doesn't improve for N epochs."},
+                ),
+                "early_stopping_min_delta": (
+                    "FLOAT",
+                    {"default": 0.02, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Minimum change in loss to qualify as an improvement."},
+                ),
                 "save_optimizer_state": (
                     "BOOLEAN",
                     {
@@ -3231,6 +3249,9 @@ class Qwen3FineTune:
         max_grad_norm=1.0,
         warmup_steps=0,
         warmup_ratio=0.1,
+        scheduler_type="constant",
+        early_stopping_patience=20,
+        early_stopping_min_delta=0.02,
         save_optimizer_state=True,
         unique_id=None,
     ):
@@ -3267,6 +3288,9 @@ class Qwen3FineTune:
 
         # --- TRACKER: Initialize best saved loss from existing files ---
         min_saved_loss = 999.0
+        best_epoch_loss = float("inf")
+        early_stopping_counter = 0
+
         if os.path.exists(full_output_dir):
             for d in os.listdir(full_output_dir):
                 if d.startswith("ckpt_loss_"):
@@ -3538,17 +3562,24 @@ class Qwen3FineTune:
                 if warmup_steps == 0 and warmup_ratio > 0:
                     actual_warmup_steps = int(total_training_steps * warmup_ratio)
 
-                # Create scheduler if warmup is enabled
+                # Create scheduler
                 scheduler = None
-                if actual_warmup_steps > 0:
-                    scheduler = get_linear_schedule_with_warmup(
-                        optimizer,
-                        num_warmup_steps=actual_warmup_steps,
-                        num_training_steps=total_training_steps,
-                    )
-                    print(
-                        f"Using linear warmup scheduler: {actual_warmup_steps} warmup steps out of {total_training_steps} total"
-                    )
+                if actual_warmup_steps > 0 or scheduler_type == "constant":
+                    if scheduler_type == "constant":
+                         scheduler = get_constant_schedule_with_warmup(
+                            optimizer,
+                            num_warmup_steps=actual_warmup_steps,
+                        )
+                         print(f"Using CONSTANT scheduler with {actual_warmup_steps} warmup steps.")
+                    else:
+                        scheduler = get_linear_schedule_with_warmup(
+                            optimizer,
+                            num_warmup_steps=actual_warmup_steps,
+                            num_training_steps=total_training_steps,
+                        )
+                        print(
+                            f"Using LINEAR scheduler: {actual_warmup_steps} warmup steps out of {total_training_steps} total"
+                        )
 
                 # Handle resume: restore optimizer and scheduler state if available
                 if resume_checkpoint_path:
@@ -4003,6 +4034,39 @@ class Qwen3FineTune:
                     avg_loss = epoch_loss / steps if steps > 0 else 0
                     print(f"Epoch {epoch + 1}/{end_epoch} - Avg Loss: {avg_loss}")
                     send_status(f"Epoch {epoch + 1}/{end_epoch} - Loss: {avg_loss:.4f}")
+
+                    # --- EARLY STOPPING (Epoch-based) ---
+                    if early_stopping_patience > 0 and epoch >= start_epoch:
+                        if avg_loss < (best_epoch_loss - early_stopping_min_delta):
+                            best_epoch_loss = avg_loss
+                            early_stopping_counter = 0
+                        else:
+                            early_stopping_counter += 1
+                            print(f"[Early Stopping] Patience: {early_stopping_counter}/{early_stopping_patience} (Best: {best_epoch_loss:.4f}, Current: {avg_loss:.4f})")
+
+                        if early_stopping_counter >= early_stopping_patience:
+                            print(f"🛑 Early Stopping Triggered! Loss plateaued for {early_stopping_patience} epochs.")
+                            send_status(f"🛑 Plateau detected. Stopping...")
+
+                            final_path = save_final_model(
+                                f"plateau_detected_loss_{avg_loss:.4f}", epoch + 1, global_step
+                            )
+
+                            # Cleanup
+                            accelerator.wait_for_everyone()
+                            accelerator.free_memory()
+                            del model, optimizer, train_dataloader, qwen3tts
+                            if torch.cuda.is_available():
+                                torch.cuda.synchronize()
+                                torch.cuda.empty_cache()
+
+                            if accelerator.is_main_process:
+                                self._save_instruction_report(train_jsonl, full_output_dir)
+                                print(f"Fine-tuning stopped early. Model saved to {final_path}")
+                                return (final_path, speaker_name)
+                            else:
+                                return ("", "")
+                    # ------------------------------------
 
                 # Always save final model as epoch_N for consistent resume
                 send_status(f"Saving final model epoch {end_epoch}...")
