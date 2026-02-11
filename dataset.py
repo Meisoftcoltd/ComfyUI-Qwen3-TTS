@@ -100,6 +100,12 @@ class TTSDataset(Dataset):
         if audio.ndim > 1:
             audio = np.mean(audio, axis=-1)
 
+        # --- FIX: Peak Normalization to prevent clipping warnings ---
+        max_val = np.abs(audio).max()
+        if max_val > 0:
+            audio = audio * (0.89 / max_val)
+        # ----------------------------------------------------------
+
         return audio.astype(np.float32), int(sr)
 
     def _normalize_audio_inputs(
