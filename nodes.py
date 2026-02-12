@@ -4940,6 +4940,21 @@ class Qwen3ASRTranscribeDataset:
         total_files = len(files)
         print(f"[Qwen3-ASR] Processing {total_files} files...")
 
+        # Mapping for Qwen-ASR (ISO -> Full Name)
+        ISO_TO_FULL = {
+            "en": "English", "es": "Spanish", "fr": "French", "de": "German",
+            "it": "Italian", "ja": "Japanese", "zh": "Chinese", "pt": "Portuguese",
+            "ru": "Russian", "ko": "Korean", "nl": "Dutch", "pl": "Polish",
+            "tr": "Turkish", "hi": "Hindi", "vi": "Vietnamese", "th": "Thai",
+            "ar": "Arabic"
+        }
+
+        # Resolve language argument
+        lang_arg = None
+        if language != "Auto":
+            # Translate 'ja' -> 'Japanese', fallback to raw string if not found
+            lang_arg = ISO_TO_FULL.get(language, language)
+
         # Process
         for idx, filename in enumerate(tqdm(files, desc="Processing Audio", unit="file")):
             if unique_id:
@@ -4955,10 +4970,23 @@ class Qwen3ASRTranscribeDataset:
                 # Assuming model accepts path or waveform. Using path for simplicity if supported.
                 # If Qwen3ASRModel expects specific input, we might need to load with librosa/torchaudio.
                 # Standard assumption: accepts path.
-                lang_arg = language if language != "Auto" else None
-                text = asr_model.transcribe(filepath, language=lang_arg)
+                raw_output = asr_model.transcribe(filepath, language=lang_arg)
 
-                if not text or not text.strip():
+                # Fix list return type
+                text = ""
+                if isinstance(raw_output, list):
+                    if len(raw_output) > 0 and isinstance(raw_output[0], dict) and 'text' in raw_output[0]:
+                        text = " ".join([seg['text'] for seg in raw_output])
+                    else:
+                        text = " ".join([str(t) for t in raw_output])
+                elif isinstance(raw_output, dict) and 'text' in raw_output:
+                    text = raw_output['text']
+                else:
+                    text = str(raw_output)
+
+                text = text.strip()
+
+                if not text:
                     continue
 
                 # Align
@@ -5129,8 +5157,37 @@ class Qwen3ASRTranscribeSingle:
         sf.write(temp_wav, wav_np, sr)
 
         try:
-            lang_arg = language if language != "Auto" else None
-            text = model.transcribe(temp_wav, language=lang_arg)
+            # Mapping for Qwen-ASR (ISO -> Full Name)
+            ISO_TO_FULL = {
+                "en": "English", "es": "Spanish", "fr": "French", "de": "German",
+                "it": "Italian", "ja": "Japanese", "zh": "Chinese", "pt": "Portuguese",
+                "ru": "Russian", "ko": "Korean", "nl": "Dutch", "pl": "Polish",
+                "tr": "Turkish", "hi": "Hindi", "vi": "Vietnamese", "th": "Thai",
+                "ar": "Arabic"
+            }
+
+            # Resolve language argument
+            lang_arg = None
+            if language != "Auto":
+                # Translate 'ja' -> 'Japanese', fallback to raw string if not found
+                lang_arg = ISO_TO_FULL.get(language, language)
+
+            raw_output = model.transcribe(temp_wav, language=lang_arg)
+
+            # Fix list return type
+            text = ""
+            if isinstance(raw_output, list):
+                if len(raw_output) > 0 and isinstance(raw_output[0], dict) and 'text' in raw_output[0]:
+                    text = " ".join([seg['text'] for seg in raw_output])
+                else:
+                    text = " ".join([str(t) for t in raw_output])
+            elif isinstance(raw_output, dict) and 'text' in raw_output:
+                text = raw_output['text']
+            else:
+                text = str(raw_output)
+
+            text = text.strip()
+
         finally:
             if os.path.exists(temp_wav):
                 os.remove(temp_wav)
