@@ -2975,8 +2975,35 @@ class Qwen3DataPrep:
 class Qwen3FineTune:
     @classmethod
     def INPUT_TYPES(s):
-        # Get base models (excluding CustomVoice/VoiceDesign for fine-tuning)
+        # 1. Base models
         base_models = [k for k in QWEN3_TTS_MODELS.keys() if "Base" in k]
+        # Add local base models if available
+        available = get_available_models()
+        for m in available:
+            if "Base" in m and m not in base_models:
+                base_models.append(m)
+
+        # 2. Fine-tuned models (for sequential fine-tuning)
+        scan_paths = [
+            os.path.join(folder_paths.models_dir, "tts", "finetuned_model"),
+            os.path.join(folder_paths.models_dir, "Qwen3-TTS", "finetuned_model"),
+        ]
+        ft_models = []
+        for base_path in scan_paths:
+            if os.path.exists(base_path):
+                for item in os.listdir(base_path):
+                    item_path = os.path.join(base_path, item)
+                    if os.path.isdir(item_path):
+                        for v in os.listdir(item_path):
+                            if os.path.isdir(os.path.join(item_path, v)):
+                                name = f"{item}/{v}"
+                                if name not in ft_models:
+                                    ft_models.append(name)
+        ft_models = sorted(list(set(ft_models)))
+
+        # Combined list
+        all_models = base_models + ft_models
+
         return {
             "required": {
                 "train_jsonl": (
@@ -2988,10 +3015,10 @@ class Qwen3FineTune:
                     },
                 ),
                 "init_model": (
-                    base_models,
+                    all_models,
                     {
                         "default": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-                        "tooltip": "Base model to fine-tune. Must be a 'Base' model variant.",
+                        "tooltip": "Base model OR existing Fine-Tuned checkpoint (for multi-speaker models).",
                     },
                 ),
                 "source": (
@@ -3135,7 +3162,7 @@ class Qwen3FineTune:
                 "weight_decay": (
                     "FLOAT",
                     {
-                        "default": 0.01,
+                        "default": 0.0,
                         "min": 0.0,
                         "max": 1.0,
                         "step": 0.001,
@@ -3178,7 +3205,7 @@ class Qwen3FineTune:
                 ),
                 "early_stopping_patience": (
                     "INT",
-                    {"default": 20, "min": 0, "max": 100, "tooltip": "Stop training if loss doesn't improve for N epochs."},
+                    {"default": 20, "min": 0, "max": 100, "tooltip": "Stop if no improvement after N epochs. Use 10 for small datasets, 20 for large."},
                 ),
                 "early_stopping_min_delta": (
                     "FLOAT",
@@ -3289,7 +3316,7 @@ class Qwen3FineTune:
         # --- TRACKER: Initialize best saved loss from existing files ---
         min_saved_loss = 999.0
         best_epoch_loss = float("inf")
-        early_stopping_counter = 0
+        epochs_no_improve = 0
 
         if os.path.exists(full_output_dir):
             for d in os.listdir(full_output_dir):
@@ -3380,20 +3407,38 @@ class Qwen3FineTune:
             else:
                 print("Resume enabled but no checkpoints found, starting fresh")
 
-        # Resolve init_model path - check ComfyUI folder first, download if needed
-        # NOTE: Always use the original base model, not checkpoint - checkpoint's model.safetensors
-        # doesn't include speaker_encoder (it's stripped for inference). We load checkpoint weights separately.
-        if init_model in QWEN3_TTS_MODELS:
-            local_path = get_local_model_path(init_model)
+        # Resolve init_model path
+        # 1. Is it a known repo ID?
+        init_model_clean = init_model.replace("✓ ", "").replace("Local: ", "")
+
+        if init_model_clean in QWEN3_TTS_MODELS or init_model_clean in QWEN3_TTS_MODELS.values():
+            local_path = get_local_model_path(init_model_clean)
             if os.path.exists(local_path) and os.listdir(local_path):
                 init_model_path = local_path
-                print(f"Using model from ComfyUI folder: {init_model_path}")
+                print(f"Using Base model from ComfyUI folder: {init_model_path}")
             else:
-                print(f"Base model not found locally. Downloading {init_model}...")
-                init_model_path = download_model_to_comfyui(init_model, source)
+                print(f"Base model not found locally. Downloading {init_model_clean}...")
+                init_model_path = download_model_to_comfyui(init_model_clean, source)
         else:
-            # Assume it's a path
-            init_model_path = init_model
+            # 2. Is it a Fine-Tuned "Speaker/Version" string?
+            is_ft_string = False
+            if "/" in init_model_clean or "\\" in init_model_clean:
+                # Potential speaker/version
+                scan_paths = [
+                    os.path.join(folder_paths.models_dir, "tts", "finetuned_model"),
+                    os.path.join(folder_paths.models_dir, "Qwen3-TTS", "finetuned_model"),
+                ]
+                for base_path in scan_paths:
+                    candidate = os.path.join(base_path, init_model_clean)
+                    if os.path.exists(candidate) and os.path.isdir(candidate):
+                        init_model_path = candidate
+                        is_ft_string = True
+                        print(f"Using Fine-Tuned model path: {init_model_path}")
+                        break
+
+            # 3. Fallback: Assume absolute path
+            if not is_ft_string:
+                init_model_path = init_model_clean
 
         # Set random seeds for reproducibility
         torch.manual_seed(seed)
@@ -3485,19 +3530,46 @@ class Qwen3FineTune:
                     attn_implementation=attn_impl,
                 )
 
-                # Load training weights (includes speaker_encoder) if resuming
-                if resume_checkpoint_path:
-                    ckpt_weights = os.path.join(
-                        resume_checkpoint_path, "pytorch_model.bin"
-                    )
-                    if os.path.exists(ckpt_weights):
-                        state_dict = torch.load(ckpt_weights, map_location="cpu", weights_only=True)
-                        qwen3tts.model.load_state_dict(state_dict, strict=False)
-                        print(f"Loaded training weights from {ckpt_weights}")
-                    else:
-                        print(
-                            f"Warning: Training checkpoint not found at {ckpt_weights}, using model.safetensors weights"
-                        )
+                # Load training weights if resuming OR if init_model is a checkpoint
+                load_source = resume_checkpoint_path if resume_checkpoint_path else init_model_path
+
+                # Check if we need to load weights from pytorch_model.bin (Fine-tuned/Resume)
+                # Base models usually use model.safetensors which is loaded by from_pretrained
+                bin_path = os.path.join(load_source, "pytorch_model.bin")
+
+                if os.path.exists(bin_path):
+                    print(f"Loading weights from checkpoint: {bin_path}")
+                    state_dict = torch.load(bin_path, map_location="cpu", weights_only=True)
+                    keys = qwen3tts.model.load_state_dict(state_dict, strict=False)
+                    if keys.missing_keys:
+                        print(f"DEBUG: Missing keys during load: {len(keys.missing_keys)} (Expected for some PEFT setups)")
+
+                # DYNAMIC ID ALLOCATION LOGIC
+                config_path = os.path.join(init_model_path, "config.json")
+                existing_spk_ids = {}
+
+                try:
+                    with open(config_path, 'r', encoding='utf-8') as f:
+                        cfg_data = json.load(f)
+                    if "talker_config" in cfg_data and "spk_id" in cfg_data["talker_config"]:
+                        existing_spk_ids = cfg_data["talker_config"]["spk_id"]
+                except Exception as e:
+                    print(f"Warning: Could not read existing speaker config: {e}")
+
+                # Determine ID for the current speaker_name
+                target_spk_id = 3000 # Default
+
+                if speaker_name in existing_spk_ids:
+                    # Overwrite existing speaker (Refinement)
+                    target_spk_id = existing_spk_ids[speaker_name]
+                    print(f"♻️ Refining existing speaker '{speaker_name}' at ID {target_spk_id}")
+                else:
+                    # Allocate new ID
+                    used_ids = [v for k, v in existing_spk_ids.items() if isinstance(v, int)]
+                    # Start at 3000 if empty, otherwise max + 1
+                    start_id = 3000
+                    target_spk_id = max(used_ids) + 1 if used_ids else start_id
+                    print(f"🆕 Adding new speaker '{speaker_name}' at ID {target_spk_id}")
 
                 # FORCE GRADIENTS ON
                 qwen3tts.model.train()
@@ -3650,7 +3722,7 @@ class Qwen3FineTune:
                     unwrapped = accelerator.unwrap_model(model)
                     state_dict = {k: v.cpu() for k, v in unwrapped.state_dict().items()}
 
-                    # Inject speaker embedding at index 3000 (for inference)
+                    # Inject speaker embedding at DYNAMIC ID (for inference)
                     if target_speaker_embedding is not None:
                         # Validate embedding shape
                         if target_speaker_embedding.dim() > 1:
@@ -3659,21 +3731,32 @@ class Qwen3FineTune:
                              emb_to_save = target_speaker_embedding
 
                         weight = state_dict["talker.model.codec_embedding.weight"]
-                        state_dict["talker.model.codec_embedding.weight"][3000] = (
+                        # Extend embedding layer if needed?
+                        # Usually pre-allocated to 5000+ or similar? Qwen3TTS codec embedding size check?
+                        # Assuming it fits for now (3000-5000 range usually supported)
+                        if target_spk_id >= weight.shape[0]:
+                             print(f"Warning: target_spk_id {target_spk_id} exceeds embedding size {weight.shape[0]}. Ensure model supports >{target_spk_id} speakers.")
+
+                        state_dict["talker.model.codec_embedding.weight"][target_spk_id] = (
                             emb_to_save.detach().cpu().to(weight.dtype)
                         )
 
                     torch.save(state_dict, os.path.join(ckpt_path, "pytorch_model.bin"))
 
-                    # Save config for inference (speaker mapping)
+                    # Save config for inference (speaker mapping) - MERGE LOGIC
                     base_cfg_path = os.path.join(init_model_path, "config.json")
                     with open(base_cfg_path, "r", encoding="utf-8") as f:
                         ckpt_cfg = json.load(f)
 
                     ckpt_cfg["tts_model_type"] = "custom_voice"
-                    spk_key = speaker_name.lower()
-                    ckpt_cfg["talker_config"]["spk_id"] = {spk_key: 3000}
-                    ckpt_cfg["talker_config"]["spk_is_dialect"] = {spk_key: False}
+
+                    if "talker_config" not in ckpt_cfg: ckpt_cfg["talker_config"] = {}
+                    if "spk_id" not in ckpt_cfg["talker_config"]: ckpt_cfg["talker_config"]["spk_id"] = {}
+                    if "spk_is_dialect" not in ckpt_cfg["talker_config"]: ckpt_cfg["talker_config"]["spk_is_dialect"] = {}
+
+                    # Merge new speaker
+                    ckpt_cfg["talker_config"]["spk_id"][speaker_name] = target_spk_id
+                    ckpt_cfg["talker_config"]["spk_is_dialect"][speaker_name] = False
 
                     with open(
                         os.path.join(ckpt_path, "config.json"), "w", encoding="utf-8"
@@ -3740,9 +3823,14 @@ class Qwen3FineTune:
                         ckpt_cfg = json.load(f)
 
                     ckpt_cfg["tts_model_type"] = "custom_voice"
-                    spk_key = speaker_name.lower()
-                    ckpt_cfg["talker_config"]["spk_id"] = {spk_key: 3000}
-                    ckpt_cfg["talker_config"]["spk_is_dialect"] = {spk_key: False}
+
+                    if "talker_config" not in ckpt_cfg: ckpt_cfg["talker_config"] = {}
+                    if "spk_id" not in ckpt_cfg["talker_config"]: ckpt_cfg["talker_config"]["spk_id"] = {}
+                    if "spk_is_dialect" not in ckpt_cfg["talker_config"]: ckpt_cfg["talker_config"]["spk_is_dialect"] = {}
+
+                    # Merge new speaker
+                    ckpt_cfg["talker_config"]["spk_id"][speaker_name] = target_spk_id
+                    ckpt_cfg["talker_config"]["spk_is_dialect"][speaker_name] = False
 
                     with open(ckpt_cfg_path, "w", encoding="utf-8") as f:
                         json.dump(ckpt_cfg, f, indent=2, ensure_ascii=False)
@@ -3751,7 +3839,7 @@ class Qwen3FineTune:
                     unwrapped = accelerator.unwrap_model(model)
                     state_dict = {k: v.cpu() for k, v in unwrapped.state_dict().items()}
 
-                    # Inject speaker embedding at index 3000 (for inference)
+                    # Inject speaker embedding at DYNAMIC ID (for inference)
                     if target_speaker_embedding is not None:
                         # Validate embedding shape
                         if target_speaker_embedding.dim() > 1:
@@ -3760,7 +3848,7 @@ class Qwen3FineTune:
                              emb_to_save = target_speaker_embedding
 
                         weight = state_dict["talker.model.codec_embedding.weight"]
-                        state_dict["talker.model.codec_embedding.weight"][3000] = (
+                        state_dict["talker.model.codec_embedding.weight"][target_spk_id] = (
                             emb_to_save.detach().cpu().to(weight.dtype)
                         )
 
@@ -4035,38 +4123,21 @@ class Qwen3FineTune:
                     print(f"Epoch {epoch + 1}/{end_epoch} - Avg Loss: {avg_loss}")
                     send_status(f"Epoch {epoch + 1}/{end_epoch} - Loss: {avg_loss:.4f}")
 
-                    # --- EARLY STOPPING (Epoch-based) ---
-                    if early_stopping_patience > 0 and epoch >= start_epoch:
+                    # Early Stopping Logic
+                    if early_stopping_patience > 0:
                         if avg_loss < (best_epoch_loss - early_stopping_min_delta):
                             best_epoch_loss = avg_loss
-                            early_stopping_counter = 0
+                            epochs_no_improve = 0
                         else:
-                            early_stopping_counter += 1
-                            print(f"[Early Stopping] Patience: {early_stopping_counter}/{early_stopping_patience} (Best: {best_epoch_loss:.4f}, Current: {avg_loss:.4f})")
+                            epochs_no_improve += 1
+                            print(f"⚠️ Plateau Alert: No significant improvement for {epochs_no_improve}/{early_stopping_patience} epochs.")
 
-                        if early_stopping_counter >= early_stopping_patience:
-                            print(f"🛑 Early Stopping Triggered! Loss plateaued for {early_stopping_patience} epochs.")
-                            send_status(f"🛑 Plateau detected. Stopping...")
-
-                            final_path = save_final_model(
-                                f"plateau_detected_loss_{avg_loss:.4f}", epoch + 1, global_step
-                            )
-
-                            # Cleanup
-                            accelerator.wait_for_everyone()
+                        if epochs_no_improve >= early_stopping_patience:
+                            print(f"🛑 STOPPING: Plateau detected. Saving best model and exiting node.")
+                            # CRITICAL: Use return to force-exit the ComfyUI node execution
+                            final_path = save_final_model(f"plateau_detected_loss_{avg_loss:.3f}", epoch + 1, global_step)
                             accelerator.free_memory()
-                            del model, optimizer, train_dataloader, qwen3tts
-                            if torch.cuda.is_available():
-                                torch.cuda.synchronize()
-                                torch.cuda.empty_cache()
-
-                            if accelerator.is_main_process:
-                                self._save_instruction_report(train_jsonl, full_output_dir)
-                                print(f"Fine-tuning stopped early. Model saved to {final_path}")
-                                return (final_path, speaker_name)
-                            else:
-                                return ("", "")
-                    # ------------------------------------
+                            return (final_path, speaker_name)
 
                 # Always save final model as epoch_N for consistent resume
                 send_status(f"Saving final model epoch {end_epoch}...")
