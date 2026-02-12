@@ -76,11 +76,16 @@ try:
 except ImportError:
     HAS_BNB = False
 try:
-    from qwen_asr import Qwen3ASRModel, ForcedAligner
-
+    # Try the new class name first (aliasing it for compatibility)
+    from qwen_asr import Qwen3ASRModel, Qwen3ForcedAligner as ForcedAligner
     HAS_QWEN_ASR = True
 except ImportError:
-    HAS_QWEN_ASR = False
+    try:
+        # Fallback to the old class name
+        from qwen_asr import Qwen3ASRModel, ForcedAligner
+        HAS_QWEN_ASR = True
+    except ImportError:
+        HAS_QWEN_ASR = False
 
 from torch.utils.data import DataLoader, Dataset
 from transformers import (
@@ -1842,6 +1847,26 @@ class Qwen3AudioToDataset:
                     ["tiny", "base", "small", "medium", "large", "large-v3"],
                     {"default": "medium"},
                 ),
+                "language": (
+                    [
+                        "Auto",
+                        "en",
+                        "es",
+                        "fr",
+                        "de",
+                        "it",
+                        "ja",
+                        "zh",
+                        "pt",
+                        "ru",
+                        "ko",
+                        "nl",
+                        "pl",
+                        "tr",
+                        "hi",
+                    ],
+                    {"default": "Auto"},
+                ),
             },
             "optional": {
                 "output_folder_name": ("STRING", {"default": "dataset_final"}),
@@ -1873,6 +1898,7 @@ class Qwen3AudioToDataset:
         self,
         audio_folder,
         model_size,
+        language="Auto",
         output_folder_name="dataset_final",
         min_duration=0.8,
         max_duration=15.0,
@@ -1883,6 +1909,8 @@ class Qwen3AudioToDataset:
             raise ImportError(
                 "Please install 'openai-whisper' and 'pydub' to use this node."
             )
+
+        lang_arg = None if language == "Auto" else language
 
         if not audio_folder or not audio_folder.strip():
             raise ValueError("Audio folder path is empty. Please select a valid folder.")
@@ -1957,7 +1985,7 @@ class Qwen3AudioToDataset:
                 continue
 
             # Transcribe
-            result = model.transcribe(filepath, language="es", verbose=False)
+            result = model.transcribe(filepath, language=lang_arg, verbose=False)
 
             file_count = 0
             for segment in result["segments"]:
@@ -2137,6 +2165,26 @@ class Qwen3TranscribeWhisper:
                     ["tiny", "base", "small", "medium", "large", "large-v3"],
                     {"default": "medium"},
                 ),
+                "language": (
+                    [
+                        "Auto",
+                        "en",
+                        "es",
+                        "fr",
+                        "de",
+                        "it",
+                        "ja",
+                        "zh",
+                        "pt",
+                        "ru",
+                        "ko",
+                        "nl",
+                        "pl",
+                        "tr",
+                        "hi",
+                    ],
+                    {"default": "Auto"},
+                ),
             },
             "optional": {
                 "output_dataset_folder": (
@@ -2175,6 +2223,7 @@ class Qwen3TranscribeWhisper:
         self,
         audio_list,
         whisper_model,
+        language="Auto",
         output_dataset_folder="dataset_final",
         min_duration=0.8,
         max_duration=60.0,
@@ -2186,6 +2235,8 @@ class Qwen3TranscribeWhisper:
             raise ImportError(
                 "Please install 'openai-whisper' and 'pydub' to use this node."
             )
+
+        lang_arg = None if language == "Auto" else language
 
         folder_path = audio_list["folder_path"]
         files = audio_list["files"]
@@ -2260,7 +2311,7 @@ class Qwen3TranscribeWhisper:
                 normalization_factor = float(1 << (8 * audio_for_whisper.sample_width - 1))
                 audio_np = samples.astype(np.float32) / normalization_factor
 
-                result = model.transcribe(audio_np, language="es", verbose=False)
+                result = model.transcribe(audio_np, language=lang_arg, verbose=False)
 
                 file_count = 0
                 for segment in result["segments"]:
