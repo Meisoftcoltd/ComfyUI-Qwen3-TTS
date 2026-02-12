@@ -4822,6 +4822,26 @@ class Qwen3ASRTranscribeDataset:
         return {
             "required": {
                 "audio_list": ("DATASET_AUDIO_LIST",),
+                "language": (
+                    [
+                        "Auto",
+                        "en",
+                        "es",
+                        "fr",
+                        "de",
+                        "it",
+                        "ja",
+                        "zh",
+                        "pt",
+                        "ru",
+                        "ko",
+                        "nl",
+                        "pl",
+                        "tr",
+                        "hi",
+                    ],
+                    {"default": "Auto"},
+                ),
             },
             "optional": {
                 "output_dataset_folder": (
@@ -4851,6 +4871,7 @@ class Qwen3ASRTranscribeDataset:
     def process(
         self,
         audio_list,
+        language="Auto",
         output_dataset_folder="dataset_final",
         min_duration=0.8,
         max_duration=60.0,
@@ -4902,7 +4923,8 @@ class Qwen3ASRTranscribeDataset:
                 # Assuming model accepts path or waveform. Using path for simplicity if supported.
                 # If Qwen3ASRModel expects specific input, we might need to load with librosa/torchaudio.
                 # Standard assumption: accepts path.
-                text = asr_model.transcribe(filepath)
+                lang_arg = language if language != "Auto" else None
+                text = asr_model.transcribe(filepath, language=lang_arg)
 
                 if not text or not text.strip():
                     continue
@@ -5015,6 +5037,26 @@ class Qwen3ASRTranscribeSingle:
         return {
             "required": {
                 "audio": ("AUDIO",),
+                "language": (
+                    [
+                        "Auto",
+                        "en",
+                        "es",
+                        "fr",
+                        "de",
+                        "it",
+                        "ja",
+                        "zh",
+                        "pt",
+                        "ru",
+                        "ko",
+                        "nl",
+                        "pl",
+                        "tr",
+                        "hi",
+                    ],
+                    {"default": "Auto"},
+                ),
             }
         }
 
@@ -5023,7 +5065,7 @@ class Qwen3ASRTranscribeSingle:
     FUNCTION = "transcribe"
     CATEGORY = "Qwen3-TTS/Utils"
 
-    def transcribe(self, audio):
+    def transcribe(self, audio, language="Auto"):
         if not HAS_QWEN_ASR:
             raise ImportError(
                 "Please install 'qwen-asr' to use this node."
@@ -5055,7 +5097,8 @@ class Qwen3ASRTranscribeSingle:
         sf.write(temp_wav, wav_np, sr)
 
         try:
-            text = model.transcribe(temp_wav)
+            lang_arg = language if language != "Auto" else None
+            text = model.transcribe(temp_wav, language=lang_arg)
         finally:
             if os.path.exists(temp_wav):
                 os.remove(temp_wav)
