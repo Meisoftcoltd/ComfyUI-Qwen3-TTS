@@ -76,11 +76,16 @@ try:
 except ImportError:
     HAS_BNB = False
 try:
-    from qwen_asr import Qwen3ASRModel, ForcedAligner
-
+    # Try the new class name first (aliasing it for compatibility)
+    from qwen_asr import Qwen3ASRModel, Qwen3ForcedAligner as ForcedAligner
     HAS_QWEN_ASR = True
 except ImportError:
-    HAS_QWEN_ASR = False
+    try:
+        # Fallback to the old class name
+        from qwen_asr import Qwen3ASRModel, ForcedAligner
+        HAS_QWEN_ASR = True
+    except ImportError:
+        HAS_QWEN_ASR = False
 
 from torch.utils.data import DataLoader, Dataset
 from transformers import (
