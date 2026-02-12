@@ -3135,7 +3135,7 @@ class Qwen3FineTune:
                 "weight_decay": (
                     "FLOAT",
                     {
-                        "default": 0.01,
+                        "default": 0.0,
                         "min": 0.0,
                         "max": 1.0,
                         "step": 0.001,
@@ -3178,7 +3178,7 @@ class Qwen3FineTune:
                 ),
                 "early_stopping_patience": (
                     "INT",
-                    {"default": 20, "min": 0, "max": 100, "tooltip": "Stop training if loss doesn't improve for N epochs."},
+                    {"default": 20, "min": 0, "max": 100, "tooltip": "Stop if no improvement after N epochs. Use 10 for small datasets, 20 for large."},
                 ),
                 "early_stopping_min_delta": (
                     "FLOAT",
@@ -3289,7 +3289,7 @@ class Qwen3FineTune:
         # --- TRACKER: Initialize best saved loss from existing files ---
         min_saved_loss = 999.0
         best_epoch_loss = float("inf")
-        early_stopping_counter = 0
+        epochs_no_improve = 0
 
         if os.path.exists(full_output_dir):
             for d in os.listdir(full_output_dir):
@@ -4035,38 +4035,21 @@ class Qwen3FineTune:
                     print(f"Epoch {epoch + 1}/{end_epoch} - Avg Loss: {avg_loss}")
                     send_status(f"Epoch {epoch + 1}/{end_epoch} - Loss: {avg_loss:.4f}")
 
-                    # --- EARLY STOPPING (Epoch-based) ---
-                    if early_stopping_patience > 0 and epoch >= start_epoch:
+                    # Early Stopping Logic
+                    if early_stopping_patience > 0:
                         if avg_loss < (best_epoch_loss - early_stopping_min_delta):
                             best_epoch_loss = avg_loss
-                            early_stopping_counter = 0
+                            epochs_no_improve = 0
                         else:
-                            early_stopping_counter += 1
-                            print(f"[Early Stopping] Patience: {early_stopping_counter}/{early_stopping_patience} (Best: {best_epoch_loss:.4f}, Current: {avg_loss:.4f})")
+                            epochs_no_improve += 1
+                            print(f"⚠️ Plateau Alert: No significant improvement for {epochs_no_improve}/{early_stopping_patience} epochs.")
 
-                        if early_stopping_counter >= early_stopping_patience:
-                            print(f"🛑 Early Stopping Triggered! Loss plateaued for {early_stopping_patience} epochs.")
-                            send_status(f"🛑 Plateau detected. Stopping...")
-
-                            final_path = save_final_model(
-                                f"plateau_detected_loss_{avg_loss:.4f}", epoch + 1, global_step
-                            )
-
-                            # Cleanup
-                            accelerator.wait_for_everyone()
+                        if epochs_no_improve >= early_stopping_patience:
+                            print(f"🛑 STOPPING: Plateau detected. Saving best model and exiting node.")
+                            # CRITICAL: Use return to force-exit the ComfyUI node execution
+                            final_path = save_final_model(f"plateau_detected_loss_{avg_loss:.3f}", epoch + 1, global_step)
                             accelerator.free_memory()
-                            del model, optimizer, train_dataloader, qwen3tts
-                            if torch.cuda.is_available():
-                                torch.cuda.synchronize()
-                                torch.cuda.empty_cache()
-
-                            if accelerator.is_main_process:
-                                self._save_instruction_report(train_jsonl, full_output_dir)
-                                print(f"Fine-tuning stopped early. Model saved to {final_path}")
-                                return (final_path, speaker_name)
-                            else:
-                                return ("", "")
-                    # ------------------------------------
+                            return (final_path, speaker_name)
 
                 # Always save final model as epoch_N for consistent resume
                 send_status(f"Saving final model epoch {end_epoch}...")
