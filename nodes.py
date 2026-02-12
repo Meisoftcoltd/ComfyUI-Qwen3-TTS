@@ -4991,7 +4991,7 @@ class Qwen3ASRTranscribeDataset:
 
                 # Align
                 # Returns list of {text, start, end}
-                alignment = aligner.align(filepath, text)
+                alignment = aligner.align(filepath, text, language=lang_arg)
 
             except Exception as e:
                 print(f"   [Error processing {filename}] {e}")
