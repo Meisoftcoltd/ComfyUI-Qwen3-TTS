@@ -3627,32 +3627,10 @@ class Qwen3FineTune:
                     if keys.missing_keys:
                         print(f"DEBUG: Missing keys during load: {len(keys.missing_keys)} (Expected for some PEFT setups)")
 
-                # DYNAMIC ID ALLOCATION LOGIC
-                config_path = os.path.join(init_model_path, "config.json")
-                existing_spk_ids = {}
-
-                try:
-                    with open(config_path, 'r', encoding='utf-8') as f:
-                        cfg_data = json.load(f)
-                    if "talker_config" in cfg_data and "spk_id" in cfg_data["talker_config"]:
-                        existing_spk_ids = cfg_data["talker_config"]["spk_id"]
-                except Exception as e:
-                    print(f"Warning: Could not read existing speaker config: {e}")
-
-                # Determine ID for the current speaker_name
-                target_spk_id = 3000 # Default
-
-                if speaker_name in existing_spk_ids:
-                    # Overwrite existing speaker (Refinement)
-                    target_spk_id = existing_spk_ids[speaker_name]
-                    print(f"♻️ Refining existing speaker '{speaker_name}' at ID {target_spk_id}")
-                else:
-                    # Allocate new ID
-                    used_ids = [v for k, v in existing_spk_ids.items() if isinstance(v, int)]
-                    # Start at 3000 if empty, otherwise max + 1
-                    start_id = 3000
-                    target_spk_id = max(used_ids) + 1 if used_ids else start_id
-                    print(f"🆕 Adding new speaker '{speaker_name}' at ID {target_spk_id}")
+                # SINGLE SPEAKER LOGIC (Reverted)
+                # Always assign the custom speaker to the standard ID (e.g., 3000)
+                target_spk_id = 3000
+                print(f"[Qwen3-TTS] 🟢 Single-Speaker Mode: Assigning '{speaker_name}' to ID {target_spk_id}")
 
                 # FORCE GRADIENTS ON
                 qwen3tts.model.train()
@@ -3972,255 +3950,262 @@ class Qwen3FineTune:
                     start_epoch * num_update_steps_per_epoch + resume_from_step
                 )  # Resume from correct optimizer step
 
-                for epoch in range(start_epoch, end_epoch):
-                    epoch_loss = 0
-                    steps = 0
-                    send_status(f"Epoch {epoch + 1}/{end_epoch} - Training...")
-                    for batch in train_dataloader:
-                        with accelerator.accumulate(model):
-                            # Debug info (only on first batch of first epoch in this run)
-                            if steps == 0 and epoch == start_epoch:
-                                print(f"DEBUG: Grad Enabled: {torch.is_grad_enabled()}")
-                                print(
-                                    f"DEBUG: Inference Mode: {torch.is_inference_mode_enabled()}"
-                                )
-                                for n, p in model.named_parameters():
-                                    if p.requires_grad:
-                                        print(f"DEBUG: Parameter {n} requires grad.")
-                                        break
-
-                            # Data extraction logic from sft_12hz.py
-                            input_ids = batch["input_ids"]
-                            codec_ids = batch["codec_ids"]
-                            ref_mels = batch["ref_mels"]
-                            text_embedding_mask = batch["text_embedding_mask"]
-                            codec_embedding_mask = batch["codec_embedding_mask"]
-                            attention_mask = batch["attention_mask"]
-                            codec_0_labels = batch["codec_0_labels"]
-                            codec_mask = batch["codec_mask"]
-
-                            # Unwrap model to access attributes (DDP/FSDP wrappers hide them)
-                            unwrapped_model = accelerator.unwrap_model(model)
-
-                            # Get device/dtype from model parameters (DDP wrappers don't expose these directly)
-                            model_dtype = next(unwrapped_model.parameters()).dtype
-                            model_device = next(unwrapped_model.parameters()).device
-                            speaker_embedding = unwrapped_model.speaker_encoder(
-                                ref_mels.to(model_device).to(model_dtype)
-                            ).detach()
-                            if target_speaker_embedding is None:
-                                target_speaker_embedding = speaker_embedding
-
-                            input_text_ids = input_ids[:, :, 0]
-                            input_codec_ids = input_ids[:, :, 1]
-
-                            # Use unwrapped model for attribute access (DDP/FSDP wrappers hide them)
-                            current_model = unwrapped_model
-
-                            # Debug Gradient Flow
-                            if steps == 0 and epoch == start_epoch:
-                                print(
-                                    f"DEBUG: Model Training Mode: {current_model.training}"
-                                )
-                                # Check embedding layer grad
-                                emb_layer = current_model.talker.model.text_embedding
-                                print(
-                                    f"DEBUG: Text Embedding Layer Weight requires_grad: {emb_layer.weight.requires_grad}"
-                                )
-
-                            # 0.6B model requires text_projection for dimension matching (1024 -> 2048)
-                            raw_text_embedding = (
-                                current_model.talker.model.text_embedding(
-                                    input_text_ids
-                                )
-                            )
-                            if "0.6B" in init_model:
-                                input_text_embedding = (
-                                    current_model.talker.text_projection(
-                                        raw_text_embedding
-                                    )
-                                    * text_embedding_mask
-                                )
-                            else:
-                                input_text_embedding = (
-                                    raw_text_embedding * text_embedding_mask
-                                )
-                            input_codec_embedding = (
-                                current_model.talker.model.codec_embedding(
-                                    input_codec_ids
-                                )
-                                * codec_embedding_mask
-                            )
-                            input_codec_embedding[:, 6, :] = speaker_embedding
-
-                            input_embeddings = (
-                                input_text_embedding + input_codec_embedding
-                            )
-
-                            if steps == 0 and epoch == start_epoch:
-                                print(
-                                    f"DEBUG: input_text_embedding requires_grad: {input_text_embedding.requires_grad}"
-                                )
-                                print(
-                                    f"DEBUG: input_codec_embedding requires_grad: {input_codec_embedding.requires_grad}"
-                                )
-                                print(
-                                    f"DEBUG: input_embeddings requires_grad: {input_embeddings.requires_grad}"
-                                )
-
-                            for i in range(1, 16):
-                                codec_i_embedding = current_model.talker.code_predictor.get_input_embeddings()[
-                                    i - 1
-                                ](
-                                    codec_ids[:, :, i]
-                                )
-                                codec_i_embedding = (
-                                    codec_i_embedding * codec_mask.unsqueeze(-1)
-                                )
-                                input_embeddings = input_embeddings + codec_i_embedding
-
-                            outputs = current_model.talker(
-                                inputs_embeds=input_embeddings[:, :-1, :],
-                                attention_mask=attention_mask[:, :-1],
-                                labels=codec_0_labels[:, 1:],
-                                output_hidden_states=True,
-                            )
-
-                            hidden_states = outputs.hidden_states[0][-1]
-                            talker_hidden_states = hidden_states[codec_mask[:, 1:]]
-                            talker_codec_ids = codec_ids[codec_mask]
-
-                            sub_talker_logits, sub_talker_loss = (
-                                current_model.talker.forward_sub_talker_finetune(
-                                    talker_codec_ids, talker_hidden_states
-                                )
-                            )
-
-                            loss = outputs.loss + sub_talker_loss
-
-                            if steps == 0 and epoch == start_epoch:
-                                print(
-                                    f"DEBUG: Loss requires_grad: {loss.requires_grad}"
-                                )
-                                if not loss.requires_grad:
+                try:
+                    for epoch in range(start_epoch, end_epoch):
+                        epoch_loss = 0
+                        steps = 0
+                        send_status(f"Epoch {epoch + 1}/{end_epoch} - Training...")
+                        for batch in train_dataloader:
+                            with accelerator.accumulate(model):
+                                # Debug info (only on first batch of first epoch in this run)
+                                if steps == 0 and epoch == start_epoch:
+                                    print(f"DEBUG: Grad Enabled: {torch.is_grad_enabled()}")
                                     print(
-                                        f"DEBUG: outputs.loss requires_grad: {outputs.loss.requires_grad if outputs.loss is not None else 'None'}"
+                                        f"DEBUG: Inference Mode: {torch.is_inference_mode_enabled()}"
                                     )
+                                    for n, p in model.named_parameters():
+                                        if p.requires_grad:
+                                            print(f"DEBUG: Parameter {n} requires grad.")
+                                            break
+
+                                # Data extraction logic from sft_12hz.py
+                                input_ids = batch["input_ids"]
+                                codec_ids = batch["codec_ids"]
+                                ref_mels = batch["ref_mels"]
+                                text_embedding_mask = batch["text_embedding_mask"]
+                                codec_embedding_mask = batch["codec_embedding_mask"]
+                                attention_mask = batch["attention_mask"]
+                                codec_0_labels = batch["codec_0_labels"]
+                                codec_mask = batch["codec_mask"]
+
+                                # Unwrap model to access attributes (DDP/FSDP wrappers hide them)
+                                unwrapped_model = accelerator.unwrap_model(model)
+
+                                # Get device/dtype from model parameters (DDP wrappers don't expose these directly)
+                                model_dtype = next(unwrapped_model.parameters()).dtype
+                                model_device = next(unwrapped_model.parameters()).device
+                                speaker_embedding = unwrapped_model.speaker_encoder(
+                                    ref_mels.to(model_device).to(model_dtype)
+                                ).detach()
+                                if target_speaker_embedding is None:
+                                    target_speaker_embedding = speaker_embedding
+
+                                input_text_ids = input_ids[:, :, 0]
+                                input_codec_ids = input_ids[:, :, 1]
+
+                                # Use unwrapped model for attribute access (DDP/FSDP wrappers hide them)
+                                current_model = unwrapped_model
+
+                                # Debug Gradient Flow
+                                if steps == 0 and epoch == start_epoch:
                                     print(
-                                        f"DEBUG: sub_talker_loss requires_grad: {sub_talker_loss.requires_grad}"
+                                        f"DEBUG: Model Training Mode: {current_model.training}"
+                                    )
+                                    # Check embedding layer grad
+                                    emb_layer = current_model.talker.model.text_embedding
+                                    print(
+                                        f"DEBUG: Text Embedding Layer Weight requires_grad: {emb_layer.weight.requires_grad}"
                                     )
 
-                            accelerator.backward(loss)
-
-                            if accelerator.sync_gradients:
-                                if max_grad_norm > 0:
-                                    accelerator.clip_grad_norm_(
-                                        model.parameters(), max_grad_norm
+                                # 0.6B model requires text_projection for dimension matching (1024 -> 2048)
+                                raw_text_embedding = (
+                                    current_model.talker.model.text_embedding(
+                                        input_text_ids
                                     )
-
-                            optimizer.step()
-                            if scheduler:
-                                scheduler.step()
-                            optimizer.zero_grad()
-
-                            epoch_loss += loss.item()
-                            steps += 1
-
-                            # Check for NaN loss
-                            if math.isnan(loss.item()):
-                                print(f"\n❌ [Qwen3-TTS] ERROR: Loss is NaN at epoch {epoch+1}, step {global_step}. Aborting training.")
-                                send_status("❌ Training aborted: Loss is NaN")
-                                accelerator.free_memory()
-                                del model, optimizer, train_dataloader, qwen3tts
-                                if torch.cuda.is_available():
-                                    torch.cuda.empty_cache()
-                                raise ValueError("Training Aborted: Loss became NaN (diverged). Try lowering learning rate or increasing batch size.")
-
-                            current_loss_val = loss.item()
-
-                            # --- LOGICA DE TARGET LOSS (STOP) ---
-                            if target_loss > 0 and current_loss_val <= target_loss and global_step > actual_warmup_steps:
-                                if accelerator.is_main_process:
-                                    print(f"🎯 Target Reached (Loss {current_loss_val:.4f}). Saving and exiting.")
-                                    send_status(f"🎯 Target Loss reached: {current_loss_val:.4f}")
-
-                                final_path = save_final_model(
-                                    f"target_reached_loss_{current_loss_val:.4f}", epoch, global_step
                                 )
-
-                                # Only the main process returns a path, others might return None from save_final_model
-                                # But we need to sync exit.
-                                accelerator.wait_for_everyone()
-
-                                accelerator.free_memory()
-                                del model, optimizer, train_dataloader, qwen3tts
-                                if torch.cuda.is_available():
-                                    torch.cuda.synchronize()
-                                    torch.cuda.empty_cache()
-
-                                if accelerator.is_main_process:
-                                    self._save_instruction_report(train_jsonl, full_output_dir)
-                                    print(f"Fine-tuning complete (Target Reached). Model saved to {final_path}")
-                                    send_status("Training complete (Target Reached)!")
-                                    return (final_path, speaker_name)
+                                if "0.6B" in init_model:
+                                    input_text_embedding = (
+                                        current_model.talker.text_projection(
+                                            raw_text_embedding
+                                        )
+                                        * text_embedding_mask
+                                    )
                                 else:
-                                    # Non-main processes just exit gracefully (return empty/dummy)
-                                    return ("", "")
-                            # -----------------------------
+                                    input_text_embedding = (
+                                        raw_text_embedding * text_embedding_mask
+                                    )
+                                input_codec_embedding = (
+                                    current_model.talker.model.codec_embedding(
+                                        input_codec_ids
+                                    )
+                                    * codec_embedding_mask
+                                )
+                                input_codec_embedding[:, 6, :] = speaker_embedding
 
-                            # --- LOGICA DE SAVE LOSS THRESHOLD (CHECKPOINT) ---
-                            if save_loss_threshold > 0 and current_loss_val <= save_loss_threshold:
-                                # Check if improvement exceeds the user-defined buffer
-                                if current_loss_val < (min_saved_loss - save_loss_buffer):
-                                    loss_str = f"{current_loss_val:.3f}"
-                                    ckpt_name = f"ckpt_loss_{loss_str}"
+                                input_embeddings = (
+                                    input_text_embedding + input_codec_embedding
+                                )
+
+                                if steps == 0 and epoch == start_epoch:
+                                    print(
+                                        f"DEBUG: input_text_embedding requires_grad: {input_text_embedding.requires_grad}"
+                                    )
+                                    print(
+                                        f"DEBUG: input_codec_embedding requires_grad: {input_codec_embedding.requires_grad}"
+                                    )
+                                    print(
+                                        f"DEBUG: input_embeddings requires_grad: {input_embeddings.requires_grad}"
+                                    )
+
+                                for i in range(1, 16):
+                                    codec_i_embedding = current_model.talker.code_predictor.get_input_embeddings()[
+                                        i - 1
+                                    ](
+                                        codec_ids[:, :, i]
+                                    )
+                                    codec_i_embedding = (
+                                        codec_i_embedding * codec_mask.unsqueeze(-1)
+                                    )
+                                    input_embeddings = input_embeddings + codec_i_embedding
+
+                                outputs = current_model.talker(
+                                    inputs_embeds=input_embeddings[:, :-1, :],
+                                    attention_mask=attention_mask[:, :-1],
+                                    labels=codec_0_labels[:, 1:],
+                                    output_hidden_states=True,
+                                )
+
+                                hidden_states = outputs.hidden_states[0][-1]
+                                talker_hidden_states = hidden_states[codec_mask[:, 1:]]
+                                talker_codec_ids = codec_ids[codec_mask]
+
+                                sub_talker_logits, sub_talker_loss = (
+                                    current_model.talker.forward_sub_talker_finetune(
+                                        talker_codec_ids, talker_hidden_states
+                                    )
+                                )
+
+                                loss = outputs.loss + sub_talker_loss
+
+                                if steps == 0 and epoch == start_epoch:
+                                    print(
+                                        f"DEBUG: Loss requires_grad: {loss.requires_grad}"
+                                    )
+                                    if not loss.requires_grad:
+                                        print(
+                                            f"DEBUG: outputs.loss requires_grad: {outputs.loss.requires_grad if outputs.loss is not None else 'None'}"
+                                        )
+                                        print(
+                                            f"DEBUG: sub_talker_loss requires_grad: {sub_talker_loss.requires_grad}"
+                                        )
+
+                                accelerator.backward(loss)
+
+                                if accelerator.sync_gradients:
+                                    if max_grad_norm > 0:
+                                        accelerator.clip_grad_norm_(
+                                            model.parameters(), max_grad_norm
+                                        )
+
+                                optimizer.step()
+                                if scheduler:
+                                    scheduler.step()
+                                optimizer.zero_grad()
+
+                                epoch_loss += loss.item()
+                                steps += 1
+
+                                # Check for NaN loss
+                                if math.isnan(loss.item()):
+                                    print(f"\n❌ [Qwen3-TTS] ERROR: Loss is NaN at epoch {epoch+1}, step {global_step}. Aborting training.")
+                                    send_status("❌ Training aborted: Loss is NaN")
+                                    accelerator.free_memory()
+                                    del model, optimizer, train_dataloader, qwen3tts
+                                    if torch.cuda.is_available():
+                                        torch.cuda.empty_cache()
+                                    raise ValueError("Training Aborted: Loss became NaN (diverged). Try lowering learning rate or increasing batch size.")
+
+                                current_loss_val = loss.item()
+
+                                # --- LOGICA DE TARGET LOSS (STOP) ---
+                                if target_loss > 0 and current_loss_val <= target_loss and global_step > actual_warmup_steps:
+                                    if accelerator.is_main_process:
+                                        print(f"🎯 Target Reached (Loss {current_loss_val:.4f}). Saving and exiting.")
+                                        send_status(f"🎯 Target Loss reached: {current_loss_val:.4f}")
+
+                                    final_path = save_final_model(
+                                        f"target_reached_loss_{current_loss_val:.4f}", epoch, global_step
+                                    )
+
+                                    # Only the main process returns a path, others might return None from save_final_model
+                                    # But we need to sync exit.
+                                    accelerator.wait_for_everyone()
+
+                                    accelerator.free_memory()
+                                    del model, optimizer, train_dataloader, qwen3tts
+                                    if torch.cuda.is_available():
+                                        torch.cuda.synchronize()
+                                        torch.cuda.empty_cache()
 
                                     if accelerator.is_main_process:
-                                        print(f"\n💾 [Qwen3-TTS] Loss Milestone: {current_loss_val:.4f} (Improved by >{save_loss_buffer} over {min_saved_loss})")
-                                        send_status(f"Saving milestone (Loss {current_loss_val:.3f})...")
+                                        self._save_instruction_report(train_jsonl, full_output_dir)
+                                        print(f"Fine-tuning complete (Target Reached). Model saved to {final_path}")
+                                        send_status("Training complete (Target Reached)!")
+                                        return (final_path, speaker_name)
+                                    else:
+                                        # Non-main processes just exit gracefully (return empty/dummy)
+                                        return ("", "")
+                                # -----------------------------
 
-                                    save_training_checkpoint(ckpt_name, epoch, global_step)
+                                # --- LOGICA DE SAVE LOSS THRESHOLD (CHECKPOINT) ---
+                                if save_loss_threshold > 0 and current_loss_val <= save_loss_threshold:
+                                    # Check if improvement exceeds the user-defined buffer
+                                    if current_loss_val < (min_saved_loss - save_loss_buffer):
+                                        loss_str = f"{current_loss_val:.3f}"
+                                        ckpt_name = f"ckpt_loss_{loss_str}"
 
-                                    # Update tracker
-                                    min_saved_loss = current_loss_val
-                            # -----------------------------
+                                        if accelerator.is_main_process:
+                                            print(f"\n💾 [Qwen3-TTS] Loss Milestone: {current_loss_val:.4f} (Improved by >{save_loss_buffer} over {min_saved_loss})")
+                                            send_status(f"Saving milestone (Loss {current_loss_val:.3f})...")
 
-                            # Only count optimizer steps (after gradient accumulation completes)
-                            if accelerator.sync_gradients:
-                                global_step += 1
+                                        save_training_checkpoint(ckpt_name, epoch, global_step)
 
-                                if unique_id:
-                                    PromptServer.instance.send_sync("progress", {"value": global_step, "max": total_optimizer_steps}, unique_id)
+                                        # Update tracker
+                                        min_saved_loss = current_loss_val
+                                # -----------------------------
 
-                                # Show step progress periodically
-                                if (
-                                    log_every_steps > 0
-                                    and global_step % log_every_steps == 0
-                                ):
-                                    lr_val = optimizer.param_groups[0]["lr"]
-                                    status = f"Step {global_step}/{total_optimizer_steps}, Loss: {loss.item():.4f}, LR: {lr_val:.8f}"
-                                    print(status)
-                                    send_status(status)
+                                # Only count optimizer steps (after gradient accumulation completes)
+                                if accelerator.sync_gradients:
+                                    global_step += 1
 
-                    avg_loss = epoch_loss / steps if steps > 0 else 0
-                    print(f"Epoch {epoch + 1}/{end_epoch} - Avg Loss: {avg_loss}")
-                    send_status(f"Epoch {epoch + 1}/{end_epoch} - Loss: {avg_loss:.4f}")
+                                    if unique_id:
+                                        PromptServer.instance.send_sync("progress", {"value": global_step, "max": total_optimizer_steps}, unique_id)
 
-                    # Early Stopping Logic
-                    if early_stopping_patience > 0:
-                        if avg_loss < (best_epoch_loss - early_stopping_min_delta):
-                            best_epoch_loss = avg_loss
-                            epochs_no_improve = 0
-                        else:
-                            epochs_no_improve += 1
-                            print(f"⚠️ Plateau Alert: No significant improvement for {epochs_no_improve}/{early_stopping_patience} epochs.")
+                                    # Show step progress periodically
+                                    if (
+                                        log_every_steps > 0
+                                        and global_step % log_every_steps == 0
+                                    ):
+                                        lr_val = optimizer.param_groups[0]["lr"]
+                                        status = f"Step {global_step}/{total_optimizer_steps}, Loss: {loss.item():.4f}, LR: {lr_val:.8f}"
+                                        print(status)
+                                        send_status(status)
 
-                        if epochs_no_improve >= early_stopping_patience:
-                            print(f"🛑 STOPPING: Plateau detected. Saving best model and exiting node.")
-                            # CRITICAL: Use return to force-exit the ComfyUI node execution
-                            final_path = save_final_model(f"plateau_detected_loss_{avg_loss:.3f}", epoch + 1, global_step)
-                            accelerator.free_memory()
-                            return (final_path, speaker_name)
+                        avg_loss = epoch_loss / steps if steps > 0 else 0
+                        print(f"Epoch {epoch + 1}/{end_epoch} - Avg Loss: {avg_loss}")
+                        send_status(f"Epoch {epoch + 1}/{end_epoch} - Loss: {avg_loss:.4f}")
+
+                        # Early Stopping Logic
+                        if early_stopping_patience > 0:
+                            if avg_loss < (best_epoch_loss - early_stopping_min_delta):
+                                best_epoch_loss = avg_loss
+                                epochs_no_improve = 0
+                            else:
+                                epochs_no_improve += 1
+                                print(f"⚠️ Plateau Alert: No significant improvement for {epochs_no_improve}/{early_stopping_patience} epochs.")
+
+                            if epochs_no_improve >= early_stopping_patience:
+                                print(f"🛑 STOPPING: Plateau detected. Saving best model and exiting node.")
+                                # CRITICAL: Use return to force-exit the ComfyUI node execution
+                                final_path = save_final_model(f"plateau_detected_loss_{avg_loss:.3f}", epoch + 1, global_step)
+                                accelerator.free_memory()
+                                return (final_path, speaker_name)
+
+                except Exception as e:
+                    print(f"[Qwen3-TTS] Training interrupted/failed: {e}")
+                    # Try to save latest checkpoint if possible
+                    save_final_model(f"interrupted_epoch_{epoch}_step_{global_step}", epoch, global_step)
+                    raise e
 
                 # Always save final model as epoch_N for consistent resume
                 send_status(f"Saving final model epoch {end_epoch}...")
@@ -4949,11 +4934,11 @@ class Qwen3ASRTranscribeDataset:
             "ar": "Arabic"
         }
 
+        if language == "Auto":
+             raise ValueError("Language 'Auto' is not supported for Qwen-ASR. Please select a specific language.")
+
         # Resolve language argument
-        lang_arg = None
-        if language != "Auto":
-            # Translate 'ja' -> 'Japanese', fallback to raw string if not found
-            lang_arg = ISO_TO_FULL.get(language, language)
+        lang_arg = ISO_TO_FULL.get(language, language)
 
         # Process
         for idx, filename in enumerate(tqdm(files, desc="Processing Audio", unit="file")):
@@ -5166,11 +5151,11 @@ class Qwen3ASRTranscribeSingle:
                 "ar": "Arabic"
             }
 
+            if language == "Auto":
+                 raise ValueError("Language 'Auto' is not supported for Qwen-ASR. Please select a specific language.")
+
             # Resolve language argument
-            lang_arg = None
-            if language != "Auto":
-                # Translate 'ja' -> 'Japanese', fallback to raw string if not found
-                lang_arg = ISO_TO_FULL.get(language, language)
+            lang_arg = ISO_TO_FULL.get(language, language)
 
             raw_output = model.transcribe(temp_wav, language=lang_arg)
 
