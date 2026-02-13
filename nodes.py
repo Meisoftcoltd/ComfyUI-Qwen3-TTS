@@ -1172,21 +1172,37 @@ class Qwen3CustomVoice:
         # Standard Qwen3-TTS speakers that are always allowed
         STANDARD_SPEAKERS = ['Aiden', 'Dylan', 'Eric', 'Ono_Anna', 'Pod', 'Ryan', 'Serena', 'Sohee', 'Uncle_Fu', 'Vivian']
 
-        # Check if we need to bypass validation
-        use_masquerade = target_speaker not in STANDARD_SPEAKERS
-        masquerade_target = "Vivian" # The 'Trojan Horse' name
-        original_spk_id_map = None
         model_ref = model.model # Access inner Qwen3TTS wrapper
 
+        # Check if speaker exists in config (to avoid unnecessary masquerade)
+        speaker_in_config = False
         cfg_ref = None
+
+        if hasattr(model_ref, "talker") and hasattr(model_ref.talker, "config"):
+            cfg_ref = model_ref.talker.config
+        elif hasattr(model_ref, "config"): # Fallback
+            cfg_ref = model_ref.config
+
+        if cfg_ref and hasattr(cfg_ref, "spk_id"):
+            if target_speaker in cfg_ref.spk_id:
+                speaker_in_config = True
+            else:
+                # Case-insensitive check
+                for k in cfg_ref.spk_id.keys():
+                    if k.lower() == target_speaker.lower():
+                        speaker_in_config = True
+                        target_speaker = k # Normalize name
+                        break
+
+        # Check if we need to bypass validation
+        # Only masquerade if it's NOT standard AND NOT in config
+        use_masquerade = (target_speaker not in STANDARD_SPEAKERS) and (not speaker_in_config)
+
+        masquerade_target = "Vivian" # The 'Trojan Horse' name
+        original_spk_id_map = None
+
         if use_masquerade:
             print(f"[Qwen3-TTS] 🛡️ Bypassing library validation for custom speaker '{target_speaker}'...")
-
-            # Try to find the inner config to patch
-            if hasattr(model_ref, "talker") and hasattr(model_ref.talker, "config"):
-                cfg_ref = model_ref.talker.config
-            elif hasattr(model_ref, "config"): # Fallback
-                cfg_ref = model_ref.config
 
             if cfg_ref and hasattr(cfg_ref, "spk_id"):
                 original_spk_id_map = cfg_ref.spk_id.copy() # Backup
@@ -1209,6 +1225,9 @@ class Qwen3CustomVoice:
                     target_speaker = masquerade_target
                 else:
                     print(f"[Qwen3-TTS] ⚠️ Warning: Custom speaker '{target_speaker}' ID not found in config map. Bypass might fail.")
+        else:
+             if speaker_in_config:
+                  print(f"[Qwen3-TTS] Custom speaker '{target_speaker}' found in config. Using natively.")
 
         gen_kwargs = {
             "top_p": top_p,
