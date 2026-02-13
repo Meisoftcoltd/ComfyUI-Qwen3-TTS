@@ -1169,65 +1169,49 @@ class Qwen3CustomVoice:
             target_speaker = custom_speaker_name.strip()
             print(f"Using custom speaker: {target_speaker}")
 
-        # Standard Qwen3-TTS speakers that are always allowed
-        STANDARD_SPEAKERS = ['Aiden', 'Dylan', 'Eric', 'Ono_Anna', 'Pod', 'Ryan', 'Serena', 'Sohee', 'Uncle_Fu', 'Vivian']
+        # ---------------------------------------------------------
+        # RUNTIME INJECTION: THE DEFINITIVE FIX
+        # Forcefully ensure the speaker ID map is updated in the LIVE model instance
+        # ---------------------------------------------------------
 
-        model_ref = model.model # Access inner Qwen3TTS wrapper
+        model_ref = model.model
+        configs_to_check = []
 
-        # Check if speaker exists in config (to avoid unnecessary masquerade)
-        speaker_in_config = False
-        cfg_ref = None
-
+        # Collect all reachable config objects
+        if hasattr(model_ref, "config"): configs_to_check.append(model_ref.config)
         if hasattr(model_ref, "talker") and hasattr(model_ref.talker, "config"):
-            cfg_ref = model_ref.talker.config
-        elif hasattr(model_ref, "config"): # Fallback
-            cfg_ref = model_ref.config
+            configs_to_check.append(model_ref.talker.config)
+        if hasattr(model, "config"): configs_to_check.append(model.config)
 
-        if cfg_ref and hasattr(cfg_ref, "spk_id"):
-            if target_speaker in cfg_ref.spk_id:
-                speaker_in_config = True
-            else:
-                # Case-insensitive check
-                for k in cfg_ref.spk_id.keys():
-                    if k.lower() == target_speaker.lower():
-                        speaker_in_config = True
-                        target_speaker = k # Normalize name
-                        break
+        injected = False
+        target_id = 3000 # Standard Fine-Tune ID
 
-        # Check if we need to bypass validation
-        # Only masquerade if it's NOT standard AND NOT in config
-        use_masquerade = (target_speaker not in STANDARD_SPEAKERS) and (not speaker_in_config)
+        for cfg in configs_to_check:
+            # 1. Force model type to 'custom_voice' (Required for generate_custom_voice)
+            if hasattr(cfg, "tts_model_type") and cfg.tts_model_type != "custom_voice":
+                print(f"[Qwen3-TTS] 🔧 Auto-Fixing tts_model_type='custom_voice' on config {id(cfg)}")
+                cfg.tts_model_type = "custom_voice"
 
-        masquerade_target = "Vivian" # The 'Trojan Horse' name
-        original_spk_id_map = None
+            # 2. Inject Speaker ID
+            t_cfg = getattr(cfg, "talker_config", None)
+            if t_cfg:
+                if not hasattr(t_cfg, "spk_id") or t_cfg.spk_id is None:
+                    t_cfg.spk_id = {}
 
-        if use_masquerade:
-            print(f"[Qwen3-TTS] 🛡️ Bypassing library validation for custom speaker '{target_speaker}'...")
+                # If speaker missing, inject it
+                if target_speaker not in t_cfg.spk_id:
+                    print(f"[Qwen3-TTS] 💉 Runtime Injecting '{target_speaker}' -> ID {target_id}")
+                    t_cfg.spk_id[target_speaker] = target_id
 
-            if cfg_ref and hasattr(cfg_ref, "spk_id"):
-                original_spk_id_map = cfg_ref.spk_id.copy() # Backup
+                    if not hasattr(t_cfg, "spk_is_dialect") or t_cfg.spk_is_dialect is None:
+                        t_cfg.spk_is_dialect = {}
+                    t_cfg.spk_is_dialect[target_speaker] = False
+                    injected = True
 
-                # Find ID of our custom speaker (e.g., 3000)
-                custom_id = original_spk_id_map.get(target_speaker)
+        if injected:
+            print("[Qwen3-TTS] ✅ Speaker injection successful. Proceeding to generation.")
 
-                # Try case-insensitive lookup if exact match fails
-                if custom_id is None:
-                     for k, v in original_spk_id_map.items():
-                         if k.lower() == target_speaker.lower():
-                             custom_id = v
-                             break
-
-                if custom_id is not None:
-                    # THE SWAP: Point 'Vivian' to ID 3000
-                    cfg_ref.spk_id[masquerade_target] = custom_id
-                    print(f"[Qwen3-TTS] 🔧 Masquerade active: '{masquerade_target}' -> ID {custom_id}")
-                    # trick the library into accepting the call
-                    target_speaker = masquerade_target
-                else:
-                    print(f"[Qwen3-TTS] ⚠️ Warning: Custom speaker '{target_speaker}' ID not found in config map. Bypass might fail.")
-        else:
-             if speaker_in_config:
-                  print(f"[Qwen3-TTS] Custom speaker '{target_speaker}' found in config. Using natively.")
+        # ---------------------------------------------------------
 
         gen_kwargs = {
             "top_p": top_p,
@@ -1236,7 +1220,6 @@ class Qwen3CustomVoice:
         }
 
         try:
-            # Call generation (asking for 'Vivian' if masquerading, but getting Custom Voice)
             try:
                 wavs, sr = model.generate_custom_voice(
                     text=text,
@@ -1247,7 +1230,6 @@ class Qwen3CustomVoice:
                     **gen_kwargs,
                 )
             except TypeError:
-                # Fallback for older library versions without kwargs
                 print(
                     "Warning: Model generation function does not support extra parameters (top_p, temperature, repetition_penalty). Ignoring them."
                 )
@@ -1259,18 +1241,12 @@ class Qwen3CustomVoice:
                     max_new_tokens=max_new_tokens,
                 )
         except ValueError as e:
-            # Catch model type mismatch errors from qwen-tts
             msg = str(e)
             if "does not support generate_custom_voice" in msg:
                 raise ValueError(
                     "Model Type Error: You are trying to use 'Custom Voice' with an incompatible model. Please load a 'CustomVoice' model (e.g. Qwen3-TTS-12Hz-1.7B-CustomVoice)."
                 ) from e
             raise e
-        finally:
-            # CRITICAL: Restore the config to avoid polluting the model state
-            if use_masquerade and original_spk_id_map and cfg_ref:
-                cfg_ref.spk_id = original_spk_id_map
-                print("[Qwen3-TTS] 🛡️ Config restored.")
 
         return (convert_audio(wavs[0], sr),)
 
