@@ -979,8 +979,8 @@ class Qwen3CustomVoice:
                 "seed": ("INT", {"default": 42, "min": 1, "max": 0xFFFFFFFFFFFFFFFF}),
             },
             "optional": {
-                "instruct": ("STRING", {"multiline": True, "default": ""}),
-                "custom_speaker_name": ("STRING", {"default": ""}),
+                "instruct": ("STRING", {"multiline": True, "default": "", "tooltip": "Instruction for tone/emotion (e.g. 'Happy voice')."}),
+                "custom_speaker_name": ("STRING", {"default": "", "tooltip": "Manually type speaker name if not in list (e.g. 'Neylis')."}),
                 "max_new_tokens": (
                     "INT",
                     {"default": 2048, "min": 64, "max": 8192, "step": 64},
@@ -1000,28 +1000,14 @@ class Qwen3CustomVoice:
                         "min": 1.0,
                         "max": 2.0,
                         "step": 0.01,
-                        "tooltip": "Penalty for repetition. Increase (e.g., 1.1-1.2) to prevent infinite loops/stuttering.",
                     },
                 ),
             },
         }
 
     @classmethod
-    def IS_CHANGED(
-        s,
-        model,
-        text,
-        language,
-        speaker,
-        seed,
-        instruct="",
-        custom_speaker_name="",
-        max_new_tokens=8192,
-        top_p=0.8,
-        temperature=0.7,
-        repetition_penalty=1.1,
-    ):
-        return seed
+    def IS_CHANGED(s, **kwargs):
+        return kwargs.get("seed", 0)
 
     RETURN_TYPES = ("AUDIO",)
     FUNCTION = "generate"
@@ -1044,13 +1030,61 @@ class Qwen3CustomVoice:
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
+
         lang = language if language != "Auto" else None
         inst = instruct if instruct.strip() != "" else None
 
-        target_speaker = speaker
+        # 1. Determine the actual user target speaker
+        target_name_user = speaker
         if custom_speaker_name and custom_speaker_name.strip() != "":
-            target_speaker = custom_speaker_name.strip()
-            print(f"Using custom speaker: {target_speaker}")
+            target_name_user = custom_speaker_name.strip()
+
+        print(f"[Qwen3-TTS] Requesting generation for speaker: '{target_name_user}'")
+
+        # 2. List of "VIP" names that the library safely allows
+        STANDARD_SPEAKERS = ['Aiden', 'Dylan', 'Eric', 'Ono_Anna', 'Pod', 'Ryan', 'Serena', 'Sohee', 'Uncle_Fu', 'Vivian']
+
+        # 3. Masquerade Logic
+        # If the user requests a non-standard name (e.g. "Neylis"), we will ask the library for "Vivian",
+        # but temporarily switch Vivian's ID to Neylis's ID (3000).
+        use_masquerade = target_name_user not in STANDARD_SPEAKERS
+
+        # Safe name to pass to the function (the "Trojan Horse")
+        library_safe_name = target_name_user
+
+        # Variables for restoration
+        model_ref = model.model
+        cfg_ref = None
+        original_spk_id_map = None
+
+        if use_masquerade:
+            print(f"[Qwen3-TTS] 🎭 Activating Masquerade: '{target_name_user}' will wear the mask of 'Vivian'.")
+            library_safe_name = "Vivian" # Use Vivian as mask
+            custom_id = 3000 # Standard ID for Single Speaker Fine-Tuning
+
+            # Locate internal configuration
+            if hasattr(model_ref, "talker") and hasattr(model_ref.talker, "config"):
+                cfg_ref = model_ref.talker.config
+            elif hasattr(model_ref, "config"):
+                cfg_ref = model_ref.config
+
+            # Apply temporary patch
+            if cfg_ref and hasattr(cfg_ref, "spk_id"):
+                original_spk_id_map = cfg_ref.spk_id.copy() # Backup
+
+                # If name exists in map (injected by Loader), use its real ID
+                if target_name_user in original_spk_id_map:
+                    custom_id = original_spk_id_map[target_name_user]
+                    print(f"[Qwen3-TTS] Found existing ID for {target_name_user}: {custom_id}")
+                else:
+                    print(f"[Qwen3-TTS] ID not found in map, assuming standard FT ID: {custom_id}")
+
+                # THE SWITCH: We claim 'Vivian' is the ID of our custom voice
+                cfg_ref.spk_id[library_safe_name] = custom_id
+
+                # Ensure it is not treated as a dialect
+                if hasattr(cfg_ref, "spk_is_dialect") and isinstance(cfg_ref.spk_is_dialect, dict):
+                     cfg_ref.spk_is_dialect[library_safe_name] = False
 
         gen_kwargs = {
             "top_p": top_p,
@@ -1059,33 +1093,35 @@ class Qwen3CustomVoice:
         }
 
         try:
+            # 4. Generate (Using the safe name 'Vivian')
             try:
                 wavs, sr = model.generate_custom_voice(
                     text=text,
                     language=lang,
-                    speaker=target_speaker,
+                    speaker=library_safe_name, # Pass "Vivian" here
                     instruct=inst,
                     max_new_tokens=max_new_tokens,
                     **gen_kwargs,
                 )
             except TypeError:
-                print(
-                    "Warning: Model generation function does not support extra parameters (top_p, temperature, repetition_penalty). Ignoring them."
-                )
+                print("Warning: Ignoring extra generation params.")
                 wavs, sr = model.generate_custom_voice(
                     text=text,
                     language=lang,
-                    speaker=target_speaker,
+                    speaker=library_safe_name,
                     instruct=inst,
                     max_new_tokens=max_new_tokens,
                 )
         except ValueError as e:
-            msg = str(e)
-            if "does not support generate_custom_voice" in msg:
-                raise ValueError(
-                    "Model Type Error: You are trying to use 'Custom Voice' with an incompatible model. Please load a 'CustomVoice' model (e.g. Qwen3-TTS-12Hz-1.7B-CustomVoice)."
-                ) from e
+            if "does not support generate_custom_voice" in str(e):
+                raise ValueError("Model Type Error: Load a CustomVoice model.") from e
             raise e
+        finally:
+            # 5. Restore Configuration (CRITICAL)
+            # Reset everything to avoid breaking future generations
+            if use_masquerade and cfg_ref and original_spk_id_map:
+                cfg_ref.spk_id = original_spk_id_map
+                print("[Qwen3-TTS] 🛡️ Masquerade over. Config restored.")
 
         return (convert_audio(wavs[0], sr),)
 
