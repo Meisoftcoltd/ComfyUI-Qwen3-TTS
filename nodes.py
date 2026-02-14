@@ -686,111 +686,33 @@ class Qwen3Loader:
             )
             if os.path.exists(cfg_file):
                 with open(cfg_file, "r", encoding="utf-8") as f:
-                    cfg_data = json.load(f)
+                    ft_config = json.load(f)
 
-                if (
-                    "talker_config" in cfg_data
-                    and "spk_id" in cfg_data["talker_config"]
-                ):
-                    new_spk_id = cfg_data["talker_config"]["spk_id"]
-                    new_spk_dialect = cfg_data["talker_config"].get(
-                        "spk_is_dialect", {}
-                    )
+                # Extract speaker info from fine-tuned config
+                if "talker_config" in ft_config and "spk_id" in ft_config["talker_config"]:
+                    new_spk_id_map = ft_config["talker_config"]["spk_id"]
 
-                    # --- FIX: Extract Correct Speaker Name for Output ---
-                    if isinstance(new_spk_id, dict) and len(new_spk_id) > 0:
-                        potential_name = list(new_spk_id.keys())[0]
-                        if potential_name and potential_name.strip():
-                            clean_model_name = potential_name.strip()
-                            # CRITICAL: This was missing! Actually update the output variable if you want it to work.
-                            # Although Qwen3Loader returns (model, clean_model_name), clean_model_name is a local variable.
-                            # We just need to ensure clean_model_name holds the correct string.
-                            print(
-                                f"[Qwen3-TTS] Updated model_name from config: {clean_model_name}"
-                            )
-                    # ----------------------------------------------------
+                    # DEEP UPDATE: Forcefully update the model's internal config
+                    # This prevents NotImplementedError by making the model aware of the custom speaker
+                    if hasattr(model.model, "talker") and hasattr(model.model.talker, "config"):
+                        # Ensure spk_id dict exists
+                        if not hasattr(model.model.talker.config, "spk_id") or model.model.talker.config.spk_id is None:
+                            model.model.talker.config.spk_id = {}
 
-                    # Target List: where spk_id might be hidden
-                    configs_to_update = []
+                        # Update the map
+                        model.model.talker.config.spk_id.update(new_spk_id_map)
 
-                    # 1. Main model wrapper config
-                    if hasattr(model, "config"):
-                        configs_to_update.append(model.config)
-                    # 2. Internal model config
-                    if hasattr(model, "model") and hasattr(model.model, "config"):
-                        configs_to_update.append(model.model.config)
+                        # Also ensure tts_model_type is correct
+                        model.model.tts_model_type = "custom_voice"
 
-                    found_any = False
-                    for root_cfg in configs_to_update:
-                        # Try to find talker_config within these
-                        t_cfg = getattr(root_cfg, "talker_config", None)
-                        if t_cfg is not None:
-                            for attr, val in [
-                                ("spk_id", new_spk_id),
-                                ("spk_is_dialect", new_spk_dialect),
-                            ]:
-                                if (
-                                    not hasattr(t_cfg, attr)
-                                    or getattr(t_cfg, attr) is None
-                                ):
-                                    setattr(t_cfg, attr, {})
-                                cur_val = getattr(t_cfg, attr)
-                                if isinstance(cur_val, dict):
-                                    cur_val.update(val)
-                                    found_any = True
+                        print(f"[Qwen3-TTS] ✅ Successfully registered custom speakers: {list(new_spk_id_map.keys())}")
 
-                    # 3. Direct access to the Talker's internal config (Most important)
-                    if (
-                        hasattr(model, "model")
-                        and hasattr(model.model, "talker")
-                        and hasattr(model.model.talker, "config")
-                    ):
-                        st_cfg = model.model.talker.config
-                        for attr, val in [
-                            ("spk_id", new_spk_id),
-                            ("spk_is_dialect", new_spk_dialect),
-                        ]:
-                            if (
-                                not hasattr(st_cfg, attr)
-                                or getattr(st_cfg, attr) is None
-                            ):
-                                setattr(st_cfg, attr, {})
-                            cur_val = getattr(st_cfg, attr)
-                            if isinstance(cur_val, dict):
-                                cur_val.update(val)
-                                found_any = True
+                # Ensure tts_model_type is correct from config if available (redundancy check)
+                if "tts_model_type" in ft_config:
+                    new_tts_model_type = ft_config["tts_model_type"]
+                    if hasattr(model.model, "tts_model_type"):
+                         model.model.tts_model_type = new_tts_model_type
 
-                    if found_any:
-                        print(
-                            f"DEBUG: Successfully injected custom speaker mapping: {new_spk_id}",
-                            flush=True,
-                        )
-                    else:
-                        print(
-                            "DEBUG: Failed to find an appropriate config object to inject mapping into.",
-                            flush=True,
-                        )
-
-                # Inject tts_model_type if present in checkpoint config
-                if "tts_model_type" in cfg_data:
-                    new_tts_model_type = cfg_data["tts_model_type"]
-
-                    # Inject into config objects
-                    for root_cfg in configs_to_update:
-                        if hasattr(root_cfg, "tts_model_type"):
-                            setattr(root_cfg, "tts_model_type", new_tts_model_type)
-
-                    # CRITICAL: Also update the direct attribute on the inner model
-                    # This is what generate_custom_voice() actually checks
-                    if hasattr(model, "model") and hasattr(
-                        model.model, "tts_model_type"
-                    ):
-                        model.model.tts_model_type = new_tts_model_type
-
-                    print(
-                        f"DEBUG: Injected tts_model_type = {new_tts_model_type}",
-                        flush=True,
-                    )
         except Exception as e:
             print(f"DEBUG: Error during deep speaker injection: {e}", flush=True)
 
@@ -997,71 +919,32 @@ class Qwen3LoadFineTuned:
             cfg_file = os.path.join(checkpoint_path, "config.json")
             if os.path.exists(cfg_file):
                 with open(cfg_file, "r", encoding="utf-8") as f:
-                    cfg_data = json.load(f)
+                    ft_config = json.load(f)
 
-                configs_to_update = []
-                if hasattr(model, "config"):
-                    configs_to_update.append(model.config)
-                if hasattr(model, "model") and hasattr(model.model, "config"):
-                    configs_to_update.append(model.model.config)
+                # Extract speaker info from fine-tuned config
+                if "talker_config" in ft_config and "spk_id" in ft_config["talker_config"]:
+                    new_spk_id_map = ft_config["talker_config"]["spk_id"]
 
-                if (
-                    "talker_config" in cfg_data
-                    and "spk_id" in cfg_data["talker_config"]
-                ):
-                    new_spk_id = cfg_data["talker_config"]["spk_id"]
-                    new_spk_dialect = cfg_data["talker_config"].get(
-                        "spk_is_dialect", {}
-                    )
+                    # DEEP UPDATE: Forcefully update the model's internal config
+                    # This prevents NotImplementedError by making the model aware of the custom speaker
+                    if hasattr(model.model, "talker") and hasattr(model.model.talker, "config"):
+                        # Ensure spk_id dict exists
+                        if not hasattr(model.model.talker.config, "spk_id") or model.model.talker.config.spk_id is None:
+                            model.model.talker.config.spk_id = {}
 
-                    found_any = False
-                    for root_cfg in configs_to_update:
-                        t_cfg = getattr(root_cfg, "talker_config", None)
-                        if t_cfg is not None:
-                            if not hasattr(t_cfg, "spk_id") or t_cfg.spk_id is None:
-                                t_cfg.spk_id = {}
-                            if isinstance(t_cfg.spk_id, dict):
-                                t_cfg.spk_id.update(new_spk_id)
+                        # Update the map
+                        model.model.talker.config.spk_id.update(new_spk_id_map)
 
-                            if (
-                                not hasattr(t_cfg, "spk_is_dialect")
-                                or t_cfg.spk_is_dialect is None
-                            ):
-                                t_cfg.spk_is_dialect = {}
-                            if isinstance(t_cfg.spk_is_dialect, dict):
-                                t_cfg.spk_is_dialect.update(new_spk_dialect)
-                            found_any = True
+                        # Also ensure tts_model_type is correct
+                        model.model.tts_model_type = "custom_voice"
 
-                    # Update internal talker config
-                    if (
-                        hasattr(model, "model")
-                        and hasattr(model.model, "talker")
-                        and hasattr(model.model.talker, "config")
-                    ):
-                        st_cfg = model.model.talker.config
-                        if not hasattr(st_cfg, "spk_id") or st_cfg.spk_id is None:
-                            st_cfg.spk_id = {}
-                        if isinstance(st_cfg.spk_id, dict):
-                            st_cfg.spk_id.update(new_spk_id)
-                        found_any = True
+                        print(f"[Qwen3-TTS] ✅ Successfully registered custom speakers: {list(new_spk_id_map.keys())}")
 
-                    if found_any:
-                        print(
-                            f"DEBUG: Successfully injected custom speaker mapping from {checkpoint_path}: {list(new_spk_id.keys())}"
-                        )
-
-                if "tts_model_type" in cfg_data:
-                    new_tts_model_type = cfg_data["tts_model_type"]
-                    for root_cfg in configs_to_update:
-                        if hasattr(root_cfg, "tts_model_type"):
-                            setattr(root_cfg, "tts_model_type", new_tts_model_type)
-
-                    if hasattr(model, "model") and hasattr(
-                        model.model, "tts_model_type"
-                    ):
-                        model.model.tts_model_type = new_tts_model_type
-
-                    print(f"DEBUG: Injected tts_model_type = {new_tts_model_type}")
+                # Ensure tts_model_type is correct from config if available (redundancy check)
+                if "tts_model_type" in ft_config:
+                    new_tts_model_type = ft_config["tts_model_type"]
+                    if hasattr(model.model, "tts_model_type"):
+                         model.model.tts_model_type = new_tts_model_type
 
         except Exception as e:
             print(f"DEBUG: Error during deep speaker injection: {e}")
@@ -1168,50 +1051,6 @@ class Qwen3CustomVoice:
         if custom_speaker_name and custom_speaker_name.strip() != "":
             target_speaker = custom_speaker_name.strip()
             print(f"Using custom speaker: {target_speaker}")
-
-        # ---------------------------------------------------------
-        # RUNTIME INJECTION: THE DEFINITIVE FIX
-        # Forcefully ensure the speaker ID map is updated in the LIVE model instance
-        # ---------------------------------------------------------
-
-        model_ref = model.model
-        configs_to_check = []
-
-        # Collect all reachable config objects
-        if hasattr(model_ref, "config"): configs_to_check.append(model_ref.config)
-        if hasattr(model_ref, "talker") and hasattr(model_ref.talker, "config"):
-            configs_to_check.append(model_ref.talker.config)
-        if hasattr(model, "config"): configs_to_check.append(model.config)
-
-        injected = False
-        target_id = 3000 # Standard Fine-Tune ID
-
-        for cfg in configs_to_check:
-            # 1. Force model type to 'custom_voice' (Required for generate_custom_voice)
-            if hasattr(cfg, "tts_model_type") and cfg.tts_model_type != "custom_voice":
-                print(f"[Qwen3-TTS] 🔧 Auto-Fixing tts_model_type='custom_voice' on config {id(cfg)}")
-                cfg.tts_model_type = "custom_voice"
-
-            # 2. Inject Speaker ID
-            t_cfg = getattr(cfg, "talker_config", None)
-            if t_cfg:
-                if not hasattr(t_cfg, "spk_id") or t_cfg.spk_id is None:
-                    t_cfg.spk_id = {}
-
-                # If speaker missing, inject it
-                if target_speaker not in t_cfg.spk_id:
-                    print(f"[Qwen3-TTS] 💉 Runtime Injecting '{target_speaker}' -> ID {target_id}")
-                    t_cfg.spk_id[target_speaker] = target_id
-
-                    if not hasattr(t_cfg, "spk_is_dialect") or t_cfg.spk_is_dialect is None:
-                        t_cfg.spk_is_dialect = {}
-                    t_cfg.spk_is_dialect[target_speaker] = False
-                    injected = True
-
-        if injected:
-            print("[Qwen3-TTS] ✅ Speaker injection successful. Proceeding to generation.")
-
-        # ---------------------------------------------------------
 
         gen_kwargs = {
             "top_p": top_p,
