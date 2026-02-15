@@ -1035,54 +1035,50 @@ class Qwen3CustomVoice:
         # Determine target speaker name
         target_speaker = custom_speaker_name.strip() if custom_speaker_name.strip() else speaker
 
-        # --- RUNTIME FORCE-REGISTRATION ---
-        # Ensure the speaker exists in the model's config to prevent NotImplementedError
-        # We patch ALL possible config locations to be safe.
+        # --- AGGRESSIVE RUNTIME PATCHING ---
+        # We assume the fine-tuned speaker is always at ID 3000 (standard for single-speaker FT)
+        TARGET_ID = 3000
 
-        # 1. Patch Talker Config (Primary)
+        print(f"[Qwen3-TTS] 🛡️ Validating config for speaker: '{target_speaker}'...")
+
+        # Helper function to inject speaker into a specific config object
+        def inject_into_config(cfg, name, label):
+            patched = False
+            # Check if config is a dict
+            if isinstance(cfg, dict):
+                if "spk_id" not in cfg: cfg["spk_id"] = {}
+                if name not in cfg["spk_id"]:
+                    cfg["spk_id"][name] = TARGET_ID
+                    print(f"   -> Injected '{name}' into {label} (dict)")
+                    patched = True
+            # Check if config is an object
+            elif hasattr(cfg, "spk_id"):
+                if cfg.spk_id is None: cfg.spk_id = {}
+                if name not in cfg.spk_id:
+                    cfg.spk_id[name] = TARGET_ID
+                    print(f"   -> Injected '{name}' into {label} (object)")
+                    patched = True
+            return patched
+
+        # 1. Patch model.model.talker.config (Primary location for generation)
         if hasattr(model.model, "talker") and hasattr(model.model.talker, "config"):
-            if not hasattr(model.model.talker.config, "spk_id") or model.model.talker.config.spk_id is None:
-                model.model.talker.config.spk_id = {}
+            inject_into_config(model.model.talker.config, target_speaker, "model.model.talker.config")
 
-            # Force add if missing
-            if target_speaker not in model.model.talker.config.spk_id:
-                print(f"[Qwen3-TTS] ⚠️ Runtime: Force-registering '{target_speaker}' to ID 3000 in talker config.")
-                model.model.talker.config.spk_id[target_speaker] = 3000
+        # 2. Patch model.model.config (Root config of inner model)
+        if hasattr(model.model, "config"):
+            if hasattr(model.model.config, "talker_config"):
+                inject_into_config(model.model.config.talker_config, target_speaker, "model.model.config.talker_config")
 
-            # Ensure model type is correct
+        # 3. Patch model.config (Wrapper config - rare but possible)
+        if hasattr(model, "config"):
+            if hasattr(model.config, "talker_config"):
+                inject_into_config(model.config.talker_config, target_speaker, "model.config.talker_config")
+
+        # 4. Force model type
+        if hasattr(model.model, "tts_model_type"):
             model.model.tts_model_type = "custom_voice"
 
-        # 2. Patch Root Config (Secondary/Fallback)
-        if hasattr(model.model, "config"):
-            # Some wrappers verify against root config
-            if not hasattr(model.model.config, "talker_config") or model.model.config.talker_config is None:
-                 model.model.config.talker_config = {}
-
-            tc = model.model.config.talker_config
-
-            # Robustly handle both dict and object config
-            if isinstance(tc, dict):
-                if "spk_id" not in tc:
-                    tc["spk_id"] = {}
-                if target_speaker not in tc["spk_id"]:
-                    print(
-                        f"[Qwen3-TTS] ⚠️ Runtime: Force-registering '{target_speaker}' to ID 3000 in root config (dict)."
-                    )
-                    tc["spk_id"][target_speaker] = 3000
-            else:
-                # Handle object (e.g. Qwen3TTSTalkerConfig)
-                if not hasattr(tc, "spk_id") or tc.spk_id is None:
-                    tc.spk_id = {}
-
-                if target_speaker not in tc.spk_id:
-                    print(
-                        f"[Qwen3-TTS] ⚠️ Runtime: Force-registering '{target_speaker}' to ID 3000 in root config (object)."
-                    )
-                    tc.spk_id[target_speaker] = 3000
-
         # ----------------------------------
-
-        print(f"[Qwen3-TTS] Generating for speaker: '{target_speaker}'")
 
         gen_kwargs = {
             "top_p": top_p,
@@ -1090,11 +1086,13 @@ class Qwen3CustomVoice:
             "repetition_penalty": repetition_penalty,
         }
 
+        print(f"[Qwen3-TTS] Generating audio for '{target_speaker}' (ID: {TARGET_ID})...")
+
         try:
             try:
                 wavs, sr = model.generate_custom_voice(
                     text=text,
-                    speaker=target_speaker, # Direct pass
+                    speaker=target_speaker,
                     language=lang,
                     instruct=inst,
                     max_new_tokens=max_new_tokens,
@@ -1110,8 +1108,12 @@ class Qwen3CustomVoice:
                     max_new_tokens=max_new_tokens,
                 )
         except ValueError as e:
-            if "does not support generate_custom_voice" in str(e):
+            msg = str(e)
+            if "does not support generate_custom_voice" in msg:
                 raise ValueError("Model Type Error: Load a CustomVoice model.") from e
+            # Re-raise with specific help if it's the speaker error
+            if "not implemented" in msg and target_speaker in msg:
+                raise ValueError(f"CRITICAL: The model refused '{target_speaker}'. This implies the internal config is resetting. Try restarting ComfyUI completely to clear the model cache.") from e
             raise e
 
         return (convert_audio(wavs[0], sr),)
