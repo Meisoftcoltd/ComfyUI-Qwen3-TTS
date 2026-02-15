@@ -3083,6 +3083,26 @@ class Qwen3FineTune:
                 ),
             },
             "optional": {
+                "language": (
+                    [
+                        "Auto",
+                        "en",
+                        "es",
+                        "fr",
+                        "de",
+                        "it",
+                        "ja",
+                        "zh",
+                        "pt",
+                        "ru",
+                        "ko",
+                        "nl",
+                        "pl",
+                        "tr",
+                        "hi",
+                    ],
+                    {"default": "Auto"},
+                ),
                 # Workflow
                 "resume_training": (
                     "BOOLEAN",
@@ -3245,7 +3265,7 @@ class Qwen3FineTune:
         gradient_accumulation=8,
         gradient_checkpointing=True,
         use_8bit_optimizer=True,
-        weight_decay=0.01,
+        weight_decay=0.0,
         max_grad_norm=1.0,
         warmup_steps=0,
         warmup_ratio=0.1,
@@ -3253,6 +3273,7 @@ class Qwen3FineTune:
         early_stopping_patience=20,
         early_stopping_min_delta=0.02,
         save_optimizer_state=True,
+        language="Auto",
         unique_id=None,
     ):
         train_jsonl = fix_wsl_path(train_jsonl)
@@ -4046,10 +4067,17 @@ class Qwen3FineTune:
 
                         if epochs_no_improve >= early_stopping_patience:
                             print(f"🛑 STOPPING: Plateau detected. Saving best model and exiting node.")
-                            # CRITICAL: Use return to force-exit the ComfyUI node execution
                             final_path = save_final_model(f"plateau_detected_loss_{avg_loss:.3f}", epoch + 1, global_step)
+
+                            # Cleanup
                             accelerator.free_memory()
-                            return (final_path, speaker_name)
+                            if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+                            # CRITICAL: Force exit the node
+                            if accelerator.is_main_process:
+                                return (final_path, speaker_name)
+                            else:
+                                return ("", "")
 
                 # Always save final model as epoch_N for consistent resume
                 send_status(f"Saving final model epoch {end_epoch}...")
@@ -4685,6 +4713,26 @@ class Qwen3ASRTranscribeDataset:
                 "audio_list": ("DATASET_AUDIO_LIST",),
             },
             "optional": {
+                "language": (
+                    [
+                        "Auto",
+                        "en",
+                        "es",
+                        "fr",
+                        "de",
+                        "it",
+                        "ja",
+                        "zh",
+                        "pt",
+                        "ru",
+                        "ko",
+                        "nl",
+                        "pl",
+                        "tr",
+                        "hi",
+                    ],
+                    {"default": "Auto"},
+                ),
                 "output_dataset_folder": (
                     "STRING",
                     {"default": "dataset_final", "multiline": False},
@@ -4712,6 +4760,7 @@ class Qwen3ASRTranscribeDataset:
     def process(
         self,
         audio_list,
+        language="Auto",
         output_dataset_folder="dataset_final",
         min_duration=0.8,
         max_duration=60.0,
@@ -4721,6 +4770,28 @@ class Qwen3ASRTranscribeDataset:
             raise ImportError(
                 "Please install 'qwen-asr' to use this node (add to requirements.txt)."
             )
+
+        # Mapping for Qwen3-ASR (ISO code -> Full Name)
+        ISO_TO_FULL = {
+            "en": "English",
+            "es": "Spanish",
+            "fr": "French",
+            "de": "German",
+            "it": "Italian",
+            "ja": "Japanese",
+            "zh": "Chinese",
+            "pt": "Portuguese",
+            "ru": "Russian",
+            "ko": "Korean",
+            "nl": "Dutch",
+            "pl": "Polish",
+            "tr": "Turkish",
+            "hi": "Hindi",
+        }
+
+        lang_arg = None
+        if language != "Auto":
+            lang_arg = ISO_TO_FULL.get(language, language)
 
         folder_path = audio_list["folder_path"]
         files = audio_list["files"]
@@ -4759,18 +4830,27 @@ class Qwen3ASRTranscribeDataset:
             print(f"--- Processing [{idx+1}/{total_files}]: {filename} ---")
 
             try:
-                # Transcribe
-                # Assuming model accepts path or waveform. Using path for simplicity if supported.
-                # If Qwen3ASRModel expects specific input, we might need to load with librosa/torchaudio.
-                # Standard assumption: accepts path.
-                text = asr_model.transcribe(filepath)
+                # 1. Transcribe
+                raw_output = asr_model.transcribe(filepath, language=lang_arg)
 
-                if not text or not text.strip():
-                    continue
+                # 2. Fix List Return Type (Crucial Fix)
+                text = ""
+                if isinstance(raw_output, list):
+                    # Handle list of dicts or list of strings
+                    if len(raw_output) > 0 and isinstance(raw_output[0], dict) and 'text' in raw_output[0]:
+                        text = " ".join([seg['text'] for seg in raw_output])
+                    else:
+                        text = " ".join([str(t) for t in raw_output])
+                elif isinstance(raw_output, dict) and 'text' in raw_output:
+                    text = raw_output['text']
+                else:
+                    text = str(raw_output)
 
-                # Align
-                # Returns list of {text, start, end}
-                alignment = aligner.align(filepath, text)
+                text = text.strip()
+                if not text: continue
+
+                # 3. Align
+                alignment = aligner.align(filepath, text, language=lang_arg)
 
             except Exception as e:
                 print(f"   [Error processing {filename}] {e}")
