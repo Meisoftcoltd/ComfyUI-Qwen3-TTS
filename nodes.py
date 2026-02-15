@@ -1059,11 +1059,26 @@ class Qwen3CustomVoice:
                  model.model.config.talker_config = {}
 
             tc = model.model.config.talker_config
-            if "spk_id" not in tc: tc["spk_id"] = {}
 
-            if target_speaker not in tc["spk_id"]:
-                 print(f"[Qwen3-TTS] ⚠️ Runtime: Force-registering '{target_speaker}' to ID 3000 in root config.")
-                 tc["spk_id"][target_speaker] = 3000
+            # Robustly handle both dict and object config
+            if isinstance(tc, dict):
+                if "spk_id" not in tc:
+                    tc["spk_id"] = {}
+                if target_speaker not in tc["spk_id"]:
+                    print(
+                        f"[Qwen3-TTS] ⚠️ Runtime: Force-registering '{target_speaker}' to ID 3000 in root config (dict)."
+                    )
+                    tc["spk_id"][target_speaker] = 3000
+            else:
+                # Handle object (e.g. Qwen3TTSTalkerConfig)
+                if not hasattr(tc, "spk_id") or tc.spk_id is None:
+                    tc.spk_id = {}
+
+                if target_speaker not in tc.spk_id:
+                    print(
+                        f"[Qwen3-TTS] ⚠️ Runtime: Force-registering '{target_speaker}' to ID 3000 in root config (object)."
+                    )
+                    tc.spk_id[target_speaker] = 3000
 
         # ----------------------------------
 
