@@ -1032,10 +1032,40 @@ class Qwen3CustomVoice:
         lang = language if language != "Auto" else None
         inst = instruct if instruct.strip() != "" else None
 
-        # Clean logic: Just pass the name. The Loader must have registered it.
-        target_speaker = speaker
-        if custom_speaker_name and custom_speaker_name.strip() != "":
-            target_speaker = custom_speaker_name.strip()
+        # Determine target speaker name
+        target_speaker = custom_speaker_name.strip() if custom_speaker_name.strip() else speaker
+
+        # --- RUNTIME FORCE-REGISTRATION ---
+        # Ensure the speaker exists in the model's config to prevent NotImplementedError
+        # We patch ALL possible config locations to be safe.
+
+        # 1. Patch Talker Config (Primary)
+        if hasattr(model.model, "talker") and hasattr(model.model.talker, "config"):
+            if not hasattr(model.model.talker.config, "spk_id") or model.model.talker.config.spk_id is None:
+                model.model.talker.config.spk_id = {}
+
+            # Force add if missing
+            if target_speaker not in model.model.talker.config.spk_id:
+                print(f"[Qwen3-TTS] ⚠️ Runtime: Force-registering '{target_speaker}' to ID 3000 in talker config.")
+                model.model.talker.config.spk_id[target_speaker] = 3000
+
+            # Ensure model type is correct
+            model.model.tts_model_type = "custom_voice"
+
+        # 2. Patch Root Config (Secondary/Fallback)
+        if hasattr(model.model, "config"):
+            # Some wrappers verify against root config
+            if not hasattr(model.model.config, "talker_config") or model.model.config.talker_config is None:
+                 model.model.config.talker_config = {}
+
+            tc = model.model.config.talker_config
+            if "spk_id" not in tc: tc["spk_id"] = {}
+
+            if target_speaker not in tc["spk_id"]:
+                 print(f"[Qwen3-TTS] ⚠️ Runtime: Force-registering '{target_speaker}' to ID 3000 in root config.")
+                 tc["spk_id"][target_speaker] = 3000
+
+        # ----------------------------------
 
         print(f"[Qwen3-TTS] Generating for speaker: '{target_speaker}'")
 
@@ -3019,6 +3049,10 @@ class Qwen3FineTune:
                         "tooltip": "Name for the custom speaker. Use this name when generating with the fine-tuned model.",
                     },
                 ),
+                "language": (
+                    ["Auto", "Chinese", "English", "Japanese", "Korean", "Spanish", "French", "German", "Italian", "Russian", "Portuguese"],
+                    {"default": "Auto", "tooltip": "Force a specific language for training data if not specified in JSONL."},
+                ),
                 "seed": (
                     "INT",
                     {
@@ -3185,6 +3219,7 @@ class Qwen3FineTune:
         save_loss_threshold=8.2,
         save_loss_buffer=0.2,
         speaker_name="my_speaker",
+        language="Auto",
         seed=42,
         mixed_precision="bf16",
         resume_training=False,
@@ -3492,7 +3527,7 @@ class Qwen3FineTune:
                 config = AutoConfig.from_pretrained(init_model_path)
 
                 # Load Data (Lazy)
-                dataset = TTSDataset(train_jsonl, qwen3tts.processor, config)
+                dataset = TTSDataset(train_jsonl, qwen3tts.processor, config, language=language)
                 generator = torch.Generator()
                 generator.manual_seed(seed)
 
