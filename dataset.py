@@ -34,11 +34,10 @@ MaybeList = Union[Any, List[Any]]
 
 
 class TTSDataset(Dataset):
-    def __init__(self, data_source, processor, config: Qwen3TTSConfig, lag_num=-1, language="Auto"):
+    def __init__(self, data_source, processor, config: Qwen3TTSConfig, lag_num=-1):
         self.processor = processor
         self.lag_num = lag_num
         self.config = config
-        self.language = language  # Global override/default
         self._ref_mel_cache = {}
 
         # --- FIX: Robust initialization logic ---
@@ -171,8 +170,7 @@ class TTSDataset(Dataset):
         audio_path = item["audio"]
         text = item["text"]
         audio_codes = item["audio_codes"]
-        # Use item language if present, otherwise fallback to global setting
-        language = item.get("language", self.language)
+        language = item.get("language", "Auto")
         ref_audio_path = item["ref_audio"]
 
         # Optimization: Use pre-computed text_ids if available (from Qwen3DataPrep)

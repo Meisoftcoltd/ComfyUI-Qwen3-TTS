@@ -76,16 +76,11 @@ try:
 except ImportError:
     HAS_BNB = False
 try:
-    # Try the new class name first (aliasing it for compatibility)
-    from qwen_asr import Qwen3ASRModel, Qwen3ForcedAligner as ForcedAligner
+    from qwen_asr import Qwen3ASRModel, ForcedAligner
+
     HAS_QWEN_ASR = True
 except ImportError:
-    try:
-        # Fallback to the old class name
-        from qwen_asr import Qwen3ASRModel, ForcedAligner
-        HAS_QWEN_ASR = True
-    except ImportError:
-        HAS_QWEN_ASR = False
+    HAS_QWEN_ASR = False
 
 from torch.utils.data import DataLoader, Dataset
 from transformers import (
@@ -177,7 +172,6 @@ def get_finetuned_speakers() -> list:
         "Aiden",
         "Ono_Anna",
         "Sohee",
-        "Pod",
     ]
 
     # Paths to scan
@@ -686,33 +680,111 @@ class Qwen3Loader:
             )
             if os.path.exists(cfg_file):
                 with open(cfg_file, "r", encoding="utf-8") as f:
-                    ft_config = json.load(f)
+                    cfg_data = json.load(f)
 
-                # Extract speaker info from fine-tuned config
-                if "talker_config" in ft_config and "spk_id" in ft_config["talker_config"]:
-                    new_spk_id_map = ft_config["talker_config"]["spk_id"]
+                if (
+                    "talker_config" in cfg_data
+                    and "spk_id" in cfg_data["talker_config"]
+                ):
+                    new_spk_id = cfg_data["talker_config"]["spk_id"]
+                    new_spk_dialect = cfg_data["talker_config"].get(
+                        "spk_is_dialect", {}
+                    )
 
-                    # DEEP UPDATE: Forcefully update the model's internal config
-                    # This prevents NotImplementedError by making the model aware of the custom speaker
-                    if hasattr(model.model, "talker") and hasattr(model.model.talker, "config"):
-                        # Ensure spk_id dict exists
-                        if not hasattr(model.model.talker.config, "spk_id") or model.model.talker.config.spk_id is None:
-                            model.model.talker.config.spk_id = {}
+                    # --- FIX: Extract Correct Speaker Name for Output ---
+                    if isinstance(new_spk_id, dict) and len(new_spk_id) > 0:
+                        potential_name = list(new_spk_id.keys())[0]
+                        if potential_name and potential_name.strip():
+                            clean_model_name = potential_name.strip()
+                            # CRITICAL: This was missing! Actually update the output variable if you want it to work.
+                            # Although Qwen3Loader returns (model, clean_model_name), clean_model_name is a local variable.
+                            # We just need to ensure clean_model_name holds the correct string.
+                            print(
+                                f"[Qwen3-TTS] Updated model_name from config: {clean_model_name}"
+                            )
+                    # ----------------------------------------------------
 
-                        # Update the map
-                        model.model.talker.config.spk_id.update(new_spk_id_map)
+                    # Target List: where spk_id might be hidden
+                    configs_to_update = []
 
-                        # Also ensure tts_model_type is correct
-                        model.model.tts_model_type = "custom_voice"
+                    # 1. Main model wrapper config
+                    if hasattr(model, "config"):
+                        configs_to_update.append(model.config)
+                    # 2. Internal model config
+                    if hasattr(model, "model") and hasattr(model.model, "config"):
+                        configs_to_update.append(model.model.config)
 
-                        print(f"[Qwen3-TTS] ✅ Successfully registered custom speakers: {list(new_spk_id_map.keys())}")
+                    found_any = False
+                    for root_cfg in configs_to_update:
+                        # Try to find talker_config within these
+                        t_cfg = getattr(root_cfg, "talker_config", None)
+                        if t_cfg is not None:
+                            for attr, val in [
+                                ("spk_id", new_spk_id),
+                                ("spk_is_dialect", new_spk_dialect),
+                            ]:
+                                if (
+                                    not hasattr(t_cfg, attr)
+                                    or getattr(t_cfg, attr) is None
+                                ):
+                                    setattr(t_cfg, attr, {})
+                                cur_val = getattr(t_cfg, attr)
+                                if isinstance(cur_val, dict):
+                                    cur_val.update(val)
+                                    found_any = True
 
-                # Ensure tts_model_type is correct from config if available (redundancy check)
-                if "tts_model_type" in ft_config:
-                    new_tts_model_type = ft_config["tts_model_type"]
-                    if hasattr(model.model, "tts_model_type"):
-                         model.model.tts_model_type = new_tts_model_type
+                    # 3. Direct access to the Talker's internal config (Most important)
+                    if (
+                        hasattr(model, "model")
+                        and hasattr(model.model, "talker")
+                        and hasattr(model.model.talker, "config")
+                    ):
+                        st_cfg = model.model.talker.config
+                        for attr, val in [
+                            ("spk_id", new_spk_id),
+                            ("spk_is_dialect", new_spk_dialect),
+                        ]:
+                            if (
+                                not hasattr(st_cfg, attr)
+                                or getattr(st_cfg, attr) is None
+                            ):
+                                setattr(st_cfg, attr, {})
+                            cur_val = getattr(st_cfg, attr)
+                            if isinstance(cur_val, dict):
+                                cur_val.update(val)
+                                found_any = True
 
+                    if found_any:
+                        print(
+                            f"DEBUG: Successfully injected custom speaker mapping: {new_spk_id}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            "DEBUG: Failed to find an appropriate config object to inject mapping into.",
+                            flush=True,
+                        )
+
+                # Inject tts_model_type if present in checkpoint config
+                if "tts_model_type" in cfg_data:
+                    new_tts_model_type = cfg_data["tts_model_type"]
+
+                    # Inject into config objects
+                    for root_cfg in configs_to_update:
+                        if hasattr(root_cfg, "tts_model_type"):
+                            setattr(root_cfg, "tts_model_type", new_tts_model_type)
+
+                    # CRITICAL: Also update the direct attribute on the inner model
+                    # This is what generate_custom_voice() actually checks
+                    if hasattr(model, "model") and hasattr(
+                        model.model, "tts_model_type"
+                    ):
+                        model.model.tts_model_type = new_tts_model_type
+
+                    print(
+                        f"DEBUG: Injected tts_model_type = {new_tts_model_type}",
+                        flush=True,
+                    )
         except Exception as e:
             print(f"DEBUG: Error during deep speaker injection: {e}", flush=True)
 
@@ -919,30 +991,71 @@ class Qwen3LoadFineTuned:
             cfg_file = os.path.join(checkpoint_path, "config.json")
             if os.path.exists(cfg_file):
                 with open(cfg_file, "r", encoding="utf-8") as f:
-                    ft_config = json.load(f)
+                    cfg_data = json.load(f)
 
-                # Force update the internal config to match the checkpoint's identity
-                if "talker_config" in ft_config and "spk_id" in ft_config["talker_config"]:
-                    new_spk_id = ft_config["talker_config"]["spk_id"]
+                configs_to_update = []
+                if hasattr(model, "config"):
+                    configs_to_update.append(model.config)
+                if hasattr(model, "model") and hasattr(model.model, "config"):
+                    configs_to_update.append(model.model.config)
 
-                    # Ensure the destination dict exists
-                    if not hasattr(model.model.talker.config, "spk_id") or model.model.talker.config.spk_id is None:
-                        model.model.talker.config.spk_id = {}
+                if (
+                    "talker_config" in cfg_data
+                    and "spk_id" in cfg_data["talker_config"]
+                ):
+                    new_spk_id = cfg_data["talker_config"]["spk_id"]
+                    new_spk_dialect = cfg_data["talker_config"].get(
+                        "spk_is_dialect", {}
+                    )
 
-                    # UPDATE mapping (Merge or Overwrite)
-                    # We update so we don't lose base speakers if they exist, but ensure Neylis is added.
-                    model.model.talker.config.spk_id.update(new_spk_id)
+                    found_any = False
+                    for root_cfg in configs_to_update:
+                        t_cfg = getattr(root_cfg, "talker_config", None)
+                        if t_cfg is not None:
+                            if not hasattr(t_cfg, "spk_id") or t_cfg.spk_id is None:
+                                t_cfg.spk_id = {}
+                            if isinstance(t_cfg.spk_id, dict):
+                                t_cfg.spk_id.update(new_spk_id)
 
-                    # ALSO ensure 'spk_is_dialect' is updated (prevent errors if checking for dialect)
-                    if "spk_is_dialect" in ft_config["talker_config"]:
-                        if not hasattr(model.model.talker.config, "spk_is_dialect"):
-                            model.model.talker.config.spk_is_dialect = {}
-                        model.model.talker.config.spk_is_dialect.update(ft_config["talker_config"]["spk_is_dialect"])
+                            if (
+                                not hasattr(t_cfg, "spk_is_dialect")
+                                or t_cfg.spk_is_dialect is None
+                            ):
+                                t_cfg.spk_is_dialect = {}
+                            if isinstance(t_cfg.spk_is_dialect, dict):
+                                t_cfg.spk_is_dialect.update(new_spk_dialect)
+                            found_any = True
 
-                    # Force model type to custom_voice so the library uses the spk_id map
-                    model.model.tts_model_type = "custom_voice"
+                    # Update internal talker config
+                    if (
+                        hasattr(model, "model")
+                        and hasattr(model.model, "talker")
+                        and hasattr(model.model.talker, "config")
+                    ):
+                        st_cfg = model.model.talker.config
+                        if not hasattr(st_cfg, "spk_id") or st_cfg.spk_id is None:
+                            st_cfg.spk_id = {}
+                        if isinstance(st_cfg.spk_id, dict):
+                            st_cfg.spk_id.update(new_spk_id)
+                        found_any = True
 
-                    print(f"[Qwen3-TTS] ✅ Registered speakers from checkpoint: {list(new_spk_id.keys())}")
+                    if found_any:
+                        print(
+                            f"DEBUG: Successfully injected custom speaker mapping from {checkpoint_path}: {list(new_spk_id.keys())}"
+                        )
+
+                if "tts_model_type" in cfg_data:
+                    new_tts_model_type = cfg_data["tts_model_type"]
+                    for root_cfg in configs_to_update:
+                        if hasattr(root_cfg, "tts_model_type"):
+                            setattr(root_cfg, "tts_model_type", new_tts_model_type)
+
+                    if hasattr(model, "model") and hasattr(
+                        model.model, "tts_model_type"
+                    ):
+                        model.model.tts_model_type = new_tts_model_type
+
+                    print(f"DEBUG: Injected tts_model_type = {new_tts_model_type}")
 
         except Exception as e:
             print(f"DEBUG: Error during deep speaker injection: {e}")
@@ -977,8 +1090,8 @@ class Qwen3CustomVoice:
                 "seed": ("INT", {"default": 42, "min": 1, "max": 0xFFFFFFFFFFFFFFFF}),
             },
             "optional": {
-                "instruct": ("STRING", {"multiline": True, "default": "", "tooltip": "Instruction for tone/emotion (e.g. 'Happy voice')."}),
-                "custom_speaker_name": ("STRING", {"default": "", "tooltip": "Manually type speaker name if not in list (e.g. 'Neylis')."}),
+                "instruct": ("STRING", {"multiline": True, "default": ""}),
+                "custom_speaker_name": ("STRING", {"default": ""}),
                 "max_new_tokens": (
                     "INT",
                     {"default": 2048, "min": 64, "max": 8192, "step": 64},
@@ -998,14 +1111,28 @@ class Qwen3CustomVoice:
                         "min": 1.0,
                         "max": 2.0,
                         "step": 0.01,
+                        "tooltip": "Penalty for repetition. Increase (e.g., 1.1-1.2) to prevent infinite loops/stuttering.",
                     },
                 ),
             },
         }
 
     @classmethod
-    def IS_CHANGED(s, **kwargs):
-        return kwargs.get("seed", 0)
+    def IS_CHANGED(
+        s,
+        model,
+        text,
+        language,
+        speaker,
+        seed,
+        instruct="",
+        custom_speaker_name="",
+        max_new_tokens=8192,
+        top_p=0.8,
+        temperature=0.7,
+        repetition_penalty=1.1,
+    ):
+        return seed
 
     RETURN_TYPES = ("AUDIO",)
     FUNCTION = "generate"
@@ -1028,61 +1155,41 @@ class Qwen3CustomVoice:
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
-
         lang = language if language != "Auto" else None
         inst = instruct if instruct.strip() != "" else None
 
-        # Determine target speaker name
-        target_speaker = custom_speaker_name.strip() if custom_speaker_name.strip() else speaker
+        target_speaker = speaker
+        if custom_speaker_name and custom_speaker_name.strip() != "":
+            target_speaker = custom_speaker_name.strip()
+            print(f"Using custom speaker: {target_speaker}")
 
-        # --- RUNTIME FORCE-REGISTRATION ---
-        # Ensure the speaker exists in the model's config to prevent NotImplementedError
-        # We patch ALL possible config locations to be safe.
+        # Manual lookup and case-matching to bypass library validation failures
+        try:
+            configs_to_check = []
+            if hasattr(model, "config"):
+                configs_to_check.append(model.config)
+            if hasattr(model, "model") and hasattr(model.model, "config"):
+                configs_to_check.append(model.model.config)
 
-        # 1. Patch Talker Config (Primary)
-        if hasattr(model.model, "talker") and hasattr(model.model.talker, "config"):
-            if not hasattr(model.model.talker.config, "spk_id") or model.model.talker.config.spk_id is None:
-                model.model.talker.config.spk_id = {}
-
-            # Force add if missing
-            if target_speaker not in model.model.talker.config.spk_id:
-                print(f"[Qwen3-TTS] ⚠️ Runtime: Force-registering '{target_speaker}' to ID 3000 in talker config.")
-                model.model.talker.config.spk_id[target_speaker] = 3000
-
-            # Ensure model type is correct
-            model.model.tts_model_type = "custom_voice"
-
-        # 2. Patch Root Config (Secondary/Fallback)
-        if hasattr(model.model, "config"):
-            # Some wrappers verify against root config
-            if not hasattr(model.model.config, "talker_config") or model.model.config.talker_config is None:
-                 model.model.config.talker_config = {}
-
-            tc = model.model.config.talker_config
-
-            # Robustly handle both dict and object config
-            if isinstance(tc, dict):
-                if "spk_id" not in tc:
-                    tc["spk_id"] = {}
-                if target_speaker not in tc["spk_id"]:
-                    print(
-                        f"[Qwen3-TTS] ⚠️ Runtime: Force-registering '{target_speaker}' to ID 3000 in root config (dict)."
-                    )
-                    tc["spk_id"][target_speaker] = 3000
-            else:
-                # Handle object (e.g. Qwen3TTSTalkerConfig)
-                if not hasattr(tc, "spk_id") or tc.spk_id is None:
-                    tc.spk_id = {}
-
-                if target_speaker not in tc.spk_id:
-                    print(
-                        f"[Qwen3-TTS] ⚠️ Runtime: Force-registering '{target_speaker}' to ID 3000 in root config (object)."
-                    )
-                    tc.spk_id[target_speaker] = 3000
-
-        # ----------------------------------
-
-        print(f"[Qwen3-TTS] Generating for speaker: '{target_speaker}'")
+            for root_cfg in configs_to_check:
+                t_cfg = getattr(root_cfg, "talker_config", None)
+                if t_cfg:
+                    spk_map = getattr(t_cfg, "spk_id", None)
+                    if isinstance(spk_map, dict):
+                        # Case-insensitive match
+                        match = next(
+                            (s for s in spk_map if s.lower() == target_speaker.lower()),
+                            None,
+                        )
+                        if match:
+                            print(
+                                f"DEBUG: Found case-matched speaker: '{match}' (original: '{target_speaker}')",
+                                flush=True,
+                            )
+                            target_speaker = match  # Use the name the model expects
+                            break
+        except Exception as e:
+            print(f"DEBUG: Speaker case-matching failed: {e}", flush=True)
 
         gen_kwargs = {
             "top_p": top_p,
@@ -1094,24 +1201,30 @@ class Qwen3CustomVoice:
             try:
                 wavs, sr = model.generate_custom_voice(
                     text=text,
-                    speaker=target_speaker, # Direct pass
                     language=lang,
+                    speaker=target_speaker,
                     instruct=inst,
                     max_new_tokens=max_new_tokens,
                     **gen_kwargs,
                 )
             except TypeError:
-                print("Warning: Ignoring extra generation params.")
+                print(
+                    "Warning: Model generation function does not support extra parameters (top_p, temperature, repetition_penalty). Ignoring them."
+                )
                 wavs, sr = model.generate_custom_voice(
                     text=text,
-                    speaker=target_speaker,
                     language=lang,
+                    speaker=target_speaker,
                     instruct=inst,
                     max_new_tokens=max_new_tokens,
                 )
         except ValueError as e:
-            if "does not support generate_custom_voice" in str(e):
-                raise ValueError("Model Type Error: Load a CustomVoice model.") from e
+            # Catch model type mismatch errors from qwen-tts
+            msg = str(e)
+            if "does not support generate_custom_voice" in msg:
+                raise ValueError(
+                    "Model Type Error: You are trying to use 'Custom Voice' with an incompatible model. Please load a 'CustomVoice' model (e.g. Qwen3-TTS-12Hz-1.7B-CustomVoice)."
+                ) from e
             raise e
 
         return (convert_audio(wavs[0], sr),)
@@ -1729,42 +1842,6 @@ class Qwen3AudioToDataset:
                     ["tiny", "base", "small", "medium", "large", "large-v3"],
                     {"default": "medium"},
                 ),
-                "language": (
-                    [
-                        "Auto",
-                        "Chinese",
-                        "English",
-                        "Cantonese",
-                        "Arabic",
-                        "German",
-                        "French",
-                        "Spanish",
-                        "Portuguese",
-                        "Indonesian",
-                        "Italian",
-                        "Korean",
-                        "Russian",
-                        "Thai",
-                        "Vietnamese",
-                        "Japanese",
-                        "Turkish",
-                        "Hindi",
-                        "Malay",
-                        "Dutch",
-                        "Swedish",
-                        "Danish",
-                        "Finnish",
-                        "Polish",
-                        "Czech",
-                        "Filipino",
-                        "Persian",
-                        "Greek",
-                        "Romanian",
-                        "Hungarian",
-                        "Macedonian",
-                    ],
-                    {"default": "Auto"},
-                ),
             },
             "optional": {
                 "output_folder_name": ("STRING", {"default": "dataset_final"}),
@@ -1796,7 +1873,6 @@ class Qwen3AudioToDataset:
         self,
         audio_folder,
         model_size,
-        language="Auto",
         output_folder_name="dataset_final",
         min_duration=0.8,
         max_duration=15.0,
@@ -1807,8 +1883,6 @@ class Qwen3AudioToDataset:
             raise ImportError(
                 "Please install 'openai-whisper' and 'pydub' to use this node."
             )
-
-        lang_arg = None if language == "Auto" else language
 
         if not audio_folder or not audio_folder.strip():
             raise ValueError("Audio folder path is empty. Please select a valid folder.")
@@ -1883,7 +1957,7 @@ class Qwen3AudioToDataset:
                 continue
 
             # Transcribe
-            result = model.transcribe(filepath, language=lang_arg, verbose=False)
+            result = model.transcribe(filepath, language="es", verbose=False)
 
             file_count = 0
             for segment in result["segments"]:
@@ -2063,42 +2137,6 @@ class Qwen3TranscribeWhisper:
                     ["tiny", "base", "small", "medium", "large", "large-v3"],
                     {"default": "medium"},
                 ),
-                "language": (
-                    [
-                        "Auto",
-                        "Chinese",
-                        "English",
-                        "Cantonese",
-                        "Arabic",
-                        "German",
-                        "French",
-                        "Spanish",
-                        "Portuguese",
-                        "Indonesian",
-                        "Italian",
-                        "Korean",
-                        "Russian",
-                        "Thai",
-                        "Vietnamese",
-                        "Japanese",
-                        "Turkish",
-                        "Hindi",
-                        "Malay",
-                        "Dutch",
-                        "Swedish",
-                        "Danish",
-                        "Finnish",
-                        "Polish",
-                        "Czech",
-                        "Filipino",
-                        "Persian",
-                        "Greek",
-                        "Romanian",
-                        "Hungarian",
-                        "Macedonian",
-                    ],
-                    {"default": "Auto"},
-                ),
             },
             "optional": {
                 "output_dataset_folder": (
@@ -2137,7 +2175,6 @@ class Qwen3TranscribeWhisper:
         self,
         audio_list,
         whisper_model,
-        language="Auto",
         output_dataset_folder="dataset_final",
         min_duration=0.8,
         max_duration=60.0,
@@ -2149,8 +2186,6 @@ class Qwen3TranscribeWhisper:
             raise ImportError(
                 "Please install 'openai-whisper' and 'pydub' to use this node."
             )
-
-        lang_arg = None if language == "Auto" else language
 
         folder_path = audio_list["folder_path"]
         files = audio_list["files"]
@@ -2225,7 +2260,7 @@ class Qwen3TranscribeWhisper:
                 normalization_factor = float(1 << (8 * audio_for_whisper.sample_width - 1))
                 audio_np = samples.astype(np.float32) / normalization_factor
 
-                result = model.transcribe(audio_np, language=lang_arg, verbose=False)
+                result = model.transcribe(audio_np, language="es", verbose=False)
 
                 file_count = 0
                 for segment in result["segments"]:
@@ -2940,35 +2975,8 @@ class Qwen3DataPrep:
 class Qwen3FineTune:
     @classmethod
     def INPUT_TYPES(s):
-        # 1. Base models
+        # Get base models (excluding CustomVoice/VoiceDesign for fine-tuning)
         base_models = [k for k in QWEN3_TTS_MODELS.keys() if "Base" in k]
-        # Add local base models if available
-        available = get_available_models()
-        for m in available:
-            if "Base" in m and m not in base_models:
-                base_models.append(m)
-
-        # 2. Fine-tuned models (for sequential fine-tuning)
-        scan_paths = [
-            os.path.join(folder_paths.models_dir, "tts", "finetuned_model"),
-            os.path.join(folder_paths.models_dir, "Qwen3-TTS", "finetuned_model"),
-        ]
-        ft_models = []
-        for base_path in scan_paths:
-            if os.path.exists(base_path):
-                for item in os.listdir(base_path):
-                    item_path = os.path.join(base_path, item)
-                    if os.path.isdir(item_path):
-                        for v in os.listdir(item_path):
-                            if os.path.isdir(os.path.join(item_path, v)):
-                                name = f"{item}/{v}"
-                                if name not in ft_models:
-                                    ft_models.append(name)
-        ft_models = sorted(list(set(ft_models)))
-
-        # Combined list
-        all_models = base_models + ft_models
-
         return {
             "required": {
                 "train_jsonl": (
@@ -2980,10 +2988,10 @@ class Qwen3FineTune:
                     },
                 ),
                 "init_model": (
-                    all_models,
+                    base_models,
                     {
                         "default": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-                        "tooltip": "Base model OR existing Fine-Tuned checkpoint (for multi-speaker models).",
+                        "tooltip": "Base model to fine-tune. Must be a 'Base' model variant.",
                     },
                 ),
                 "source": (
@@ -3063,10 +3071,6 @@ class Qwen3FineTune:
                         "default": "my_speaker",
                         "tooltip": "Name for the custom speaker. Use this name when generating with the fine-tuned model.",
                     },
-                ),
-                "language": (
-                    ["Auto", "Chinese", "English", "Japanese", "Korean", "Spanish", "French", "German", "Italian", "Russian", "Portuguese"],
-                    {"default": "Auto", "tooltip": "Force a specific language for training data if not specified in JSONL."},
                 ),
                 "seed": (
                     "INT",
@@ -3234,7 +3238,6 @@ class Qwen3FineTune:
         save_loss_threshold=8.2,
         save_loss_buffer=0.2,
         speaker_name="my_speaker",
-        language="Auto",
         seed=42,
         mixed_precision="bf16",
         resume_training=False,
@@ -3242,7 +3245,7 @@ class Qwen3FineTune:
         gradient_accumulation=8,
         gradient_checkpointing=True,
         use_8bit_optimizer=True,
-        weight_decay=0.0,
+        weight_decay=0.01,
         max_grad_norm=1.0,
         warmup_steps=0,
         warmup_ratio=0.1,
@@ -3377,38 +3380,20 @@ class Qwen3FineTune:
             else:
                 print("Resume enabled but no checkpoints found, starting fresh")
 
-        # Resolve init_model path
-        # 1. Is it a known repo ID?
-        init_model_clean = init_model.replace("✓ ", "").replace("Local: ", "")
-
-        if init_model_clean in QWEN3_TTS_MODELS or init_model_clean in QWEN3_TTS_MODELS.values():
-            local_path = get_local_model_path(init_model_clean)
+        # Resolve init_model path - check ComfyUI folder first, download if needed
+        # NOTE: Always use the original base model, not checkpoint - checkpoint's model.safetensors
+        # doesn't include speaker_encoder (it's stripped for inference). We load checkpoint weights separately.
+        if init_model in QWEN3_TTS_MODELS:
+            local_path = get_local_model_path(init_model)
             if os.path.exists(local_path) and os.listdir(local_path):
                 init_model_path = local_path
-                print(f"Using Base model from ComfyUI folder: {init_model_path}")
+                print(f"Using model from ComfyUI folder: {init_model_path}")
             else:
-                print(f"Base model not found locally. Downloading {init_model_clean}...")
-                init_model_path = download_model_to_comfyui(init_model_clean, source)
+                print(f"Base model not found locally. Downloading {init_model}...")
+                init_model_path = download_model_to_comfyui(init_model, source)
         else:
-            # 2. Is it a Fine-Tuned "Speaker/Version" string?
-            is_ft_string = False
-            if "/" in init_model_clean or "\\" in init_model_clean:
-                # Potential speaker/version
-                scan_paths = [
-                    os.path.join(folder_paths.models_dir, "tts", "finetuned_model"),
-                    os.path.join(folder_paths.models_dir, "Qwen3-TTS", "finetuned_model"),
-                ]
-                for base_path in scan_paths:
-                    candidate = os.path.join(base_path, init_model_clean)
-                    if os.path.exists(candidate) and os.path.isdir(candidate):
-                        init_model_path = candidate
-                        is_ft_string = True
-                        print(f"Using Fine-Tuned model path: {init_model_path}")
-                        break
-
-            # 3. Fallback: Assume absolute path
-            if not is_ft_string:
-                init_model_path = init_model_clean
+            # Assume it's a path
+            init_model_path = init_model
 
         # Set random seeds for reproducibility
         torch.manual_seed(seed)
@@ -3500,24 +3485,19 @@ class Qwen3FineTune:
                     attn_implementation=attn_impl,
                 )
 
-                # Load training weights if resuming OR if init_model is a checkpoint
-                load_source = resume_checkpoint_path if resume_checkpoint_path else init_model_path
-
-                # Check if we need to load weights from pytorch_model.bin (Fine-tuned/Resume)
-                # Base models usually use model.safetensors which is loaded by from_pretrained
-                bin_path = os.path.join(load_source, "pytorch_model.bin")
-
-                if os.path.exists(bin_path):
-                    print(f"Loading weights from checkpoint: {bin_path}")
-                    state_dict = torch.load(bin_path, map_location="cpu", weights_only=True)
-                    keys = qwen3tts.model.load_state_dict(state_dict, strict=False)
-                    if keys.missing_keys:
-                        print(f"DEBUG: Missing keys during load: {len(keys.missing_keys)} (Expected for some PEFT setups)")
-
-                # SINGLE SPEAKER LOGIC (Reverted)
-                # Always assign the custom speaker to the standard ID (e.g., 3000)
-                target_spk_id = 3000
-                print(f"[Qwen3-TTS] 🟢 Single-Speaker Mode: Assigning '{speaker_name}' to ID {target_spk_id}")
+                # Load training weights (includes speaker_encoder) if resuming
+                if resume_checkpoint_path:
+                    ckpt_weights = os.path.join(
+                        resume_checkpoint_path, "pytorch_model.bin"
+                    )
+                    if os.path.exists(ckpt_weights):
+                        state_dict = torch.load(ckpt_weights, map_location="cpu", weights_only=True)
+                        qwen3tts.model.load_state_dict(state_dict, strict=False)
+                        print(f"Loaded training weights from {ckpt_weights}")
+                    else:
+                        print(
+                            f"Warning: Training checkpoint not found at {ckpt_weights}, using model.safetensors weights"
+                        )
 
                 # FORCE GRADIENTS ON
                 qwen3tts.model.train()
@@ -3542,7 +3522,7 @@ class Qwen3FineTune:
                 config = AutoConfig.from_pretrained(init_model_path)
 
                 # Load Data (Lazy)
-                dataset = TTSDataset(train_jsonl, qwen3tts.processor, config, language=language)
+                dataset = TTSDataset(train_jsonl, qwen3tts.processor, config)
                 generator = torch.Generator()
                 generator.manual_seed(seed)
 
@@ -3670,7 +3650,7 @@ class Qwen3FineTune:
                     unwrapped = accelerator.unwrap_model(model)
                     state_dict = {k: v.cpu() for k, v in unwrapped.state_dict().items()}
 
-                    # Inject speaker embedding at DYNAMIC ID (for inference)
+                    # Inject speaker embedding at index 3000 (for inference)
                     if target_speaker_embedding is not None:
                         # Validate embedding shape
                         if target_speaker_embedding.dim() > 1:
@@ -3679,32 +3659,21 @@ class Qwen3FineTune:
                              emb_to_save = target_speaker_embedding
 
                         weight = state_dict["talker.model.codec_embedding.weight"]
-                        # Extend embedding layer if needed?
-                        # Usually pre-allocated to 5000+ or similar? Qwen3TTS codec embedding size check?
-                        # Assuming it fits for now (3000-5000 range usually supported)
-                        if target_spk_id >= weight.shape[0]:
-                             print(f"Warning: target_spk_id {target_spk_id} exceeds embedding size {weight.shape[0]}. Ensure model supports >{target_spk_id} speakers.")
-
-                        state_dict["talker.model.codec_embedding.weight"][target_spk_id] = (
+                        state_dict["talker.model.codec_embedding.weight"][3000] = (
                             emb_to_save.detach().cpu().to(weight.dtype)
                         )
 
                     torch.save(state_dict, os.path.join(ckpt_path, "pytorch_model.bin"))
 
-                    # Save config for inference (speaker mapping) - MERGE LOGIC
+                    # Save config for inference (speaker mapping)
                     base_cfg_path = os.path.join(init_model_path, "config.json")
                     with open(base_cfg_path, "r", encoding="utf-8") as f:
                         ckpt_cfg = json.load(f)
 
                     ckpt_cfg["tts_model_type"] = "custom_voice"
-
-                    if "talker_config" not in ckpt_cfg: ckpt_cfg["talker_config"] = {}
-                    if "spk_id" not in ckpt_cfg["talker_config"]: ckpt_cfg["talker_config"]["spk_id"] = {}
-                    if "spk_is_dialect" not in ckpt_cfg["talker_config"]: ckpt_cfg["talker_config"]["spk_is_dialect"] = {}
-
-                    # Merge new speaker
-                    ckpt_cfg["talker_config"]["spk_id"][speaker_name] = target_spk_id
-                    ckpt_cfg["talker_config"]["spk_is_dialect"][speaker_name] = False
+                    spk_key = speaker_name.lower()
+                    ckpt_cfg["talker_config"]["spk_id"] = {spk_key: 3000}
+                    ckpt_cfg["talker_config"]["spk_is_dialect"] = {spk_key: False}
 
                     with open(
                         os.path.join(ckpt_path, "config.json"), "w", encoding="utf-8"
@@ -3771,14 +3740,9 @@ class Qwen3FineTune:
                         ckpt_cfg = json.load(f)
 
                     ckpt_cfg["tts_model_type"] = "custom_voice"
-
-                    if "talker_config" not in ckpt_cfg: ckpt_cfg["talker_config"] = {}
-                    if "spk_id" not in ckpt_cfg["talker_config"]: ckpt_cfg["talker_config"]["spk_id"] = {}
-                    if "spk_is_dialect" not in ckpt_cfg["talker_config"]: ckpt_cfg["talker_config"]["spk_is_dialect"] = {}
-
-                    # Merge new speaker
-                    ckpt_cfg["talker_config"]["spk_id"][speaker_name] = target_spk_id
-                    ckpt_cfg["talker_config"]["spk_is_dialect"][speaker_name] = False
+                    spk_key = speaker_name.lower()
+                    ckpt_cfg["talker_config"]["spk_id"] = {spk_key: 3000}
+                    ckpt_cfg["talker_config"]["spk_is_dialect"] = {spk_key: False}
 
                     with open(ckpt_cfg_path, "w", encoding="utf-8") as f:
                         json.dump(ckpt_cfg, f, indent=2, ensure_ascii=False)
@@ -3787,7 +3751,7 @@ class Qwen3FineTune:
                     unwrapped = accelerator.unwrap_model(model)
                     state_dict = {k: v.cpu() for k, v in unwrapped.state_dict().items()}
 
-                    # Inject speaker embedding at DYNAMIC ID (for inference)
+                    # Inject speaker embedding at index 3000 (for inference)
                     if target_speaker_embedding is not None:
                         # Validate embedding shape
                         if target_speaker_embedding.dim() > 1:
@@ -3796,7 +3760,7 @@ class Qwen3FineTune:
                              emb_to_save = target_speaker_embedding
 
                         weight = state_dict["talker.model.codec_embedding.weight"]
-                        state_dict["talker.model.codec_embedding.weight"][target_spk_id] = (
+                        state_dict["talker.model.codec_embedding.weight"][3000] = (
                             emb_to_save.detach().cpu().to(weight.dtype)
                         )
 
@@ -3837,262 +3801,255 @@ class Qwen3FineTune:
                     start_epoch * num_update_steps_per_epoch + resume_from_step
                 )  # Resume from correct optimizer step
 
-                try:
-                    for epoch in range(start_epoch, end_epoch):
-                        epoch_loss = 0
-                        steps = 0
-                        send_status(f"Epoch {epoch + 1}/{end_epoch} - Training...")
-                        for batch in train_dataloader:
-                            with accelerator.accumulate(model):
-                                # Debug info (only on first batch of first epoch in this run)
-                                if steps == 0 and epoch == start_epoch:
-                                    print(f"DEBUG: Grad Enabled: {torch.is_grad_enabled()}")
-                                    print(
-                                        f"DEBUG: Inference Mode: {torch.is_inference_mode_enabled()}"
-                                    )
-                                    for n, p in model.named_parameters():
-                                        if p.requires_grad:
-                                            print(f"DEBUG: Parameter {n} requires grad.")
-                                            break
-
-                                # Data extraction logic from sft_12hz.py
-                                input_ids = batch["input_ids"]
-                                codec_ids = batch["codec_ids"]
-                                ref_mels = batch["ref_mels"]
-                                text_embedding_mask = batch["text_embedding_mask"]
-                                codec_embedding_mask = batch["codec_embedding_mask"]
-                                attention_mask = batch["attention_mask"]
-                                codec_0_labels = batch["codec_0_labels"]
-                                codec_mask = batch["codec_mask"]
-
-                                # Unwrap model to access attributes (DDP/FSDP wrappers hide them)
-                                unwrapped_model = accelerator.unwrap_model(model)
-
-                                # Get device/dtype from model parameters (DDP wrappers don't expose these directly)
-                                model_dtype = next(unwrapped_model.parameters()).dtype
-                                model_device = next(unwrapped_model.parameters()).device
-                                speaker_embedding = unwrapped_model.speaker_encoder(
-                                    ref_mels.to(model_device).to(model_dtype)
-                                ).detach()
-                                if target_speaker_embedding is None:
-                                    target_speaker_embedding = speaker_embedding
-
-                                input_text_ids = input_ids[:, :, 0]
-                                input_codec_ids = input_ids[:, :, 1]
-
-                                # Use unwrapped model for attribute access (DDP/FSDP wrappers hide them)
-                                current_model = unwrapped_model
-
-                                # Debug Gradient Flow
-                                if steps == 0 and epoch == start_epoch:
-                                    print(
-                                        f"DEBUG: Model Training Mode: {current_model.training}"
-                                    )
-                                    # Check embedding layer grad
-                                    emb_layer = current_model.talker.model.text_embedding
-                                    print(
-                                        f"DEBUG: Text Embedding Layer Weight requires_grad: {emb_layer.weight.requires_grad}"
-                                    )
-
-                                # 0.6B model requires text_projection for dimension matching (1024 -> 2048)
-                                raw_text_embedding = (
-                                    current_model.talker.model.text_embedding(
-                                        input_text_ids
-                                    )
+                for epoch in range(start_epoch, end_epoch):
+                    epoch_loss = 0
+                    steps = 0
+                    send_status(f"Epoch {epoch + 1}/{end_epoch} - Training...")
+                    for batch in train_dataloader:
+                        with accelerator.accumulate(model):
+                            # Debug info (only on first batch of first epoch in this run)
+                            if steps == 0 and epoch == start_epoch:
+                                print(f"DEBUG: Grad Enabled: {torch.is_grad_enabled()}")
+                                print(
+                                    f"DEBUG: Inference Mode: {torch.is_inference_mode_enabled()}"
                                 )
-                                if "0.6B" in init_model:
-                                    input_text_embedding = (
-                                        current_model.talker.text_projection(
-                                            raw_text_embedding
-                                        )
-                                        * text_embedding_mask
-                                    )
-                                else:
-                                    input_text_embedding = (
-                                        raw_text_embedding * text_embedding_mask
-                                    )
-                                input_codec_embedding = (
-                                    current_model.talker.model.codec_embedding(
-                                        input_codec_ids
-                                    )
-                                    * codec_embedding_mask
-                                )
-                                input_codec_embedding[:, 6, :] = speaker_embedding
+                                for n, p in model.named_parameters():
+                                    if p.requires_grad:
+                                        print(f"DEBUG: Parameter {n} requires grad.")
+                                        break
 
-                                input_embeddings = (
-                                    input_text_embedding + input_codec_embedding
+                            # Data extraction logic from sft_12hz.py
+                            input_ids = batch["input_ids"]
+                            codec_ids = batch["codec_ids"]
+                            ref_mels = batch["ref_mels"]
+                            text_embedding_mask = batch["text_embedding_mask"]
+                            codec_embedding_mask = batch["codec_embedding_mask"]
+                            attention_mask = batch["attention_mask"]
+                            codec_0_labels = batch["codec_0_labels"]
+                            codec_mask = batch["codec_mask"]
+
+                            # Unwrap model to access attributes (DDP/FSDP wrappers hide them)
+                            unwrapped_model = accelerator.unwrap_model(model)
+
+                            # Get device/dtype from model parameters (DDP wrappers don't expose these directly)
+                            model_dtype = next(unwrapped_model.parameters()).dtype
+                            model_device = next(unwrapped_model.parameters()).device
+                            speaker_embedding = unwrapped_model.speaker_encoder(
+                                ref_mels.to(model_device).to(model_dtype)
+                            ).detach()
+                            if target_speaker_embedding is None:
+                                target_speaker_embedding = speaker_embedding
+
+                            input_text_ids = input_ids[:, :, 0]
+                            input_codec_ids = input_ids[:, :, 1]
+
+                            # Use unwrapped model for attribute access (DDP/FSDP wrappers hide them)
+                            current_model = unwrapped_model
+
+                            # Debug Gradient Flow
+                            if steps == 0 and epoch == start_epoch:
+                                print(
+                                    f"DEBUG: Model Training Mode: {current_model.training}"
+                                )
+                                # Check embedding layer grad
+                                emb_layer = current_model.talker.model.text_embedding
+                                print(
+                                    f"DEBUG: Text Embedding Layer Weight requires_grad: {emb_layer.weight.requires_grad}"
                                 )
 
-                                if steps == 0 and epoch == start_epoch:
-                                    print(
-                                        f"DEBUG: input_text_embedding requires_grad: {input_text_embedding.requires_grad}"
-                                    )
-                                    print(
-                                        f"DEBUG: input_codec_embedding requires_grad: {input_codec_embedding.requires_grad}"
-                                    )
-                                    print(
-                                        f"DEBUG: input_embeddings requires_grad: {input_embeddings.requires_grad}"
-                                    )
-
-                                for i in range(1, 16):
-                                    codec_i_embedding = current_model.talker.code_predictor.get_input_embeddings()[
-                                        i - 1
-                                    ](
-                                        codec_ids[:, :, i]
-                                    )
-                                    codec_i_embedding = (
-                                        codec_i_embedding * codec_mask.unsqueeze(-1)
-                                    )
-                                    input_embeddings = input_embeddings + codec_i_embedding
-
-                                outputs = current_model.talker(
-                                    inputs_embeds=input_embeddings[:, :-1, :],
-                                    attention_mask=attention_mask[:, :-1],
-                                    labels=codec_0_labels[:, 1:],
-                                    output_hidden_states=True,
+                            # 0.6B model requires text_projection for dimension matching (1024 -> 2048)
+                            raw_text_embedding = (
+                                current_model.talker.model.text_embedding(
+                                    input_text_ids
                                 )
-
-                                hidden_states = outputs.hidden_states[0][-1]
-                                talker_hidden_states = hidden_states[codec_mask[:, 1:]]
-                                talker_codec_ids = codec_ids[codec_mask]
-
-                                sub_talker_logits, sub_talker_loss = (
-                                    current_model.talker.forward_sub_talker_finetune(
-                                        talker_codec_ids, talker_hidden_states
+                            )
+                            if "0.6B" in init_model:
+                                input_text_embedding = (
+                                    current_model.talker.text_projection(
+                                        raw_text_embedding
                                     )
+                                    * text_embedding_mask
                                 )
-
-                                loss = outputs.loss + sub_talker_loss
-
-                                if steps == 0 and epoch == start_epoch:
-                                    print(
-                                        f"DEBUG: Loss requires_grad: {loss.requires_grad}"
-                                    )
-                                    if not loss.requires_grad:
-                                        print(
-                                            f"DEBUG: outputs.loss requires_grad: {outputs.loss.requires_grad if outputs.loss is not None else 'None'}"
-                                        )
-                                        print(
-                                            f"DEBUG: sub_talker_loss requires_grad: {sub_talker_loss.requires_grad}"
-                                        )
-
-                                accelerator.backward(loss)
-
-                                if accelerator.sync_gradients:
-                                    if max_grad_norm > 0:
-                                        accelerator.clip_grad_norm_(
-                                            model.parameters(), max_grad_norm
-                                        )
-
-                                optimizer.step()
-                                if scheduler:
-                                    scheduler.step()
-                                optimizer.zero_grad()
-
-                                epoch_loss += loss.item()
-                                steps += 1
-
-                                # Check for NaN loss
-                                if math.isnan(loss.item()):
-                                    print(f"\n❌ [Qwen3-TTS] ERROR: Loss is NaN at epoch {epoch+1}, step {global_step}. Aborting training.")
-                                    send_status("❌ Training aborted: Loss is NaN")
-                                    accelerator.free_memory()
-                                    del model, optimizer, train_dataloader, qwen3tts
-                                    if torch.cuda.is_available():
-                                        torch.cuda.empty_cache()
-                                    raise ValueError("Training Aborted: Loss became NaN (diverged). Try lowering learning rate or increasing batch size.")
-
-                                current_loss_val = loss.item()
-
-                                # --- LOGICA DE TARGET LOSS (STOP) ---
-                                if target_loss > 0 and current_loss_val <= target_loss and global_step > actual_warmup_steps:
-                                    if accelerator.is_main_process:
-                                        print(f"🎯 Target Reached (Loss {current_loss_val:.4f}). Saving and exiting.")
-                                        send_status(f"🎯 Target Loss reached: {current_loss_val:.4f}")
-
-                                    final_path = save_final_model(
-                                        f"target_reached_loss_{current_loss_val:.4f}", epoch, global_step
-                                    )
-
-                                    # Only the main process returns a path, others might return None from save_final_model
-                                    # But we need to sync exit.
-                                    accelerator.wait_for_everyone()
-
-                                    accelerator.free_memory()
-                                    del model, optimizer, train_dataloader, qwen3tts
-                                    if torch.cuda.is_available():
-                                        torch.cuda.synchronize()
-                                        torch.cuda.empty_cache()
-
-                                    if accelerator.is_main_process:
-                                        self._save_instruction_report(train_jsonl, full_output_dir)
-                                        print(f"Fine-tuning complete (Target Reached). Model saved to {final_path}")
-                                        send_status("Training complete (Target Reached)!")
-                                        return (final_path, speaker_name)
-                                    else:
-                                        # Non-main processes just exit gracefully (return empty/dummy)
-                                        return ("", "")
-                                # -----------------------------
-
-                                # --- LOGICA DE SAVE LOSS THRESHOLD (CHECKPOINT) ---
-                                if save_loss_threshold > 0 and current_loss_val <= save_loss_threshold:
-                                    # Check if improvement exceeds the user-defined buffer
-                                    if current_loss_val < (min_saved_loss - save_loss_buffer):
-                                        loss_str = f"{current_loss_val:.3f}"
-                                        ckpt_name = f"ckpt_loss_{loss_str}"
-
-                                        if accelerator.is_main_process:
-                                            print(f"\n💾 [Qwen3-TTS] Loss Milestone: {current_loss_val:.4f} (Improved by >{save_loss_buffer} over {min_saved_loss})")
-                                            send_status(f"Saving milestone (Loss {current_loss_val:.3f})...")
-
-                                        save_training_checkpoint(ckpt_name, epoch, global_step)
-
-                                        # Update tracker
-                                        min_saved_loss = current_loss_val
-                                # -----------------------------
-
-                                # Only count optimizer steps (after gradient accumulation completes)
-                                if accelerator.sync_gradients:
-                                    global_step += 1
-
-                                    if unique_id:
-                                        PromptServer.instance.send_sync("progress", {"value": global_step, "max": total_optimizer_steps}, unique_id)
-
-                                    # Show step progress periodically
-                                    if (
-                                        log_every_steps > 0
-                                        and global_step % log_every_steps == 0
-                                    ):
-                                        lr_val = optimizer.param_groups[0]["lr"]
-                                        status = f"Step {global_step}/{total_optimizer_steps}, Loss: {loss.item():.4f}, LR: {lr_val:.8f}"
-                                        print(status)
-                                        send_status(status)
-
-                        avg_loss = epoch_loss / steps if steps > 0 else 0
-                        print(f"Epoch {epoch + 1}/{end_epoch} - Avg Loss: {avg_loss}")
-                        send_status(f"Epoch {epoch + 1}/{end_epoch} - Loss: {avg_loss:.4f}")
-
-                        # Early Stopping Logic
-                        if early_stopping_patience > 0:
-                            if avg_loss < (best_epoch_loss - early_stopping_min_delta):
-                                best_epoch_loss = avg_loss
-                                epochs_no_improve = 0
                             else:
-                                epochs_no_improve += 1
-                                print(f"⚠️ Plateau Alert: No significant improvement for {epochs_no_improve}/{early_stopping_patience} epochs.")
+                                input_text_embedding = (
+                                    raw_text_embedding * text_embedding_mask
+                                )
+                            input_codec_embedding = (
+                                current_model.talker.model.codec_embedding(
+                                    input_codec_ids
+                                )
+                                * codec_embedding_mask
+                            )
+                            input_codec_embedding[:, 6, :] = speaker_embedding
 
-                            if epochs_no_improve >= early_stopping_patience:
-                                print(f"🛑 STOPPING: Plateau detected. Saving best model and exiting node.")
-                                # CRITICAL: Use return to force-exit the ComfyUI node execution
-                                final_path = save_final_model(f"plateau_detected_loss_{avg_loss:.3f}", epoch + 1, global_step)
+                            input_embeddings = (
+                                input_text_embedding + input_codec_embedding
+                            )
+
+                            if steps == 0 and epoch == start_epoch:
+                                print(
+                                    f"DEBUG: input_text_embedding requires_grad: {input_text_embedding.requires_grad}"
+                                )
+                                print(
+                                    f"DEBUG: input_codec_embedding requires_grad: {input_codec_embedding.requires_grad}"
+                                )
+                                print(
+                                    f"DEBUG: input_embeddings requires_grad: {input_embeddings.requires_grad}"
+                                )
+
+                            for i in range(1, 16):
+                                codec_i_embedding = current_model.talker.code_predictor.get_input_embeddings()[
+                                    i - 1
+                                ](
+                                    codec_ids[:, :, i]
+                                )
+                                codec_i_embedding = (
+                                    codec_i_embedding * codec_mask.unsqueeze(-1)
+                                )
+                                input_embeddings = input_embeddings + codec_i_embedding
+
+                            outputs = current_model.talker(
+                                inputs_embeds=input_embeddings[:, :-1, :],
+                                attention_mask=attention_mask[:, :-1],
+                                labels=codec_0_labels[:, 1:],
+                                output_hidden_states=True,
+                            )
+
+                            hidden_states = outputs.hidden_states[0][-1]
+                            talker_hidden_states = hidden_states[codec_mask[:, 1:]]
+                            talker_codec_ids = codec_ids[codec_mask]
+
+                            sub_talker_logits, sub_talker_loss = (
+                                current_model.talker.forward_sub_talker_finetune(
+                                    talker_codec_ids, talker_hidden_states
+                                )
+                            )
+
+                            loss = outputs.loss + sub_talker_loss
+
+                            if steps == 0 and epoch == start_epoch:
+                                print(
+                                    f"DEBUG: Loss requires_grad: {loss.requires_grad}"
+                                )
+                                if not loss.requires_grad:
+                                    print(
+                                        f"DEBUG: outputs.loss requires_grad: {outputs.loss.requires_grad if outputs.loss is not None else 'None'}"
+                                    )
+                                    print(
+                                        f"DEBUG: sub_talker_loss requires_grad: {sub_talker_loss.requires_grad}"
+                                    )
+
+                            accelerator.backward(loss)
+
+                            if accelerator.sync_gradients:
+                                if max_grad_norm > 0:
+                                    accelerator.clip_grad_norm_(
+                                        model.parameters(), max_grad_norm
+                                    )
+
+                            optimizer.step()
+                            if scheduler:
+                                scheduler.step()
+                            optimizer.zero_grad()
+
+                            epoch_loss += loss.item()
+                            steps += 1
+
+                            # Check for NaN loss
+                            if math.isnan(loss.item()):
+                                print(f"\n❌ [Qwen3-TTS] ERROR: Loss is NaN at epoch {epoch+1}, step {global_step}. Aborting training.")
+                                send_status("❌ Training aborted: Loss is NaN")
                                 accelerator.free_memory()
-                                return (final_path, speaker_name)
+                                del model, optimizer, train_dataloader, qwen3tts
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                raise ValueError("Training Aborted: Loss became NaN (diverged). Try lowering learning rate or increasing batch size.")
 
-                except Exception as e:
-                    print(f"[Qwen3-TTS] Training interrupted/failed: {e}")
-                    # Try to save latest checkpoint if possible
-                    save_final_model(f"interrupted_epoch_{epoch}_step_{global_step}", epoch, global_step)
-                    raise e
+                            current_loss_val = loss.item()
+
+                            # --- LOGICA DE TARGET LOSS (STOP) ---
+                            if target_loss > 0 and current_loss_val <= target_loss and global_step > actual_warmup_steps:
+                                if accelerator.is_main_process:
+                                    print(f"🎯 Target Reached (Loss {current_loss_val:.4f}). Saving and exiting.")
+                                    send_status(f"🎯 Target Loss reached: {current_loss_val:.4f}")
+
+                                final_path = save_final_model(
+                                    f"target_reached_loss_{current_loss_val:.4f}", epoch, global_step
+                                )
+
+                                # Only the main process returns a path, others might return None from save_final_model
+                                # But we need to sync exit.
+                                accelerator.wait_for_everyone()
+
+                                accelerator.free_memory()
+                                del model, optimizer, train_dataloader, qwen3tts
+                                if torch.cuda.is_available():
+                                    torch.cuda.synchronize()
+                                    torch.cuda.empty_cache()
+
+                                if accelerator.is_main_process:
+                                    self._save_instruction_report(train_jsonl, full_output_dir)
+                                    print(f"Fine-tuning complete (Target Reached). Model saved to {final_path}")
+                                    send_status("Training complete (Target Reached)!")
+                                    return (final_path, speaker_name)
+                                else:
+                                    # Non-main processes just exit gracefully (return empty/dummy)
+                                    return ("", "")
+                            # -----------------------------
+
+                            # --- LOGICA DE SAVE LOSS THRESHOLD (CHECKPOINT) ---
+                            if save_loss_threshold > 0 and current_loss_val <= save_loss_threshold:
+                                # Check if improvement exceeds the user-defined buffer
+                                if current_loss_val < (min_saved_loss - save_loss_buffer):
+                                    loss_str = f"{current_loss_val:.3f}"
+                                    ckpt_name = f"ckpt_loss_{loss_str}"
+
+                                    if accelerator.is_main_process:
+                                        print(f"\n💾 [Qwen3-TTS] Loss Milestone: {current_loss_val:.4f} (Improved by >{save_loss_buffer} over {min_saved_loss})")
+                                        send_status(f"Saving milestone (Loss {current_loss_val:.3f})...")
+
+                                    save_training_checkpoint(ckpt_name, epoch, global_step)
+
+                                    # Update tracker
+                                    min_saved_loss = current_loss_val
+                            # -----------------------------
+
+                            # Only count optimizer steps (after gradient accumulation completes)
+                            if accelerator.sync_gradients:
+                                global_step += 1
+
+                                if unique_id:
+                                    PromptServer.instance.send_sync("progress", {"value": global_step, "max": total_optimizer_steps}, unique_id)
+
+                                # Show step progress periodically
+                                if (
+                                    log_every_steps > 0
+                                    and global_step % log_every_steps == 0
+                                ):
+                                    lr_val = optimizer.param_groups[0]["lr"]
+                                    status = f"Step {global_step}/{total_optimizer_steps}, Loss: {loss.item():.4f}, LR: {lr_val:.8f}"
+                                    print(status)
+                                    send_status(status)
+
+                    avg_loss = epoch_loss / steps if steps > 0 else 0
+                    print(f"Epoch {epoch + 1}/{end_epoch} - Avg Loss: {avg_loss}")
+                    send_status(f"Epoch {epoch + 1}/{end_epoch} - Loss: {avg_loss:.4f}")
+
+                    # Early Stopping Logic
+                    if early_stopping_patience > 0:
+                        if avg_loss < (best_epoch_loss - early_stopping_min_delta):
+                            best_epoch_loss = avg_loss
+                            epochs_no_improve = 0
+                        else:
+                            epochs_no_improve += 1
+                            print(f"⚠️ Plateau Alert: No significant improvement for {epochs_no_improve}/{early_stopping_patience} epochs.")
+
+                        if epochs_no_improve >= early_stopping_patience:
+                            print(f"🛑 STOPPING: Plateau detected. Saving best model and exiting node.")
+                            # CRITICAL: Use return to force-exit the ComfyUI node execution
+                            final_path = save_final_model(f"plateau_detected_loss_{avg_loss:.3f}", epoch + 1, global_step)
+                            accelerator.free_memory()
+                            return (final_path, speaker_name)
 
                 # Always save final model as epoch_N for consistent resume
                 send_status(f"Saving final model epoch {end_epoch}...")
@@ -4726,26 +4683,6 @@ class Qwen3ASRTranscribeDataset:
         return {
             "required": {
                 "audio_list": ("DATASET_AUDIO_LIST",),
-                "language": (
-                    [
-                        "Auto",
-                        "en",
-                        "es",
-                        "fr",
-                        "de",
-                        "it",
-                        "ja",
-                        "zh",
-                        "pt",
-                        "ru",
-                        "ko",
-                        "nl",
-                        "pl",
-                        "tr",
-                        "hi",
-                    ],
-                    {"default": "Auto"},
-                ),
             },
             "optional": {
                 "output_dataset_folder": (
@@ -4775,7 +4712,6 @@ class Qwen3ASRTranscribeDataset:
     def process(
         self,
         audio_list,
-        language="Auto",
         output_dataset_folder="dataset_final",
         min_duration=0.8,
         max_duration=60.0,
@@ -4812,21 +4748,6 @@ class Qwen3ASRTranscribeDataset:
         total_files = len(files)
         print(f"[Qwen3-ASR] Processing {total_files} files...")
 
-        # Mapping for Qwen-ASR (ISO -> Full Name)
-        ISO_TO_FULL = {
-            "en": "English", "es": "Spanish", "fr": "French", "de": "German",
-            "it": "Italian", "ja": "Japanese", "zh": "Chinese", "pt": "Portuguese",
-            "ru": "Russian", "ko": "Korean", "nl": "Dutch", "pl": "Polish",
-            "tr": "Turkish", "hi": "Hindi", "vi": "Vietnamese", "th": "Thai",
-            "ar": "Arabic"
-        }
-
-        if language == "Auto":
-             raise ValueError("Language 'Auto' is not supported for Qwen-ASR. Please select a specific language.")
-
-        # Resolve language argument
-        lang_arg = ISO_TO_FULL.get(language, language)
-
         # Process
         for idx, filename in enumerate(tqdm(files, desc="Processing Audio", unit="file")):
             if unique_id:
@@ -4842,28 +4763,14 @@ class Qwen3ASRTranscribeDataset:
                 # Assuming model accepts path or waveform. Using path for simplicity if supported.
                 # If Qwen3ASRModel expects specific input, we might need to load with librosa/torchaudio.
                 # Standard assumption: accepts path.
-                raw_output = asr_model.transcribe(filepath, language=lang_arg)
+                text = asr_model.transcribe(filepath)
 
-                # Fix list return type
-                text = ""
-                if isinstance(raw_output, list):
-                    if len(raw_output) > 0 and isinstance(raw_output[0], dict) and 'text' in raw_output[0]:
-                        text = " ".join([seg['text'] for seg in raw_output])
-                    else:
-                        text = " ".join([str(t) for t in raw_output])
-                elif isinstance(raw_output, dict) and 'text' in raw_output:
-                    text = raw_output['text']
-                else:
-                    text = str(raw_output)
-
-                text = text.strip()
-
-                if not text:
+                if not text or not text.strip():
                     continue
 
                 # Align
                 # Returns list of {text, start, end}
-                alignment = aligner.align(filepath, text, language=lang_arg)
+                alignment = aligner.align(filepath, text)
 
             except Exception as e:
                 print(f"   [Error processing {filename}] {e}")
@@ -4969,26 +4876,6 @@ class Qwen3ASRTranscribeSingle:
         return {
             "required": {
                 "audio": ("AUDIO",),
-                "language": (
-                    [
-                        "Auto",
-                        "en",
-                        "es",
-                        "fr",
-                        "de",
-                        "it",
-                        "ja",
-                        "zh",
-                        "pt",
-                        "ru",
-                        "ko",
-                        "nl",
-                        "pl",
-                        "tr",
-                        "hi",
-                    ],
-                    {"default": "Auto"},
-                ),
             }
         }
 
@@ -4997,7 +4884,7 @@ class Qwen3ASRTranscribeSingle:
     FUNCTION = "transcribe"
     CATEGORY = "Qwen3-TTS/Utils"
 
-    def transcribe(self, audio, language="Auto"):
+    def transcribe(self, audio):
         if not HAS_QWEN_ASR:
             raise ImportError(
                 "Please install 'qwen-asr' to use this node."
@@ -5029,37 +4916,7 @@ class Qwen3ASRTranscribeSingle:
         sf.write(temp_wav, wav_np, sr)
 
         try:
-            # Mapping for Qwen-ASR (ISO -> Full Name)
-            ISO_TO_FULL = {
-                "en": "English", "es": "Spanish", "fr": "French", "de": "German",
-                "it": "Italian", "ja": "Japanese", "zh": "Chinese", "pt": "Portuguese",
-                "ru": "Russian", "ko": "Korean", "nl": "Dutch", "pl": "Polish",
-                "tr": "Turkish", "hi": "Hindi", "vi": "Vietnamese", "th": "Thai",
-                "ar": "Arabic"
-            }
-
-            if language == "Auto":
-                 raise ValueError("Language 'Auto' is not supported for Qwen-ASR. Please select a specific language.")
-
-            # Resolve language argument
-            lang_arg = ISO_TO_FULL.get(language, language)
-
-            raw_output = model.transcribe(temp_wav, language=lang_arg)
-
-            # Fix list return type
-            text = ""
-            if isinstance(raw_output, list):
-                if len(raw_output) > 0 and isinstance(raw_output[0], dict) and 'text' in raw_output[0]:
-                    text = " ".join([seg['text'] for seg in raw_output])
-                else:
-                    text = " ".join([str(t) for t in raw_output])
-            elif isinstance(raw_output, dict) and 'text' in raw_output:
-                text = raw_output['text']
-            else:
-                text = str(raw_output)
-
-            text = text.strip()
-
+            text = model.transcribe(temp_wav)
         finally:
             if os.path.exists(temp_wav):
                 os.remove(temp_wav)
