@@ -1044,47 +1044,35 @@ class Qwen3CustomVoice:
         # 2. List of "VIP" names that the library safely allows
         STANDARD_SPEAKERS = ['Aiden', 'Dylan', 'Eric', 'Ono_Anna', 'Pod', 'Ryan', 'Serena', 'Sohee', 'Uncle_Fu', 'Vivian']
 
-        # 3. Masquerade Logic
-        # If the user requests a non-standard name (e.g. "Neylis"), we will ask the library for "Vivian",
-        # but temporarily switch Vivian's ID to Neylis's ID (3000).
-        use_masquerade = target_name_user not in STANDARD_SPEAKERS
+        # 3. Smart Speaker ID Resolution (Fix for NotImplementedError)
+        # Instead of 'Masquerade' (forcing 'Vivian'), we look up the ID directly.
 
-        # Safe name to pass to the function (the "Trojan Horse")
-        library_safe_name = target_name_user
-
-        # Variables for restoration
         model_ref = model.model
         cfg_ref = None
+
+        # Locate internal configuration
+        if hasattr(model_ref, "talker") and hasattr(model_ref.talker, "config"):
+            cfg_ref = model_ref.talker.config
+        elif hasattr(model_ref, "config"):
+            cfg_ref = model_ref.config
+
+        # Check for existing ID
+        existing_id = None
+        if cfg_ref and hasattr(cfg_ref, "spk_id") and target_name_user in cfg_ref.spk_id:
+            existing_id = cfg_ref.spk_id[target_name_user]
+
+        # Use variables compatible with existing code flow
+        use_masquerade = False
         original_spk_id_map = None
+        library_safe_name = target_name_user
 
-        if use_masquerade:
-            print(f"[Qwen3-TTS] 🎭 Activating Masquerade: '{target_name_user}' will wear the mask of 'Vivian'.")
-            library_safe_name = "Vivian" # Use Vivian as mask
-            custom_id = 3000 # Standard ID for Single Speaker Fine-Tuning
-
-            # Locate internal configuration
-            if hasattr(model_ref, "talker") and hasattr(model_ref.talker, "config"):
-                cfg_ref = model_ref.talker.config
-            elif hasattr(model_ref, "config"):
-                cfg_ref = model_ref.config
-
-            # Apply temporary patch
-            if cfg_ref and hasattr(cfg_ref, "spk_id"):
-                original_spk_id_map = cfg_ref.spk_id.copy() # Backup
-
-                # If name exists in map (injected by Loader), use its real ID
-                if target_name_user in original_spk_id_map:
-                    custom_id = original_spk_id_map[target_name_user]
-                    print(f"[Qwen3-TTS] Found existing ID for {target_name_user}: {custom_id}")
-                else:
-                    print(f"[Qwen3-TTS] ID not found in map, assuming standard FT ID: {custom_id}")
-
-                # THE SWITCH: We claim 'Vivian' is the ID of our custom voice
-                cfg_ref.spk_id[library_safe_name] = custom_id
-
-                # Ensure it is not treated as a dialect
-                if hasattr(cfg_ref, "spk_is_dialect") and isinstance(cfg_ref.spk_is_dialect, dict):
-                     cfg_ref.spk_is_dialect[library_safe_name] = False
+        if existing_id is not None:
+            print(f"[Qwen3-TTS] ✅ Using existing ID for {target_name_user}: {existing_id}")
+            # We pass the integer ID directly to the model
+            library_safe_name = int(existing_id)
+        else:
+            print(f"[Qwen3-TTS] ⚠️ No ID found for {target_name_user}, passing name as string.")
+            # library_safe_name remains as target_name_user (string)
 
         gen_kwargs = {
             "top_p": top_p,
